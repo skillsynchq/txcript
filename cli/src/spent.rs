@@ -61,29 +61,20 @@ fn rates(model: &str) -> Option<&'static [f64; 4]> {
         .map(|(_, r)| r)
 }
 
-/// Fresh (uncached) input tokens. codex and opencode record `input_tokens`
-/// inclusive of cache reads; every other harness records fresh input only.
-fn fresh_input(harness: HarnessId, u: &common::Usage) -> u64 {
-    let read = u.cache_read_input_tokens.unwrap_or(0);
-    match harness {
-        HarnessId::Codex | HarnessId::OpenCode => u.input_tokens.saturating_sub(read),
-        _ => u.input_tokens,
-    }
-}
-
-/// All tokens the turn touched, cache traffic included.
-fn turn_tokens(harness: HarnessId, u: &common::Usage) -> u64 {
-    fresh_input(harness, u)
+/// All tokens the turn touched, cache traffic included. `Usage` is
+/// canonical fresh-input across harnesses, so this is a plain sum.
+fn turn_tokens(u: &common::Usage) -> u64 {
+    u.input_tokens
         + u.output_tokens
         + u.cache_read_input_tokens.unwrap_or(0)
         + u.cache_creation_input_tokens.unwrap_or(0)
 }
 
 /// Tokens × the model's rates, in dollars.
-fn estimate(harness: HarnessId, model: &str, u: &common::Usage) -> Option<f64> {
+fn estimate(model: &str, u: &common::Usage) -> Option<f64> {
     rates(model).map(|[input, read, write, output]| {
         let m = |tokens: u64, rate: f64| tokens as f64 * rate / 1e6;
-        m(fresh_input(harness, u), *input)
+        m(u.input_tokens, *input)
             + m(u.cache_read_input_tokens.unwrap_or(0), *read)
             + m(u.cache_creation_input_tokens.unwrap_or(0), *write)
             + m(u.output_tokens, *output)
@@ -100,10 +91,10 @@ enum Cost {
     Unknown,
 }
 
-fn message_cost(harness: HarnessId, meta: &common::Meta, msg: &common::Message) -> Option<Cost> {
+fn message_cost(meta: &common::Meta, msg: &common::Message) -> Option<Cost> {
     msg.usage.as_ref().map(|u| {
         let model = msg.model.as_deref().or(meta.model.as_deref());
-        match (u.cost_usd, model.and_then(|m| estimate(harness, m, u))) {
+        match (u.cost_usd, model.and_then(|m| estimate(m, u))) {
             (Some(recorded), _) => Cost::Recorded(recorded),
             (None, Some(estimated)) => Cost::Estimated(estimated),
             (None, None) => Cost::Unknown,
@@ -127,15 +118,15 @@ struct Agg {
 
 impl Agg {
     /// Fold one session's messages in.
-    fn add_session(&mut self, harness: HarnessId, t: &txcript::Transcript<txcript::Common>) {
+    fn add_session(&mut self, t: &txcript::Transcript<txcript::Common>) {
         self.sessions += 1;
         let mut priced = false;
         let mut unpriced = false;
         for msg in &t.body {
             if let Some(u) = msg.usage.as_ref() {
-                self.tokens += turn_tokens(harness, u);
+                self.tokens += turn_tokens(u);
             }
-            match message_cost(harness, &t.meta, msg) {
+            match message_cost(&t.meta, msg) {
                 // A turn with no usage carries no spend at all.
                 None => {}
                 Some(Cost::Recorded(d)) => {
@@ -171,10 +162,10 @@ pub(super) fn cmd_spent(from: Option<HarnessId>, cwd: Option<&std::path::Path>) 
                 .find(|(h, _)| *h == session.harness)
                 .map(|(_, a)| a);
             match agg {
-                Some(agg) => agg.add_session(session.harness, &common),
+                Some(agg) => agg.add_session(&common),
                 None => {
                     let mut agg = Agg::default();
-                    agg.add_session(session.harness, &common);
+                    agg.add_session(&common);
                     per.push((session.harness, agg));
                 }
             }
@@ -278,20 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn estimate_prices_anthropic_input_as_fresh() {
-        // claude_code: 1M fresh in, 1M out, 1M read, 1M written on opus-4-8:
-        // 5 + 25 + 0.5 + 6.25.
+    fn estimate_prices_each_token_kind_at_its_own_rate() {
+        // Usage is canonical fresh-input: 1M fresh in, 1M out, 1M read, 1M
+        // written on opus-4-8 is 5 + 25 + 0.5 + 6.25.
         let u = usage(1_000_000, 1_000_000, Some(1_000_000), Some(1_000_000));
-        let d = estimate(HarnessId::ClaudeCode, "claude-opus-4-8", &u).unwrap();
+        let d = estimate("claude-opus-4-8", &u).unwrap();
         assert!((d - 36.75).abs() < 1e-9);
-    }
 
-    #[test]
-    fn estimate_subtracts_cache_reads_on_codex() {
-        // codex records input inclusive of cached: 1M input of which 600K
-        // cached on gpt-5: 0.4 * 1.25 + 0.6 * 0.125 + 1 * 10.
-        let u = usage(1_000_000, 1_000_000, Some(600_000), None);
-        let d = estimate(HarnessId::Codex, "gpt-5", &u).unwrap();
+        // OpenAI rates: cached input discounted, cache writes free — 400K
+        // fresh + 600K cached + 1M out on gpt-5: 0.5 + 0.075 + 10.
+        let u = usage(400_000, 1_000_000, Some(600_000), None);
+        let d = estimate("gpt-5", &u).unwrap();
         assert!((d - 10.575).abs() < 1e-9);
     }
 
@@ -318,14 +306,14 @@ mod tests {
             }),
         };
         assert!(matches!(
-            message_cost(HarnessId::Pi, &meta, &msg),
+            message_cost(&meta, &msg),
             Some(Cost::Recorded(d)) if (d - 0.42).abs() < 1e-9
         ));
 
         // Without a recorded cost the priced model estimates...
         msg.usage.as_mut().unwrap().cost_usd = None;
         assert!(matches!(
-            message_cost(HarnessId::Pi, &meta, &msg),
+            message_cost(&meta, &msg),
             Some(Cost::Estimated(d)) if (d - 5.0).abs() < 1e-9
         ));
 
@@ -333,7 +321,7 @@ mod tests {
         msg.model = Some("harmonic-relay".into());
         let meta = common::Meta { model: None, ..meta };
         assert!(matches!(
-            message_cost(HarnessId::Pi, &meta, &msg),
+            message_cost(&meta, &msg),
             Some(Cost::Unknown)
         ));
     }

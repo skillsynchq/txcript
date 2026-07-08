@@ -66,7 +66,11 @@ impl Codec for Codex {
     fn to_common(transcript: &Transcript<Self>) -> Result<Transcript<Common>> {
         Ok(Transcript::new(
             transcript.meta.clone(),
-            lines_to_messages(&transcript.body, transcript.meta.timestamp),
+            lines_to_messages(
+                &transcript.body,
+                transcript.meta.timestamp,
+                input_includes_cached(transcript.meta.cli_version.as_deref()),
+            ),
         ))
     }
 
@@ -90,11 +94,23 @@ impl TextCodec for Codex {
     }
 }
 
+/// Whether this file's `last_token_usage.input_tokens` includes the cached
+/// prefix. The 0.x CLIs recorded the request's whole input; the 2.x line
+/// records fresh (uncached) input only — verified against local sessions,
+/// where 0.x never shows `cached > input` and 2.x almost always does.
+/// [`Usage`] is canonical fresh-input, so 0.x parses subtract the cached
+/// count and 0.x writes add it back. Unknown versions read as fresh: if
+/// that guess is ever wrong it overestimates a consumer's cost math rather
+/// than undercounting.
+fn input_includes_cached(cli_version: Option<&str>) -> bool {
+    cli_version.is_some_and(|v| v.starts_with("0."))
+}
+
 // One stateful pass mirroring the CLI provider's aggregation: turn context,
 // usage backfill, web-search pairing, and result dedup all share the same
 // running state, so splitting the match arms would scatter it.
 #[allow(clippy::too_many_lines)]
-fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message> {
+fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>, inclusive_input: bool) -> Vec<Message> {
     let mut queued: Vec<Queued> = Vec::new();
     let mut current_turn_id: Option<String> = None;
     let mut turn_models: HashMap<String, String> = HashMap::new();
@@ -144,8 +160,11 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             if let Some(model) = turn_models.get(turn) {
                                 queued[idx].model = Some(model.clone());
                             }
-                            if let Some(usage) = turn_usage.get(turn) {
-                                queued[idx].usage = Some(*usage);
+                            // Consumed, not copied: whatever is still in
+                            // `turn_usage` at the end belongs to turns that
+                            // never completed, and gets attached below.
+                            if let Some(usage) = turn_usage.remove(turn) {
+                                queued[idx].usage = Some(usage);
                             }
                         }
                     }
@@ -153,7 +172,22 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                         if let (Some(turn), Some(usage)) =
                             (current_turn_id.as_ref(), parse_last_token_usage(payload))
                         {
-                            turn_usage.insert(turn.clone(), usage);
+                            // Normalize to canonical fresh-input before
+                            // accumulating (see `input_includes_cached`).
+                            let usage = if inclusive_input {
+                                Usage {
+                                    input_tokens: usage
+                                        .input_tokens
+                                        .saturating_sub(usage.cache_read_input_tokens.unwrap_or(0)),
+                                    ..usage
+                                }
+                            } else {
+                                usage
+                            };
+                            turn_usage
+                                .entry(turn.clone())
+                                .and_modify(|total| *total = accumulate(*total, usage))
+                                .or_insert(usage);
                         }
                     }
                     "exec_command_end" => {
@@ -397,6 +431,30 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
         }
     }
 
+    // Usage still in `turn_usage` belongs to turns that never completed
+    // (interrupted, crashed, or mid-run when the file was read). Attach it
+    // to the turn's last assistant text, else the session's last assistant
+    // message — coarse attribution beats dropping the spend. Accumulation
+    // is a sum, so several leftover turns folding into one fallback target
+    // stay order-independent.
+    let last_assistant = queued
+        .iter()
+        .rposition(|q| matches!(q.role, Role::Assistant));
+    for (turn, usage) in turn_usage {
+        let target = last_assistant_text_by_turn
+            .get(&turn)
+            .copied()
+            .or(last_assistant);
+        // A session with no assistant message at all (target None) has
+        // nowhere to carry usage; only then is it dropped.
+        if let Some(idx) = target {
+            queued[idx].usage = Some(match queued[idx].usage {
+                Some(existing) => accumulate(existing, usage),
+                None => usage,
+            });
+        }
+    }
+
     // Drop the fallback function_call_output when a canonical result exists.
     queued
         .into_iter()
@@ -516,15 +574,26 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
         if matches!(msg.role, Role::Assistant)
             && let Some(usage) = msg.usage.as_ref()
         {
+            // Match the convention of the version this file claims: a 0.x
+            // `input_tokens` includes the cached prefix, so parsing (which
+            // subtracts it back) stays a fixpoint either way.
+            let cached = usage.cache_read_input_tokens.unwrap_or(0);
+            let input = if input_includes_cached(meta.cli_version.as_deref()) {
+                usage.input_tokens + cached
+            } else {
+                usage.input_tokens
+            };
             lines.push(meta_line(
                 &msg.timestamp,
                 "event_msg",
+                // One event carrying the turn's whole usage: parsing sums
+                // token_count events per turn, so this reads back exactly.
                 json!({
                     "type": "token_count",
                     "info": { "last_token_usage": {
-                        "input_tokens": usage.input_tokens,
+                        "input_tokens": input,
                         "output_tokens": usage.output_tokens,
-                        "cached_input_tokens": usage.cache_read_input_tokens.unwrap_or(0),
+                        "cached_input_tokens": cached,
                     }},
                 }),
             ));
@@ -1170,6 +1239,34 @@ fn parse_reasoning_summary(payload: &Value) -> Option<String> {
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// Fold one request's usage into the turn's running total. A codex turn
+/// makes one API request per tool round-trip and emits a `token_count`
+/// for each; the turn's real usage is their sum (verified: summing every
+/// `last_token_usage` reproduces the session's `total_token_usage`
+/// exactly), so keeping only the last event would drop all but the final
+/// request.
+fn accumulate(total: Usage, next: Usage) -> Usage {
+    let opt = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        // Absent on both sides stays absent rather than becoming Some(0).
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    };
+    Usage {
+        input_tokens: total.input_tokens + next.input_tokens,
+        output_tokens: total.output_tokens + next.output_tokens,
+        cache_read_input_tokens: opt(
+            total.cache_read_input_tokens,
+            next.cache_read_input_tokens,
+        ),
+        cache_creation_input_tokens: opt(
+            total.cache_creation_input_tokens,
+            next.cache_creation_input_tokens,
+        ),
+        // codex never records dollars; there is nothing to sum.
+        cost_usd: None,
+    }
 }
 
 fn parse_last_token_usage(payload: &Value) -> Option<Usage> {

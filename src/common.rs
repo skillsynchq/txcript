@@ -120,9 +120,16 @@ pub enum StopReason {
     Other(String),
 }
 
-/// Token accounting for one assistant turn.
+/// Token accounting for one assistant turn, in canonical (Anthropic API)
+/// semantics regardless of origin harness: `input_tokens` counts fresh
+/// input only, with cache reads and writes in their own fields. Codecs
+/// whose native format folds cache traffic into the input count (codex
+/// 0.x, opencode) normalize on parse and restore the native convention on
+/// write, so consumers can price or sum usage without knowing where a
+/// transcript came from — including after cross-harness migration.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Fresh (uncached) input tokens.
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

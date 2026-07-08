@@ -45,7 +45,8 @@ fn to_common_splits_parts_and_attaches_turn_usage() {
                     "modelID": "claude-opus-4-7",
                     "finish": "stop",
                     "cost": 0.0721,
-                    "tokens": { "input": 6, "output": 88, "cache": { "write": 21428, "read": 10 } },
+                    // input is the whole request: 6 fresh + 10 read + 21428 written
+                    "tokens": { "input": 21444, "output": 88, "cache": { "write": 21428, "read": 10 } },
                     "time": { "created": 1_778_834_704_540_i64 },
                 },
                 "parts": [

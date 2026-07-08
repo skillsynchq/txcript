@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use txcript::common;
 use txcript::harness::codex;
-use txcript::{Codec, Common, Store, Transcript};
+use txcript::{Codec, Common, Store, TextCodec, Transcript};
 
 fn ts(s: &str) -> DateTime<Utc> {
     s.parse().unwrap()
@@ -22,6 +22,9 @@ fn exercise_rollout() -> String {
         r#"{"timestamp":"2026-04-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"call-shell"}}"#,
         r#"{"timestamp":"2026-04-01T00:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-shell","aggregated_output":"file1\nfile2\n","stdout":"","stderr":"","exit_code":0}}"#,
         r#"{"timestamp":"2026-04-01T00:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-shell","output":"mirror output"}}"#,
+        // A mid-turn request's usage: the turn's total is the sum of every
+        // token_count, not just the last one.
+        r#"{"timestamp":"2026-04-01T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":60,"cached_input_tokens":15,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":70}}}}"#,
         r#"{"timestamp":"2026-04-01T00:00:06Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call-patch","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"}}"#,
         r#"{"timestamp":"2026-04-01T00:00:07Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-patch","output":"{\"output\":\"Success. Updated the following files:\\nM src/main.rs\\n\",\"metadata\":{\"exit_code\":0,\"duration_seconds\":0.0}}"}}"#,
         r#"{"timestamp":"2026-04-01T00:00:08Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"ws-1","query":"Next.js docs","action":{"type":"search","query":"Next.js docs","queries":["Next.js docs","Next.js cache docs"]}}}"#,
@@ -94,13 +97,14 @@ fn to_common_runs_the_full_aggregation() {
         common::Block::ToolUse { id, tool: common::Tool::Raw { tool_name, .. } } if id == "ws-1" && tool_name == "WebSearch"
     ));
 
-    // final assistant text, with model + usage backfilled from the turn.
+    // final assistant text, with model + usage backfilled from the turn:
+    // the sum of both token_count events (60+100, 10+40, 15+25).
     assert!(matches!(&msgs[8].content[0], common::Block::Text { text } if text == "Done."));
     assert_eq!(msgs[8].model.as_deref(), Some("gpt-5.2-codex"));
     let usage = msgs[8].usage.unwrap();
-    assert_eq!(usage.input_tokens, 100);
-    assert_eq!(usage.output_tokens, 40);
-    assert_eq!(usage.cache_read_input_tokens, Some(25));
+    assert_eq!(usage.input_tokens, 160);
+    assert_eq!(usage.output_tokens, 50);
+    assert_eq!(usage.cache_read_input_tokens, Some(40));
 }
 
 #[test]
@@ -270,4 +274,70 @@ fn codec_fixpoint_through_common_loses_nothing() {
     let native = codex::Codex::from_common(&common).unwrap();
     let back = codex::Codex::to_common(&native).unwrap();
     assert_eq!(common, back);
+}
+
+/// codex 0.x recorded `last_token_usage.input_tokens` inclusive of the
+/// cached prefix; the codec normalizes those files to canonical fresh
+/// input on parse and restores the inclusive count on write.
+#[test]
+fn zero_x_input_normalizes_to_fresh_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = codex::CodexStore::new(dir.path());
+    let src = dir.path().join("rollout-zero-x.jsonl");
+    std::fs::write(
+        &src,
+        [
+            r#"{"timestamp":"2026-04-01T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-04-01T00:00:00Z","cwd":"/repo","cli_version":"0.42.0"}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5-codex"}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":25,"output_tokens":40,"total_tokens":140}}}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let common = codex::Codex::to_common(&store.load(&src).unwrap()).unwrap();
+    let usage = common.body.last().unwrap().usage.unwrap();
+    // 100 inclusive input - 25 cached = 75 fresh.
+    assert_eq!(usage.input_tokens, 75);
+    assert_eq!(usage.cache_read_input_tokens, Some(25));
+
+    // The 0.x convention survives the round trip: the writer re-inflates
+    // the input for the version the file claims, and re-parsing subtracts
+    // it back.
+    let native = codex::Codex::from_common(&common).unwrap();
+    let text = codex::Codex::to_text(&native).unwrap();
+    assert!(text.contains(r#""input_tokens":100"#), "{text}");
+    assert_eq!(codex::Codex::to_common(&native).unwrap(), common);
+}
+
+/// Usage from a turn that never saw `task_complete` (interrupted, crashed,
+/// or copied mid-run) still lands on the turn's last assistant message
+/// instead of vanishing.
+#[test]
+fn usage_from_incomplete_turns_is_not_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = codex::CodexStore::new(dir.path());
+    let src = dir.path().join("rollout-incomplete.jsonl");
+    std::fs::write(
+        &src,
+        [
+            r#"{"timestamp":"2026-04-01T00:00:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5-codex"}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working on it"}]}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"cached_input_tokens":5,"output_tokens":10}}}}"#,
+            r#"{"timestamp":"2026-04-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":60,"cached_input_tokens":6,"output_tokens":12}}}}"#,
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let common = codex::Codex::to_common(&store.load(&src).unwrap()).unwrap();
+    // No session_meta: input reads as already-fresh, both events sum.
+    let usage = common.body.last().unwrap().usage.unwrap();
+    assert_eq!(usage.input_tokens, 110);
+    assert_eq!(usage.output_tokens, 22);
+    assert_eq!(usage.cache_read_input_tokens, Some(11));
 }

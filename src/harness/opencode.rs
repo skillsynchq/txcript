@@ -629,12 +629,19 @@ fn parse_tokens(tokens: Option<&Value>, cost: Option<f64>) -> Option<Usage> {
     let cache = tokens.get("cache");
     let cache_read = cache.and_then(|c| c.get("read")).and_then(Value::as_u64);
     let cache_write = cache.and_then(|c| c.get("write")).and_then(Value::as_u64);
+    // opencode's `tokens.input` (the AI SDK convention) counts the whole
+    // request input, cache traffic included; canonical [`Usage`] wants
+    // fresh input only, so shed both cache counts (`from_common` adds them
+    // back). Verified locally: input >= read + write on every real message.
+    let fresh = input
+        .saturating_sub(cache_read.unwrap_or(0))
+        .saturating_sub(cache_write.unwrap_or(0));
     // A zero `cost` is what subscription-billed sessions (and `from_common`)
     // record; only a real spend carries information.
     let cost_usd = cost.filter(|c| *c != 0.0);
     // An all-zero, cache-less token object means no usage was recorded.
     (input != 0 || output != 0 || cache_read.is_some() || cache_write.is_some()).then_some(Usage {
-        input_tokens: input,
+        input_tokens: fresh,
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_write,
@@ -655,7 +662,13 @@ fn tokens_value(usage: Option<&Usage>) -> Value {
         }
     }
     let mut tokens = json!({
-        "input": usage.map_or(0, |u| u.input_tokens),
+        // Native `input` counts the whole request (the AI SDK convention):
+        // fresh input plus both cache counts, undoing the parse-side split.
+        "input": usage.map_or(0, |u| {
+            u.input_tokens
+                + u.cache_read_input_tokens.unwrap_or(0)
+                + u.cache_creation_input_tokens.unwrap_or(0)
+        }),
         "output": usage.map_or(0, |u| u.output_tokens),
         "reasoning": 0,
     });
@@ -1133,7 +1146,8 @@ mod store {
             .unwrap();
             conn.execute(
                 "INSERT INTO message VALUES ('m_a','ses_1',1778834704540,?1)",
-                params![r#"{"role":"assistant","modelID":"claude-opus-4-7","finish":"stop","tokens":{"input":6,"output":88,"cache":{"write":21428,"read":10}}}"#],
+                // input is the whole request: 6 fresh + 10 read + 21428 written
+                params![r#"{"role":"assistant","modelID":"claude-opus-4-7","finish":"stop","tokens":{"input":21444,"output":88,"cache":{"write":21428,"read":10}}}"#],
             )
             .unwrap();
             for (id, data) in [
