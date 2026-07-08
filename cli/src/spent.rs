@@ -1,9 +1,10 @@
 //! `txcript spent`: what the sessions in a folder cost, per harness.
 //!
 //! Per assistant message, in preference order: the cost the harness itself
-//! recorded (`Usage::cost_usd` — opencode, pi) is exact; otherwise tokens ×
-//! a hardcoded price table estimate it (`*`); otherwise the spend is unknown
-//! (`?`). The total is a floor (`+`) whenever anything stayed unknown.
+//! recorded (`Usage::cost_usd` — opencode, pi, older amp) is exact;
+//! otherwise tokens × a hardcoded price table estimate it (`*`); otherwise
+//! the spend is unknown (`?`). The total is a floor (`+`) whenever anything
+//! stayed unknown.
 
 use txcript::{HarnessId, common};
 

@@ -184,9 +184,14 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>, inclusive_input
                             } else {
                                 usage
                             };
+                            // A codex turn makes one API request per tool
+                            // round-trip, each on its own token_count; the
+                            // turn's real usage is their sum (verified:
+                            // summing every last_token_usage reproduces the
+                            // session's total_token_usage exactly).
                             turn_usage
                                 .entry(turn.clone())
-                                .and_modify(|total| *total = accumulate(*total, usage))
+                                .and_modify(|total| *total = *total + usage)
                                 .or_insert(usage);
                         }
                     }
@@ -449,7 +454,7 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>, inclusive_input
         // nowhere to carry usage; only then is it dropped.
         if let Some(idx) = target {
             queued[idx].usage = Some(match queued[idx].usage {
-                Some(existing) => accumulate(existing, usage),
+                Some(existing) => existing + usage,
                 None => usage,
             });
         }
@@ -1239,34 +1244,6 @@ fn parse_reasoning_summary(payload: &Value) -> Option<String> {
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
-}
-
-/// Fold one request's usage into the turn's running total. A codex turn
-/// makes one API request per tool round-trip and emits a `token_count`
-/// for each; the turn's real usage is their sum (verified: summing every
-/// `last_token_usage` reproduces the session's `total_token_usage`
-/// exactly), so keeping only the last event would drop all but the final
-/// request.
-fn accumulate(total: Usage, next: Usage) -> Usage {
-    let opt = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        // Absent on both sides stays absent rather than becoming Some(0).
-        (None, None) => None,
-        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-    };
-    Usage {
-        input_tokens: total.input_tokens + next.input_tokens,
-        output_tokens: total.output_tokens + next.output_tokens,
-        cache_read_input_tokens: opt(
-            total.cache_read_input_tokens,
-            next.cache_read_input_tokens,
-        ),
-        cache_creation_input_tokens: opt(
-            total.cache_creation_input_tokens,
-            next.cache_creation_input_tokens,
-        ),
-        // codex never records dollars; there is nothing to sum.
-        cost_usd: None,
-    }
 }
 
 fn parse_last_token_usage(payload: &Value) -> Option<Usage> {

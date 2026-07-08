@@ -143,6 +143,37 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
 }
 
+impl std::ops::Add for Usage {
+    type Output = Usage;
+
+    /// Field-wise sum, for folding several requests' usage into one
+    /// accounting entry. A cache count or cost absent on both sides stays
+    /// absent rather than becoming a recorded zero.
+    fn add(self, rhs: Usage) -> Usage {
+        let counts = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        let cost = match (self.cost_usd, rhs.cost_usd) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        };
+        Usage {
+            input_tokens: self.input_tokens + rhs.input_tokens,
+            output_tokens: self.output_tokens + rhs.output_tokens,
+            cache_read_input_tokens: counts(
+                self.cache_read_input_tokens,
+                rhs.cache_read_input_tokens,
+            ),
+            cache_creation_input_tokens: counts(
+                self.cache_creation_input_tokens,
+                rhs.cache_creation_input_tokens,
+            ),
+            cost_usd: cost,
+        }
+    }
+}
+
 /// A base64-encoded inline image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSource {

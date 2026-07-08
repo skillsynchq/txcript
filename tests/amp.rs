@@ -591,3 +591,80 @@ fn continuing_into_amp_is_refused() {
         );
     }
 }
+
+/// One Amp API response is split across several assistant messages (tool
+/// results interleaved), each stamped with the same `usage`; the codec
+/// keeps one stamp per request so summing usage measures real spend. The
+/// `credits` field (cents) surfaces as the recorded dollar cost.
+#[test]
+fn split_response_usage_counts_once_and_credits_read_as_dollars() {
+    let stamp = json!({
+        "model": "claude-opus-4-8", "inputTokens": 10, "outputTokens": 20,
+        "cacheReadInputTokens": 100, "cacheCreationInputTokens": 5,
+        "credits": 1.5, "timestamp": "2026-07-07T23:36:15.576Z",
+    });
+    let text = serde_json::to_string(&json!({
+        "v": 13,
+        "id": "T-split",
+        "created": 1_783_466_656_505_i64,
+        "messages": [
+            { "role": "assistant", "messageId": 0,
+              "content": [{ "type": "thinking", "thinking": "hm", "provider": "anthropic" }],
+              "state": { "type": "complete", "stopReason": "tool_use" }, "usage": stamp },
+            { "role": "assistant", "messageId": 1,
+              "content": [{ "type": "tool_use", "complete": true, "id": "toolu_01",
+                  "name": "shell_command", "input": { "command": "ls", "workdir": "/w" } }],
+              "state": { "type": "complete", "stopReason": "tool_use" }, "usage": stamp },
+            { "role": "user", "messageId": 2,
+              "content": [{ "type": "tool_result", "toolUseID": "toolu_01",
+                  "run": { "status": "done", "result": { "output": "ok", "exitCode": 0 } } }] },
+            // Same stamp continuing past the tool result: still one request.
+            { "role": "assistant", "messageId": 3,
+              "content": [{ "type": "text", "text": "done with that" }],
+              "state": { "type": "complete", "stopReason": "end_turn" }, "usage": stamp },
+            // A whole request whose only message parses to nothing (empty
+            // thinking) — its spend must fold forward, not vanish.
+            { "role": "assistant", "messageId": 4,
+              "content": [{ "type": "thinking", "thinking": "", "provider": "anthropic" }],
+              "state": { "type": "complete", "stopReason": "end_turn" },
+              "usage": { "model": "claude-opus-4-8", "inputTokens": 100, "outputTokens": 1,
+                         "cacheReadInputTokens": 1000, "credits": 0.5,
+                         "timestamp": "2026-07-07T23:36:18.000Z" } },
+            // A genuinely new request carries different counts.
+            { "role": "assistant", "messageId": 5,
+              "content": [{ "type": "text", "text": "next" }],
+              "state": { "type": "complete", "stopReason": "end_turn" },
+              "usage": { "model": "claude-opus-4-8", "inputTokens": 3, "outputTokens": 7,
+                         "cacheReadInputTokens": 135, "credits": 0.2,
+                         "timestamp": "2026-07-07T23:36:20.000Z" } },
+        ],
+    }))
+    .unwrap();
+
+    let msgs = amp::Amp::to_common(&amp::Amp::from_text(&text).unwrap())
+        .unwrap()
+        .body;
+    let usages: Vec<_> = msgs.iter().map(|m| m.usage).collect();
+
+    // First stamp of the run survives; its duplicates read as None.
+    let first = usages[0].unwrap();
+    assert_eq!(first.input_tokens, 10);
+    assert_eq!(first.cost_usd, Some(0.015));
+    assert_eq!(usages[1], None);
+    assert_eq!(usages[2], None); // the tool_result user turn
+
+    // The empty-thinking message vanished (5 common messages, not 6); its
+    // request's usage folded backward into the previous survivor — the
+    // duplicate-stamp message at index 3, which would otherwise be None.
+    assert_eq!(usages.len(), 5);
+    let folded = usages[3].unwrap();
+    assert_eq!(folded.input_tokens, 100);
+    assert_eq!(folded.output_tokens, 1);
+    assert_eq!(folded.cache_read_input_tokens, Some(1000));
+    assert_eq!(folded.cost_usd, Some(0.005));
+
+    // The next request's own stamp is untouched, credits again in dollars.
+    let second = usages[4].unwrap();
+    assert_eq!(second.input_tokens, 3);
+    assert_eq!(second.cost_usd, Some(0.002));
+}

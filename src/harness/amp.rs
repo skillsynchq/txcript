@@ -31,8 +31,11 @@
 //!   `cancelled` / `rejected-by-user` result statuses collapse to
 //!   `is_error: true` text results.
 //! - Message bookkeeping: `userState`, `fileMentions`, `interrupted`,
-//!   `originalToolUseInput`, `turnElapsedMs`, `readAt`, `protocolMessageID`,
-//!   and `usage.credits`.
+//!   `originalToolUseInput`, `turnElapsedMs`, `readAt`, and
+//!   `protocolMessageID`.
+//! - Amp stamps every piece of a split assistant response with the same
+//!   `usage`; [`Common`] keeps one stamp per request (so usage sums are
+//!   real spend) and `from_common` does not re-duplicate the rest.
 //! - An assistant with no stop reason renders as `end_turn` (Amp requires a
 //!   `state`); `StopReason::Aborted` maps to `state: {type: "cancelled"}`.
 //! - `sourcePath` on image blocks and `signature`-less thinking providers.
@@ -88,18 +91,78 @@ impl Thread {
 impl Codec for Amp {
     fn to_common(transcript: &Transcript<Self>) -> Result<Transcript<Common>> {
         let mut last_ts = transcript.meta.timestamp;
-        let messages = transcript
-            .body
-            .messages
-            .iter()
-            .filter_map(|m| match m.get("role").and_then(Value::as_str) {
-                Some("user") => user_message(m, &mut last_ts),
-                Some("assistant") => assistant_message(m, &mut last_ts),
+        let mut messages: Vec<Message> = Vec::new();
+        // Amp splits one API response across several thread messages (one
+        // per content block, tool results interleaved between them) and
+        // stamps every piece with the same usage. Track the stamp runs so
+        // each request counts once: the run's first surviving message
+        // carries the usage — consecutive *real* requests never repeat the
+        // exact same counts, since cache reads ratchet as context grows.
+        // A run whose messages all parse to nothing (e.g. empty thinking)
+        // holds its usage `pending` and folds it into the next surviving
+        // assistant message rather than dropping spend. Duplicate stamps
+        // are a known representational loss on the way back out (module
+        // doc).
+        let mut prev_stamp: Option<(Option<String>, Usage)> = None;
+        let mut pending: Option<Usage> = None;
+        for m in &transcript.body.messages {
+            match m.get("role").and_then(Value::as_str) {
+                Some("user") => messages.extend(user_message(m, &mut last_ts)),
+                Some("assistant") => {
+                    let stamp = m.get("usage").and_then(|u| {
+                        parse_usage(u).map(|usage| {
+                            let model = u.get("model").and_then(Value::as_str).map(String::from);
+                            (model, usage)
+                        })
+                    });
+                    let fresh = (stamp.is_some() && stamp != prev_stamp)
+                        .then(|| stamp.as_ref().map(|(_, u)| *u))
+                        .flatten();
+                    if stamp.is_some() {
+                        prev_stamp = stamp;
+                    }
+                    let carry = [pending.take(), fresh]
+                        .into_iter()
+                        .flatten()
+                        .reduce(|a, b| a + b);
+                    if let Some(msg) = assistant_message(m, &mut last_ts) {
+                        messages.push(Message {
+                            usage: carry,
+                            ..msg
+                        });
+                    } else {
+                        // The whole message parsed to nothing: fold its
+                        // request's usage into the previous surviving
+                        // assistant message — preferring one on the same
+                        // model, so a consumer pricing by message model
+                        // prices this spend correctly (a `<synthetic>`
+                        // neighbor must not swallow a real model's usage).
+                        // Only a thread-start orphan waits in `pending`.
+                        let model = prev_stamp.as_ref().and_then(|(m, _)| m.clone());
+                        let target = messages
+                            .iter()
+                            .rposition(|m| m.role == Role::Assistant && m.model == model)
+                            .or_else(|| {
+                                messages.iter().rposition(|m| m.role == Role::Assistant)
+                            });
+                        match (carry, target) {
+                            (Some(c), Some(idx)) => {
+                                let usage = messages[idx].usage.map_or(c, |u| u + c);
+                                messages[idx].usage = Some(usage);
+                            }
+                            (Some(c), None) => pending = Some(c),
+                            // Nothing new to carry.
+                            (None, _) => {}
+                        }
+                    }
+                }
                 // Any other role (or a missing one) carries no conversational
                 // turn; the native body keeps the record.
-                _ => None,
-            })
-            .collect();
+                _ => {}
+            }
+        }
+        // `pending` still set here means no assistant message survived
+        // anywhere in the thread; there is no turn to carry the usage.
         Ok(Transcript::new(transcript.meta.clone(), messages))
     }
 
@@ -322,19 +385,28 @@ fn parse_usage(u: &Value) -> Option<Usage> {
     let output = count("outputTokens").unwrap_or(0);
     let cache_read = count("cacheReadInputTokens");
     let cache_creation = count("cacheCreationInputTokens");
+    // `credits` is this request's cost in cents — verified against local
+    // opus threads, where the token counts times provider list rates
+    // reproduce it exactly. Newer CLIs stopped recording it; a zero is
+    // what `from_common` writes for costless usage.
+    let cost_usd = u
+        .get("credits")
+        .and_then(Value::as_f64)
+        .map(|c| c / 100.0)
+        .filter(|c| *c != 0.0);
     // An all-zero usage is what `from_common` writes when no usage was
     // recorded; parse it back to None so the absence round-trips.
     (input != 0
         || output != 0
         || cache_read.is_some_and(|n| n != 0)
-        || cache_creation.is_some_and(|n| n != 0))
+        || cache_creation.is_some_and(|n| n != 0)
+        || cost_usd.is_some())
     .then_some(Usage {
         input_tokens: input,
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_creation,
-        // `usage.credits` is a balance snapshot, not this turn's spend.
-        cost_usd: None,
+        cost_usd,
     })
 }
 
@@ -607,6 +679,10 @@ fn usage_value(msg: &Message, meta: &Meta) -> Value {
     if let Some(creation) = usage.and_then(|u| u.cache_creation_input_tokens) {
         u.insert("cacheCreationInputTokens".into(), json!(creation));
         total += creation;
+    }
+    // A recorded spend goes back out as cents, the unit Amp used.
+    if let Some(cost) = usage.and_then(|u| u.cost_usd) {
+        u.insert("credits".into(), json!(cost * 100.0));
     }
     // Required-but-derivable bookkeeping, reconstructed best-effort: the
     // context window Amp recorded for this model era, and the running total.
