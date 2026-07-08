@@ -469,6 +469,7 @@ fn planner_message(
             output_tokens,
             cache_read_input_tokens: cache_read.filter(|n| *n > 0),
             cache_creation_input_tokens: cache_write.filter(|n| *n > 0),
+            cost_usd: None,
         })
     });
 

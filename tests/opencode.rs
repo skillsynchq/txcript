@@ -44,6 +44,7 @@ fn to_common_splits_parts_and_attaches_turn_usage() {
                     "role": "assistant",
                     "modelID": "claude-opus-4-7",
                     "finish": "stop",
+                    "cost": 0.0721,
                     "tokens": { "input": 6, "output": 88, "cache": { "write": 21428, "read": 10 } },
                     "time": { "created": 1_778_834_704_540_i64 },
                 },
@@ -101,6 +102,7 @@ fn to_common_splits_parts_and_attaches_turn_usage() {
     assert_eq!(usage.output_tokens, 88);
     assert_eq!(usage.cache_creation_input_tokens, Some(21428));
     assert_eq!(usage.cache_read_input_tokens, Some(10));
+    assert_eq!(usage.cost_usd, Some(0.0721));
 }
 
 #[test]
@@ -193,6 +195,7 @@ fn sample_common() -> Transcript<Common> {
                 output_tokens: 88,
                 cache_read_input_tokens: Some(10),
                 cache_creation_input_tokens: Some(21428),
+                cost_usd: Some(0.0721),
             }),
         },
         common::Message {
@@ -238,6 +241,7 @@ fn sample_common() -> Transcript<Common> {
                 output_tokens: 2,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cost_usd: None,
             }),
         },
     ];

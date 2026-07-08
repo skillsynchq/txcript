@@ -245,6 +245,7 @@ fn sample_common() -> Transcript<Common> {
                 output_tokens: 20,
                 cache_read_input_tokens: Some(50),
                 cache_creation_input_tokens: None,
+                cost_usd: None,
             }),
         },
     ];

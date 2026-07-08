@@ -446,6 +446,7 @@ fn sample_common() -> Transcript<Common> {
                 output_tokens: 40,
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: Some(1200),
+                cost_usd: None,
             }),
         },
         common::Message {
@@ -509,6 +510,7 @@ fn sample_common() -> Transcript<Common> {
                 output_tokens: 2,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cost_usd: None,
             }),
         },
     ];

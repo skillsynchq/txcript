@@ -31,7 +31,8 @@ fn sample_jsonl() -> String {
                 {"type": "toolCall", "id": "call-1", "name": "edit", "arguments": {
                     "path": "/repo/a.rs", "edits": [{"oldText": "old", "newText": "new"}]}}],
                 "model": "claude-opus-4-8", "provider": "anthropic", "api": "anthropic-messages",
-                "usage": {"input": 10, "output": 20, "cacheRead": 5, "cacheWrite": 2, "totalTokens": 37},
+                "usage": {"input": 10, "output": 20, "cacheRead": 5, "cacheWrite": 2, "totalTokens": 37,
+                    "cost": {"input": 0.004_537, "output": 0.001_428, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.005_965}},
                 "stopReason": "toolUse", "timestamp": 2}}),
         json!({"type": "message", "id": "t1", "parentId": "a1", "timestamp": "2026-01-02T03:04:08.000Z",
             "message": {"role": "toolResult", "toolCallId": "call-1", "toolName": "edit",
@@ -122,6 +123,8 @@ fn to_common_normalizes_tools_and_expands_bash() {
     let usage = msgs[1].usage.unwrap();
     assert_eq!(usage.input_tokens, 10);
     assert_eq!(usage.cache_creation_input_tokens, Some(2));
+    // The recorded spend surfaces as the cost total; the split isn't modeled.
+    assert_eq!(usage.cost_usd, Some(0.005_965));
 
     // toolResult flattens to text on a User message.
     assert!(matches!(
@@ -255,6 +258,7 @@ fn sample_common() -> Transcript<Common> {
                 output_tokens: 20,
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: Some(2),
+                cost_usd: Some(0.005_965),
             }),
         },
     ];

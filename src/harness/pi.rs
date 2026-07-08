@@ -737,6 +737,14 @@ fn parse_usage(usage: Option<&Value>) -> Option<Usage> {
     let output = usage.get("output").and_then(Value::as_u64).unwrap_or(0);
     let cache_read = usage.get("cacheRead").and_then(Value::as_u64);
     let cache_write = usage.get("cacheWrite").and_then(Value::as_u64);
+    // A zero `cost.total` is what `from_common` writes when no spend was
+    // recorded; only a real spend carries information. The per-component
+    // split is not modeled — the total is what consumers aggregate.
+    let cost_usd = usage
+        .get("cost")
+        .and_then(|c| c.get("total"))
+        .and_then(Value::as_f64)
+        .filter(|c| *c != 0.0);
     // An all-zero usage carries no information.
     let has_tokens =
         input != 0 || output != 0 || cache_read.unwrap_or(0) != 0 || cache_write.unwrap_or(0) != 0;
@@ -745,6 +753,7 @@ fn parse_usage(usage: Option<&Value>) -> Option<Usage> {
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_write,
+        cost_usd,
     })
 }
 
@@ -757,7 +766,14 @@ fn serialize_usage(usage: Option<&Usage>) -> Value {
         "cacheRead": usage.and_then(|u| u.cache_read_input_tokens).unwrap_or(0),
         "cacheWrite": usage.and_then(|u| u.cache_creation_input_tokens).unwrap_or(0),
         "totalTokens": input + output,
-        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0},
+        // Only the total survives Common; the component split is a known loss.
+        "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cacheRead": 0.0,
+            "cacheWrite": 0.0,
+            "total": usage.and_then(|u| u.cost_usd).unwrap_or(0.0),
+        },
     })
 }
 

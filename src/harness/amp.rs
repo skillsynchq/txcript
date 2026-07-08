@@ -333,6 +333,8 @@ fn parse_usage(u: &Value) -> Option<Usage> {
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_creation,
+        // `usage.credits` is a balance snapshot, not this turn's spend.
+        cost_usd: None,
     })
 }
 

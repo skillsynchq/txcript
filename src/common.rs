@@ -121,7 +121,7 @@ pub enum StopReason {
 }
 
 /// Token accounting for one assistant turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -129,6 +129,11 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Dollars the harness itself recorded for this turn, when it did.
+    /// Pricing is not the crate's business: consumers estimate from tokens
+    /// and model when this is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// A base64-encoded inline image.

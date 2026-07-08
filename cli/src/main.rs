@@ -15,6 +15,9 @@
 //!     [--from <harness>]                    #   search only <harness> (default: all)
 //!     [--with <harness>]                    #   continue the pick in <harness>
 //!     [--cwd <dir>]                         #   only sessions recorded in <dir>
+//! txcript spent                         # dollars spent, per harness
+//!     [--from <harness>]                    #   only this harness's sessions
+//!     [--cwd <dir>]                         #   only sessions recorded in <dir>
 //! txcript completion <shell>            # print a completion script
 //! ```
 //!
@@ -102,12 +105,28 @@ enum Command {
         #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         cwd: Option<PathBuf>,
     },
+    /// Sum the dollars spent on sessions, per harness
+    ///
+    /// Costs the harness recorded itself (opencode, pi) are exact; models
+    /// with token usage are priced from a built-in table and marked
+    /// estimated (*); sessions with neither count as unknown (?), making
+    /// the total a floor (+).
+    Spent {
+        /// Only this harness's sessions
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        from: Option<HarnessId>,
+        /// Only sessions recorded in this working directory
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        cwd: Option<PathBuf>,
+    },
     /// Print a completion script for a shell (add it to your shell config)
     Completion {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
 }
+
+mod spent;
 
 fn harness(s: &str) -> Result<HarnessId, txcript::Error> {
     s.parse()
@@ -162,6 +181,10 @@ fn main() -> ExitCode {
             from,
             cwd,
         } => query::cmd_query(pattern, with, from, cwd.as_deref()),
+        Command::Spent { from, cwd } => {
+            spent::cmd_spent(from, cwd.as_deref());
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Completion { shell } => {
             clap_complete::generate(
                 shell,

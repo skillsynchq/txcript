@@ -488,6 +488,7 @@ fn parse_usage(v: &Value) -> Option<Usage> {
         output_tokens: v.get("output_tokens")?.as_u64()?,
         cache_read_input_tokens: v.get("cache_read_input_tokens").and_then(Value::as_u64),
         cache_creation_input_tokens: v.get("cache_creation_input_tokens").and_then(Value::as_u64),
+        cost_usd: None,
     })
 }
 

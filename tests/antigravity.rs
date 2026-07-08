@@ -348,6 +348,7 @@ fn to_common_extracts_conversation_and_skips_bookkeeping() {
             output_tokens: 275,
             cache_read_input_tokens: Some(12000),
             cache_creation_input_tokens: None,
+            cost_usd: None,
         })
     );
     assert_eq!(planner.content.len(), 2);
@@ -497,6 +498,7 @@ fn fixpoint_common() -> Transcript<Common> {
         output_tokens: 20,
         cache_read_input_tokens: None,
         cache_creation_input_tokens: None,
+        cost_usd: None,
     };
     let body = vec![
         common::Message {

@@ -162,7 +162,7 @@ fn build_assistant_messages(
         .get("modelID")
         .and_then(Value::as_str)
         .map(String::from);
-    let usage = parse_tokens(info.get("tokens"));
+    let usage = parse_tokens(info.get("tokens"), info.get("cost").and_then(Value::as_f64));
     let stop_reason = info.get("finish").and_then(Value::as_str).map(parse_finish);
 
     let mut pending: Vec<Block> = Vec::new();
@@ -361,7 +361,10 @@ fn build_export(meta: &Meta, messages: &[Message]) -> Export {
                     info.insert("providerID".into(), json!("anthropic"));
                 }
                 info.insert("finish".into(), json!(finish_str(msg.stop_reason.as_ref())));
-                info.insert("cost".into(), json!(0.0));
+                info.insert(
+                    "cost".into(),
+                    json!(msg.usage.as_ref().and_then(|u| u.cost_usd).unwrap_or(0.0)),
+                );
                 info.insert("tokens".into(), tokens_value(msg.usage.as_ref()));
 
                 // Every assistant turn opens with a step-start part.
@@ -619,19 +622,23 @@ fn parse_file_image(part: &Value) -> Option<ImageSource> {
     })
 }
 
-fn parse_tokens(tokens: Option<&Value>) -> Option<Usage> {
+fn parse_tokens(tokens: Option<&Value>, cost: Option<f64>) -> Option<Usage> {
     let tokens = tokens?;
     let input = tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
     let output = tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
     let cache = tokens.get("cache");
     let cache_read = cache.and_then(|c| c.get("read")).and_then(Value::as_u64);
     let cache_write = cache.and_then(|c| c.get("write")).and_then(Value::as_u64);
+    // A zero `cost` is what subscription-billed sessions (and `from_common`)
+    // record; only a real spend carries information.
+    let cost_usd = cost.filter(|c| *c != 0.0);
     // An all-zero, cache-less token object means no usage was recorded.
     (input != 0 || output != 0 || cache_read.is_some() || cache_write.is_some()).then_some(Usage {
         input_tokens: input,
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_write,
+        cost_usd,
     })
 }
 

@@ -1181,6 +1181,7 @@ fn parse_last_token_usage(payload: &Value) -> Option<Usage> {
         output_tokens: usage.get("output_tokens")?.as_u64()?,
         cache_read_input_tokens: usage.get("cached_input_tokens").and_then(Value::as_u64),
         cache_creation_input_tokens: None,
+        cost_usd: None,
     })
 }
 
