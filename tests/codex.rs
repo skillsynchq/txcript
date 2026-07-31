@@ -145,8 +145,14 @@ fn store_round_trip_is_lossless_on_disk() {
     let reloaded = store.load(&saved.reference).unwrap();
 
     assert_eq!(loaded.body, reloaded.body);
-    // Landed under YYYY/MM/DD with a rollout-<ts>-<id> name.
-    assert!(saved.reference.to_string_lossy().contains("/2026/01/02/"));
+    // Landed under YYYY/MM/DD with a rollout-<ts>-<id> name. Compare path
+    // components, not the string — separators differ on Windows.
+    let components: Vec<_> = saved
+        .reference
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    assert!(components.windows(3).any(|w| w == ["2026", "01", "02"]));
     assert!(saved.reference.to_string_lossy().contains("rollout-"));
     assert!(saved.reference.to_string_lossy().ends_with("sess-1.jsonl"));
 }
