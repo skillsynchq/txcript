@@ -425,7 +425,7 @@ fn build_env(meta: &Meta) -> Option<Value> {
     if let Some(cwd) = meta.cwd.as_deref().filter(|c| !c.is_empty()) {
         let mut tree = Map::new();
         tree.insert("uri".into(), json!(path_to_file_uri(cwd)));
-        let name = cwd.rsplit('/').next().unwrap_or(cwd);
+        let name = cwd.rsplit(['/', '\\']).next().unwrap_or(cwd);
         tree.insert("displayName".into(), json!(name));
         if let Some(branch) = meta.git_branch.as_deref().filter(|b| !b.is_empty()) {
             tree.insert(
@@ -909,12 +909,34 @@ fn file_uri_to_path(uri: &str) -> Option<String> {
             }
         }
     }
-    Some(String::from_utf8_lossy(&out).into_owned())
+    let decoded = String::from_utf8_lossy(&out).into_owned();
+    // A drive-letter path came from Windows (`file:///C%3A/Users/x` →
+    // `/C:/Users/x`): drop the URI's leading slash and restore backslashes.
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && bytes.get(3).is_none_or(|b| *b == b'/')
+    {
+        return Some(decoded[1..].replace('/', "\\"));
+    }
+    Some(decoded)
 }
 
 /// `/a b` → `file:///a%20b`, percent-encoding everything outside the RFC 3986
-/// unreserved set (plus `/`).
+/// unreserved set (plus `/`). A Windows path is normalized into URI shape
+/// first (`C:\Users\x` → `file:///C%3A/Users/x`).
 fn path_to_file_uri(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let windows = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let normalized;
+    let path = if windows {
+        normalized = format!("/{}", path.replace('\\', "/"));
+        normalized.as_str()
+    } else {
+        path
+    };
     let mut out = String::with_capacity(path.len() + 8);
     out.push_str("file://");
     for byte in path.bytes() {
@@ -967,14 +989,19 @@ impl AmpStore {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("XDG_DATA_HOME")
-                    .filter(|v| !v.is_empty())
-                    .map(|xdg| PathBuf::from(xdg).join("amp").join("threads"))
+                // amp's own platform switch consults XDG_DATA_HOME only off
+                // Windows; there the data dir is always `<home>\.local\share\amp`.
+                if cfg!(windows) {
+                    None
+                } else {
+                    std::env::var_os("XDG_DATA_HOME")
+                        .filter(|v| !v.is_empty())
+                        .map(|xdg| PathBuf::from(xdg).join("amp").join("threads"))
+                }
             })
             .or_else(|| {
-                std::env::var_os("HOME").map(|home| {
-                    PathBuf::from(home)
-                        .join(".local")
+                super::home_dir().map(|home| {
+                    home.join(".local")
                         .join("share")
                         .join("amp")
                         .join("threads")

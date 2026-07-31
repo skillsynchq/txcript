@@ -1745,9 +1745,7 @@ impl AntigravityStore {
     /// The default data root, `~/.gemini/antigravity-cli`.
     #[must_use]
     pub fn default_root() -> Option<Self> {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| Self::new(home.join(".gemini").join("antigravity-cli")))
+        super::home_dir().map(|home| Self::new(home.join(".gemini").join("antigravity-cli")))
     }
 
     #[cfg(feature = "opencode")]

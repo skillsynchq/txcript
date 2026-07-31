@@ -1816,7 +1816,7 @@ fn file_fingerprint(path: &Path) -> String {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    super::home_dir()
 }
 
 // -- hashes and hex ------------------------------------------------------

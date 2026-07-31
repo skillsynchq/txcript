@@ -1237,10 +1237,7 @@ impl GrokStore {
         std::env::var_os("GROK_HOME")
             .filter(|v| !v.is_empty())
             .map(|home| Self::new(PathBuf::from(home).join("sessions")))
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| Self::new(PathBuf::from(h).join(".grok").join("sessions")))
-            })
+            .or_else(|| super::home_dir().map(|h| Self::new(h.join(".grok").join("sessions"))))
     }
 }
 

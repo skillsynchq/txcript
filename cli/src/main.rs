@@ -602,14 +602,25 @@ fn handoff(
     args: &[String],
     workdir: Option<&std::path::Path>,
 ) -> Result<ExitCode, String> {
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(args);
-    if let Some(dir) = workdir {
-        cmd.current_dir(dir);
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("failed to launch `{bin}`: {e} (is it on PATH?)"))?;
+    let spawn = |program: &str| {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
+        cmd.status()
+    };
+    let status = match spawn(bin) {
+        Ok(status) => status,
+        // npm-installed harnesses are `.cmd` shims on Windows, which
+        // CreateProcess won't resolve from the bare name; the explicit
+        // extension makes std route the launch through cmd.exe.
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::NotFound => {
+            spawn(&format!("{bin}.cmd"))
+                .map_err(|_| format!("failed to launch `{bin}`: {e} (is it on PATH?)"))?
+        }
+        Err(e) => return Err(format!("failed to launch `{bin}`: {e} (is it on PATH?)")),
+    };
     Ok(match status.code() {
         // `ExitCode` is u8-wide; a child code outside 0..=255 still reports
         // failure, just not the exact value.

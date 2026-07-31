@@ -618,7 +618,7 @@ pub(crate) fn resolve_sessions_dir(config_dir: &str, env_prefix: &str) -> Option
         if raw.is_empty() {
             None
         } else if let Some(rest) = raw.strip_prefix('~') {
-            home().map(|h| h.join(rest.trim_start_matches('/')))
+            home().map(|h| h.join(rest.trim_start_matches(['/', '\\'])))
         } else {
             Some(PathBuf::from(raw))
         }
@@ -1124,5 +1124,5 @@ fn file_fingerprints(refs: &[PathBuf]) -> HashMap<String, String> {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    super::home_dir()
 }

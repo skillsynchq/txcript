@@ -523,6 +523,18 @@ fn codec_fixpoint_through_common_loses_nothing() {
     assert_eq!(common, back);
 }
 
+/// A Windows cwd survives the trip through Amp's reconstructed `file://`
+/// env URI: `C:\…` normalizes to `file:///C%3A/…` and decodes back.
+#[test]
+fn windows_cwd_round_trips_through_the_env_uri() {
+    let mut common = sample_common();
+    common.meta.cwd = Some(r"C:\Users\dev\proj x".into());
+
+    let native = amp::Amp::from_common(&common).unwrap();
+    let back = amp::Amp::to_common(&native).unwrap();
+    assert_eq!(back.meta.cwd.as_deref(), Some(r"C:\Users\dev\proj x"));
+}
+
 /// A foreign session id (Claude uuid) becomes a deterministic, valid
 /// `T-…` thread id, and the store names the file by it — `amp threads
 /// continue` rejects anything else before even looking it up.

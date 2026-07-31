@@ -92,6 +92,22 @@ fn store_round_trip_is_lossless_on_disk() {
 }
 
 #[test]
+fn windows_cwd_encodes_the_project_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = claude_code::ClaudeStore::new(dir.path());
+
+    let src = dir.path().join("orig.jsonl");
+    let jsonl = sample_jsonl().replace("/work/repo", r"C:\\Users\\dev\\repo");
+    std::fs::write(&src, jsonl).unwrap();
+
+    // `C:\Users\dev\repo` lands in `C--Users-dev-repo`, Claude's own
+    // Windows encoding (`\` and `:` map to `-` like `/` and `.`).
+    let saved = store.save(&store.load(&src).unwrap()).unwrap();
+    let project = saved.reference.parent().unwrap().file_name().unwrap();
+    assert_eq!(project.to_str(), Some("C--Users-dev-repo"));
+}
+
+#[test]
 fn discover_extracts_session_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("-work-repo");

@@ -263,10 +263,15 @@ impl ClaudeStore {
         Self { root: root.into() }
     }
 
-    /// The default projects root, `~/.claude/projects`.
+    /// The default projects root: `$CLAUDE_CONFIG_DIR/projects` when set
+    /// (every `~/.claude` path moves under that directory), else
+    /// `~/.claude/projects`.
     #[must_use]
     pub fn default_root() -> Option<Self> {
-        dirs_home().map(|h| Self::new(h.join(".claude").join("projects")))
+        std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(|dir| Self::new(PathBuf::from(dir).join("projects")))
+            .or_else(|| dirs_home().map(|h| Self::new(h.join(".claude").join("projects"))))
     }
 
     fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -755,10 +760,18 @@ fn meta_from_text(text: &str) -> Meta {
     meta_from_records(&records)
 }
 
-/// Claude's project-dir encoding: every `/` and `.` becomes `-`.
+/// Claude's project-dir encoding: every `/` and `.` becomes `-`. Windows
+/// cwds encode the same way with `\` and the drive `:` also mapped
+/// (`C:\Users\x` → `C--Users-x`).
 fn encode_project_dir(path: &str) -> String {
     path.chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '.' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -778,7 +791,7 @@ fn file_fingerprint(path: &Path) -> String {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    super::home_dir()
 }
 
 // Surface the canonical-name guard as a typed error for callers that care.

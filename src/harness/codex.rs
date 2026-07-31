@@ -666,10 +666,14 @@ impl CodexStore {
         }
     }
 
-    /// The default sessions root, `~/.codex/sessions`.
+    /// The default sessions root: `$CODEX_HOME/sessions` when set (Codex
+    /// honors that override before its home lookup), else `~/.codex/sessions`.
     #[must_use]
     pub fn default_root() -> Option<Self> {
-        home().map(|h| Self::new(h.join(".codex").join("sessions")))
+        std::env::var_os("CODEX_HOME")
+            .filter(|v| !v.is_empty())
+            .map(|codex_home| Self::new(PathBuf::from(codex_home).join("sessions")))
+            .or_else(|| home().map(|h| Self::new(h.join(".codex").join("sessions"))))
     }
 }
 
@@ -1299,5 +1303,5 @@ fn file_fingerprint(path: &Path) -> String {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    super::home_dir()
 }

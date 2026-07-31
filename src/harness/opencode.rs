@@ -797,9 +797,8 @@ mod store {
                         .map(|xdg| PathBuf::from(xdg).join("opencode").join("opencode.db"))
                 })
                 .or_else(|| {
-                    std::env::var_os("HOME").map(|home| {
-                        PathBuf::from(home)
-                            .join(".local")
+                    crate::harness::home_dir().map(|home| {
+                        home.join(".local")
                             .join("share")
                             .join("opencode")
                             .join("opencode.db")
