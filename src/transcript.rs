@@ -242,10 +242,11 @@ pub enum HarnessId {
     Grok,
     Amp,
     Antigravity,
+    Simple,
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 10] = [
+    pub const ALL: [HarnessId; 11] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::OpenCode,
@@ -256,6 +257,7 @@ impl HarnessId {
         HarnessId::Grok,
         HarnessId::Amp,
         HarnessId::Antigravity,
+        HarnessId::Simple,
     ];
 
     /// The stable lowercase name, matching the corresponding [`Harness::NAME`].
@@ -272,6 +274,7 @@ impl HarnessId {
             HarnessId::Grok => "grok",
             HarnessId::Amp => "amp",
             HarnessId::Antigravity => "antigravity",
+            HarnessId::Simple => "simple",
         }
     }
 }
@@ -304,6 +307,7 @@ impl FromStr for HarnessId {
             "antigravity" | "agy" | "antigravity_cli" | "antigravity-cli" | "anti-gravity" => {
                 Ok(HarnessId::Antigravity)
             }
+            "simple" | "simple_json" | "simple-json" => Ok(HarnessId::Simple),
             other => Err(crate::error::Error::UnknownHarness(other.to_string())),
         }
     }
