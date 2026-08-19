@@ -240,13 +240,14 @@ pub enum HarnessId {
     Cursor,
     CursorDesktop,
     Grok,
+    Hermes,
     Amp,
     Antigravity,
     Simple,
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 11] = [
+    pub const ALL: [HarnessId; 12] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::OpenCode,
@@ -255,6 +256,7 @@ impl HarnessId {
         HarnessId::Cursor,
         HarnessId::CursorDesktop,
         HarnessId::Grok,
+        HarnessId::Hermes,
         HarnessId::Amp,
         HarnessId::Antigravity,
         HarnessId::Simple,
@@ -272,6 +274,7 @@ impl HarnessId {
             HarnessId::Cursor => "cursor",
             HarnessId::CursorDesktop => "cursor_desktop",
             HarnessId::Grok => "grok",
+            HarnessId::Hermes => "hermes",
             HarnessId::Amp => "amp",
             HarnessId::Antigravity => "antigravity",
             HarnessId::Simple => "simple",
@@ -303,6 +306,7 @@ impl FromStr for HarnessId {
             "grok" | "grok_cli" | "grok-cli" | "grokcli" | "grok_build" | "grok-build" => {
                 Ok(HarnessId::Grok)
             }
+            "hermes" | "hermes_agent" | "hermes-agent" | "hermesagent" => Ok(HarnessId::Hermes),
             "amp" | "ampcode" | "amp_code" | "amp-code" => Ok(HarnessId::Amp),
             "antigravity" | "agy" | "antigravity_cli" | "antigravity-cli" | "anti-gravity" => {
                 Ok(HarnessId::Antigravity)

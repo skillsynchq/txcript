@@ -47,7 +47,7 @@ txcript maps each harness's native transcript format through a typed common mode
 
 ## Highlights
 
-- **11 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
+- **12 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
 - **A format for everyone else**: agents txcript has never heard of emit the documented [Simple](docs/formats/simple.md) interchange JSON — a file or a stream, handed to txcript directly — and their transcripts continue in any supported harness.
 - **Byte-lossless round-trips**: loading and saving a session in its own format reproduces it exactly.
 - **Continue anywhere**: `txcript continue <id> --with <harness>` rewrites a session into another harness's native format and launches it. The original is never modified.
@@ -69,6 +69,7 @@ flowchart LR
     common <--> grok["Grok CLI"]
     common <--> antigravity["Antigravity"]
     simple["Simple (any agent)"] --> common
+    hermes["Hermes Agent"] --> common
     amp["Amp"] --> common
 ```
 
@@ -84,6 +85,7 @@ Discovery, listing, search, `view`, and native round-trips work for every harnes
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | — |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | JSON session dir | ⇄ | ✓ | [spec](docs/formats/grok.md) |
+| Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](docs/formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | thread JSON | → | — <sup>1</sup> | [spec](docs/formats/amp.md) |
 | [Antigravity](https://antigravity.google) | `antigravity` | `~/.gemini/antigravity-cli/` | SQLite | ⇄ | ✓ | [spec](docs/formats/antigravity.md) |
 | Simple | `simple` | — <sup>2</sup> | interchange JSON | → | — <sup>2</sup> | [spec](docs/formats/simple.md) |
@@ -91,6 +93,8 @@ Discovery, listing, search, `view`, and native round-trips work for every harnes
 <sup>1</sup> Amp threads are server-side and the CLI has no import: sessions convert *from* Amp, but can't be continued into it.
 
 <sup>2</sup> Simple is txcript's own interchange format — the on-ramp for any agent not listed above. There is no app and no managed directory: a Simple session is a document (a file, or stdin) handed to `txcript continue` directly, and the continued conversation lives in the target harness from then on.
+
+<sup>3</sup> Hermes's `state.db` is read-only in txcript and Hermes has no session-import command: sessions convert *from* Hermes, but can't be continued into it.
 
 ## Install
 
@@ -271,7 +275,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","amp","antigravity","simple"]
+harnesses(); // ["claude_code","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","hermes","amp","antigravity","simple"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -283,6 +287,7 @@ Text-in / text-out: `input` is the source harness's native session text and the 
 | `cursor` | JSON export of the session's `store.db` |
 | `cursor_desktop` | JSON dump of the session's `state.vscdb` rows |
 | `grok` | JSON bundle of the session directory's files |
+| `hermes` | `hermes sessions export` JSON object |
 | `amp` | `amp threads export` JSON |
 | `antigravity` | JSON dump of the conversation database, protobuf blobs hex-encoded |
 | `simple` | the [Simple](docs/formats/simple.md) interchange JSON document |

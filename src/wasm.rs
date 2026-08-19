@@ -14,8 +14,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::common;
 use crate::harness::{
-    amp, antigravity, campfire, claude_code, codex, cursor, cursor_desktop, grok, opencode, pi,
-    simple,
+    amp, antigravity, campfire, claude_code, codex, cursor, cursor_desktop, grok, hermes, opencode,
+    pi, simple,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
@@ -24,11 +24,12 @@ use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 /// `input` is the source session text (JSONL for `claude_code`/codex/pi/campfire,
 /// the Cursor JSON DB export for cursor, the JSON dump of the session's
 /// database rows for `cursor_desktop`, the `opencode export` JSON for
-/// opencode, the JSON bundle of the session directory for grok, the thread
-/// JSON document for amp, the JSON dump of the conversation database for
-/// antigravity, the interchange JSON document for simple); `from`/`to` are
-/// harness names (`"claude_code"`, `"codex"`, `"opencode"`, `"pi"`,
-/// `"campfire"`, `"cursor"`, `"cursor_desktop"`, `"grok"`, `"amp"`,
+/// opencode, the JSON bundle of the session directory for grok, the
+/// `hermes sessions export` JSON object for hermes, the thread JSON document
+/// for amp, the JSON dump of the conversation database for antigravity, the
+/// interchange JSON document for simple); `from`/`to` are harness names
+/// (`"claude_code"`, `"codex"`, `"opencode"`, `"pi"`, `"campfire"`,
+/// `"cursor"`, `"cursor_desktop"`, `"grok"`, `"hermes"`, `"amp"`,
 /// `"antigravity"`, `"simple"`). Returns the target harness's native text.
 #[wasm_bindgen]
 pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
@@ -200,6 +201,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Cursor => go::<cursor::Cursor>(text),
         HarnessId::CursorDesktop => go::<cursor_desktop::CursorDesktop>(text),
         HarnessId::Grok => go::<grok::Grok>(text),
+        HarnessId::Hermes => go::<hermes::Hermes>(text),
         HarnessId::Amp => go::<amp::Amp>(text),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(text),
         HarnessId::Simple => go::<simple::Simple>(text),
@@ -219,6 +221,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Cursor => go::<cursor::Cursor>(common),
         HarnessId::CursorDesktop => go::<cursor_desktop::CursorDesktop>(common),
         HarnessId::Grok => go::<grok::Grok>(common),
+        HarnessId::Hermes => go::<hermes::Hermes>(common),
         HarnessId::Amp => go::<amp::Amp>(common),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(common),
         HarnessId::Simple => go::<simple::Simple>(common),

@@ -22,6 +22,9 @@ use chrono::{DateTime, Utc};
 use crate::common::Meta;
 use crate::harness::{amp, antigravity, campfire, claude_code, codex, cursor, grok, pi};
 
+#[cfg(feature = "hermes")]
+use crate::harness::hermes;
+
 #[cfg(feature = "opencode")]
 use crate::harness::cursor_desktop;
 use crate::{Codec, Common, Error, HarnessId, Result, Store, Transcript};
@@ -43,7 +46,7 @@ pub struct Session {
 
 enum Locator {
     Path(PathBuf),
-    #[cfg(feature = "opencode")]
+    #[cfg(any(feature = "opencode", feature = "hermes"))]
     Id(String),
 }
 
@@ -110,6 +113,22 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
         &mut out,
     );
 
+    #[cfg(feature = "hermes")]
+    {
+        on_store(HarnessId::Hermes, out.len());
+        if let Some(store) = hermes::HermesStore::default_root() {
+            for d in store.discover().unwrap_or_default() {
+                out.push(Session {
+                    harness: HarnessId::Hermes,
+                    meta: d.meta,
+                    // The database doesn't surface a per-session mtime.
+                    updated_at: None,
+                    locator: Locator::Id(d.reference),
+                });
+            }
+        }
+    }
+
     #[cfg(feature = "opencode")]
     {
         on_store(HarnessId::CursorDesktop, out.len());
@@ -154,7 +173,7 @@ impl Session {
         match &self.locator {
             Locator::Path(p) => p.display().to_string(),
             #[cfg(feature = "opencode")]
-            Locator::Id(id) => format!("opencode db session {id}"),
+            Locator::Id(id) => format!("{} db session {id}", self.harness),
         }
     }
 
@@ -185,6 +204,10 @@ impl Session {
             (HarnessId::Amp, Locator::Path(p)) => go(amp::AmpStore::default_root(), p),
             (HarnessId::Antigravity, Locator::Path(p)) => {
                 go(antigravity::AntigravityStore::default_root(), p)
+            }
+            #[cfg(feature = "hermes")]
+            (HarnessId::Hermes, Locator::Id(id)) => {
+                hermes::Hermes::to_common(&required(hermes::HermesStore::default_root())?.load(id)?)
             }
             #[cfg(feature = "opencode")]
             (HarnessId::CursorDesktop, Locator::Id(id)) => {
@@ -226,6 +249,11 @@ impl Session {
             (HarnessId::Antigravity, Locator::Path(p)) => {
                 go(antigravity::AntigravityStore::default_root(), p)
             }
+            // Errors: the Hermes store is read-only.
+            #[cfg(feature = "hermes")]
+            (HarnessId::Hermes, Locator::Id(id)) => {
+                required(hermes::HermesStore::default_root())?.delete(id)
+            }
             #[cfg(feature = "opencode")]
             (HarnessId::CursorDesktop, Locator::Id(id)) => {
                 required(cursor_desktop::CursorDesktopStore::default_root())?.delete(id)
@@ -260,6 +288,9 @@ pub struct Written {
 ///
 /// # Errors
 /// When conversion to the target fails or its store rejects the write.
+// One dispatch arm per harness; length grows with the harness count, not
+// with complexity.
+#[allow(clippy::too_many_lines)]
 pub fn write(
     target: HarnessId,
     common: &Transcript<Common>,
@@ -332,6 +363,16 @@ pub fn write(
             common,
             |s| s.sessions_dir,
         ),
+        // Hermes's state.db is read-only in txcript and Hermes has no
+        // session-import command. Sessions convert *from* Hermes, never
+        // into it.
+        HarnessId::Hermes => Err(Error::Unconvertible {
+            harness: "hermes",
+            detail: "Hermes state.db is read-only and Hermes has no session \
+                     import command; sessions can be converted from Hermes, \
+                     but not continued into it"
+                .to_string(),
+        }),
         // Amp is server-authoritative: threads live on ampcode.com and the
         // CLI has no import, so a locally written thread can never be
         // resumed. Sessions convert *from* amp, never into it.
@@ -443,6 +484,7 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             // the session is in the Agents sidebar.
             HarnessId::CursorDesktop => ("cursor".into(), Vec::new()),
             HarnessId::Grok => ("grok".into(), vec!["--resume".into(), id]),
+            HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),
             HarnessId::Antigravity => ("agy".into(), vec![format!("--conversation={id}")]),
             // Unreachable in practice: Simple sessions are neither discovered

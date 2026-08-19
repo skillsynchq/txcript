@@ -13,6 +13,7 @@ pub mod codex;
 pub mod cursor;
 pub mod cursor_desktop;
 pub mod grok;
+pub mod hermes;
 pub mod opencode;
 pub mod pi;
 pub mod simple;
