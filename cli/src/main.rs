@@ -1313,16 +1313,71 @@ fn handoff(
 }
 
 /// The controlling terminal, opened the way a shell hands it to an
-/// interactive program: read *and* write. A read-only fd passes `isatty()`
-/// but is not the conventional shape, and TUIs can treat it as
-/// non-interactive. `None` when the process has no controlling terminal.
+/// interactive program: read *and* write, and — crucially — by its *real*
+/// device path, not the `/dev/tty` alias. On macOS, kqueue cannot monitor
+/// the alias device: a TUI handed `/dev/tty` as stdin renders but never
+/// receives keys (Node's libuv has a `select()` workaround; Bun-compiled
+/// TUIs like Claude Code do not). The real device is found the way fzf's
+/// `ttyname()` does: stderr usually still points at the terminal in a
+/// pipeline, so match its device id against `/dev`. `None` when the
+/// process has no controlling terminal.
+#[cfg(unix)]
 fn tty_stdin() -> Option<std::fs::File> {
-    let device = if cfg!(windows) { "CONIN$" } else { "/dev/tty" };
+    let open_rw = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .ok()
+    };
+    resolved_tty_path()
+        .as_deref()
+        .and_then(open_rw)
+        .or_else(|| open_rw(std::path::Path::new("/dev/tty")))
+}
+
+#[cfg(windows)]
+fn tty_stdin() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(device)
+        .open("CONIN$")
         .ok()
+}
+
+/// The real device path of the terminal on stderr (or stdout): fstat the
+/// stream, then scan `/dev/pts/` (Linux) and `/dev/` for the character
+/// device with the same device id. `None` when neither stream is a
+/// terminal or nothing in `/dev` matches.
+#[cfg(unix)]
+fn resolved_tty_path() -> Option<PathBuf> {
+    use std::io::IsTerminal;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let stream_rdev = |fd: i32, terminal: bool| {
+        terminal
+            .then(|| std::fs::metadata(format!("/dev/fd/{fd}")).ok())
+            .flatten()
+            .map(|m| m.rdev())
+    };
+    let rdev = stream_rdev(2, std::io::stderr().is_terminal())
+        .or_else(|| stream_rdev(1, std::io::stdout().is_terminal()))?;
+
+    for dir in ["/dev/pts", "/dev"] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata()
+                && meta.file_type().is_char_device()
+                && meta.rdev() == rdev
+                && entry.path() != std::path::Path::new("/dev/tty")
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(unix))]
