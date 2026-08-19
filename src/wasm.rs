@@ -15,6 +15,7 @@ use wasm_bindgen::prelude::*;
 use crate::common;
 use crate::harness::{
     amp, antigravity, campfire, claude_code, codex, cursor, cursor_desktop, grok, opencode, pi,
+    simple,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
@@ -25,10 +26,10 @@ use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 /// database rows for `cursor_desktop`, the `opencode export` JSON for
 /// opencode, the JSON bundle of the session directory for grok, the thread
 /// JSON document for amp, the JSON dump of the conversation database for
-/// antigravity); `from`/`to` are harness names (`"claude_code"`, `"codex"`,
-/// `"opencode"`, `"pi"`, `"campfire"`, `"cursor"`, `"cursor_desktop"`,
-/// `"grok"`, `"amp"`, `"antigravity"`). Returns the target harness's native
-/// text.
+/// antigravity, the interchange JSON document for simple); `from`/`to` are
+/// harness names (`"claude_code"`, `"codex"`, `"opencode"`, `"pi"`,
+/// `"campfire"`, `"cursor"`, `"cursor_desktop"`, `"grok"`, `"amp"`,
+/// `"antigravity"`, `"simple"`). Returns the target harness's native text.
 #[wasm_bindgen]
 pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
     parse_harness(from)
@@ -201,6 +202,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Grok => go::<grok::Grok>(text),
         HarnessId::Amp => go::<amp::Amp>(text),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(text),
+        HarnessId::Simple => go::<simple::Simple>(text),
     }
 }
 
@@ -219,6 +221,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Grok => go::<grok::Grok>(common),
         HarnessId::Amp => go::<amp::Amp>(common),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(common),
+        HarnessId::Simple => go::<simple::Simple>(common),
     }
 }
 

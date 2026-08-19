@@ -18,6 +18,7 @@ mod opencode;
 mod path_safety;
 mod pi;
 mod properties;
+mod simple;
 mod store_delete;
 
 #[cfg(feature = "search")]

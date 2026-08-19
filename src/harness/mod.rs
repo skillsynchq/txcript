@@ -15,6 +15,7 @@ pub mod cursor_desktop;
 pub mod grok;
 pub mod opencode;
 pub mod pi;
+pub mod simple;
 
 pub(crate) mod jsonl;
 

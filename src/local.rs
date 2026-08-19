@@ -349,6 +349,15 @@ pub fn write(
             common,
             |s| s.root,
         ),
+        // Simple is an interchange *input*: documents are handed to txcript
+        // directly (a file, stdin, the WASM text API) rather than managed in
+        // a directory of its own, so there is nowhere to write one back to.
+        HarnessId::Simple => Err(Error::Unconvertible {
+            harness: "simple",
+            detail: "simple is an interchange input; sessions are continued \
+                     from Simple documents, not written into them"
+                .to_string(),
+        }),
         // `opencode import` writes into the live database wherever it lives;
         // honoring a root override is impossible, and ignoring it would send
         // an "export" into the user's real store.
@@ -436,6 +445,9 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             HarnessId::Grok => ("grok".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),
             HarnessId::Antigravity => ("agy".into(), vec![format!("--conversation={id}")]),
+            // Unreachable in practice: Simple sessions are neither discovered
+            // nor written, so nothing resumes one. There is no native app.
+            HarnessId::Simple => ("txcript".into(), Vec::new()),
         }
     })
 }
