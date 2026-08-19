@@ -1287,24 +1287,27 @@ fn handoff(
     workdir: Option<&std::path::Path>,
     stdin: Option<std::fs::File>,
 ) -> Result<ExitCode, String> {
-    let spawn = |program: &str| {
+    // The `.cmd` retry below needs its own handle; take it before the first
+    // spawn consumes `stdin`.
+    let retry_stdin = stdin.as_ref().and_then(|f| f.try_clone().ok());
+    let spawn = |program: &str, stdin: Option<std::fs::File>| {
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }
-        if let Some(stdin) = stdin.as_ref().and_then(|f| f.try_clone().ok()) {
+        if let Some(stdin) = stdin {
             cmd.stdin(stdin);
         }
         cmd.status()
     };
-    let status = match spawn(bin) {
+    let status = match spawn(bin, stdin) {
         Ok(status) => status,
         // npm-installed harnesses are `.cmd` shims on Windows, which
         // CreateProcess won't resolve from the bare name; the explicit
         // extension makes std route the launch through cmd.exe.
         Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::NotFound => {
-            spawn(&format!("{bin}.cmd"))
+            spawn(&format!("{bin}.cmd"), retry_stdin)
                 .map_err(|_| format!("failed to launch `{bin}`: {e} (is it on PATH?)"))?
         }
         Err(e) => return Err(format!("failed to launch `{bin}`: {e} (is it on PATH?)")),
