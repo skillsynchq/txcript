@@ -14,6 +14,7 @@ mod cross_harness;
 mod cursor;
 mod cursor_desktop;
 mod grok;
+mod hermes;
 mod opencode;
 mod path_safety;
 mod pi;

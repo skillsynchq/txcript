@@ -82,10 +82,13 @@ harness = false
 required-features = ["search"]
 
 [features]
-default = ["opencode", "search"]
+default = ["opencode", "hermes", "search"]
 # The OpenCode harness store reads OpenCode's SQLite database. The OpenCode
 # codec itself is always available; only the on-disk store needs rusqlite.
 opencode = ["dep:rusqlite"]
+# Hermes Agent's canonical session store is SQLite. The JSON export codec is
+# always available; only local discovery/loading needs rusqlite.
+hermes = ["dep:rusqlite"]
 # Fuzzy/substring search over transcripts (`txcript::search`). nucleo-matcher
 # is pure Rust (helix's matcher) and compiles to wasm32; combine with `wasm`
 # to expose the bindings.

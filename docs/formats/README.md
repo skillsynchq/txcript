@@ -45,6 +45,7 @@ than none.
 | [cursor.md](cursor.md) | Cursor | `src/harness/cursor.rs` |
 | [amp.md](amp.md) | Amp (Sourcegraph) | `src/harness/amp.rs` |
 | [grok.md](grok.md) | Grok CLI (xAI) | `src/harness/grok.rs` |
+| [hermes.md](hermes.md) | Hermes Agent | `src/harness/hermes.rs` |
 | [antigravity.md](antigravity.md) | Antigravity (Google) | `src/harness/antigravity.rs` |
 | [pi.md](pi.md) | pi | `src/harness/pi.rs` |
 | [campfire.md](campfire.md) | Campfire (embeds pi) | `src/harness/campfire.rs` |
