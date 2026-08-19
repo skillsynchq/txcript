@@ -12,6 +12,9 @@
 //!     [--from <harness>]                    #   scope the id lookup to one harness
 //!     [--out <dir>]                         #   write under <dir>; implies --no-resume
 //!     [--no-resume]                         #   write the session but don't launch
+//! txcript continue <file|->[#range]     # continue a Simple document (file, or stdin
+//!     --with <harness> [...]                #   for `-`) into <harness>; see
+//!                                           #   docs/formats/simple.md
 //! txcript view <id>[#range]             # print a session as compact text
 //!     [--from <harness>]                    #   scope the id lookup to one harness
 //! txcript query '<pattern>'             # one-shot search, print ranked hits
@@ -42,7 +45,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use txcript::harness::amp;
+use txcript::harness::{amp, simple};
 use txcript::{Codec, Common, HarnessId, TextCodec, Transcript, local};
 
 mod fragment;
@@ -93,13 +96,19 @@ enum Command {
     /// A `#range` suffix continues just those messages (as a new session);
     /// ranges that cut a tool call away from its result are refused.
     ///
+    /// The argument may also be a Simple interchange document — a file
+    /// path, or `-` for stdin — instead of a local session: any agent's
+    /// transcript in the format of docs/formats/simple.md continues into
+    /// the harness named by --with (required for documents).
+    ///
     /// Anything that writes a copy writes a *new* session, with its own id and
     /// today's timestamp — the source is never modified. The printed resume
     /// command carries the new id.
     Continue {
-        /// Session id (any unambiguous prefix) or its exact title, with an
-        /// optional `#range` of 1-based inclusive message numbers
-        /// (`abc#5-12`, `#7`, `#5-`, `#-10`)
+        /// Session id (any unambiguous prefix) or its exact title; or a
+        /// Simple document (a file path, `-` for stdin). Takes an optional
+        /// `#range` of 1-based inclusive message numbers (`abc#5-12`, `#7`,
+        /// `#5-`, `#-10`)
         // Other: without a hint, generated completions fall back to filenames.
         #[arg(value_hint = clap::ValueHint::Other)]
         id: String,
@@ -760,6 +769,27 @@ fn cmd_continue(
     out: Option<&PathBuf>,
     no_resume: bool,
 ) -> Result<ExitCode, String> {
+    // A Simple interchange document (stdin, or an existing file) rather than
+    // a local session id. Checked before discovery: the document names its
+    // input directly, so no session can shadow it.
+    if let Some((input, request)) = document_source(id) {
+        if from.is_some() {
+            return Err(
+                "--from scopes the search for a local session; a Simple document \
+                 is its own input and takes --with only"
+                    .to_string(),
+            );
+        }
+        let resume = out.is_none() && !no_resume;
+        return continue_document(
+            &input,
+            request.as_ref(),
+            with,
+            out.map(PathBuf::as_path),
+            resume,
+        );
+    }
+
     // Locate the session by id (exact or unambiguous prefix) or exact title,
     // optionally scoped to one harness.
     let sessions = discover_with_spinner();
@@ -796,8 +826,179 @@ fn cmd_continue(
         }
         None => Err(match from {
             Some(h) => format!("no {h} session matches `{src}` (try `txcript list`)"),
+            // A path-looking argument that named no file falls through to the
+            // session lookup; say so, or the "no session" alone misleads.
+            None if src.contains(['/', '\\']) => format!(
+                "no local session matches `{src}`, and no such file exists \
+                 (a Simple document must be an existing file, or `-` for stdin)"
+            ),
             None => format!("no local session matches `{src}` (try `txcript list`)"),
         }),
+    }
+}
+
+/// What `continue` received when it wasn't a session id: a Simple document
+/// on stdin or in a file.
+enum DocInput {
+    Stdin,
+    File(PathBuf),
+}
+
+/// Recognize a document argument. `-` is stdin; an argument (or its part
+/// before a `#range` suffix) naming an existing file is that file. A whole
+/// argument that is an existing file wins over the range interpretation, so
+/// a filename containing `#` still opens. Everything else is a session
+/// reference for the discovery path.
+fn document_source(input: &str) -> Option<(DocInput, Option<fragment::SpanReq>)> {
+    if input == "-" {
+        return Some((DocInput::Stdin, None));
+    }
+    if std::path::Path::new(input).is_file() {
+        return Some((DocInput::File(PathBuf::from(input)), None));
+    }
+    let (src, request) = fragment::parse_ref(input);
+    if src == "-" {
+        return Some((DocInput::Stdin, request));
+    }
+    if std::path::Path::new(src).is_file() {
+        return Some((DocInput::File(PathBuf::from(src)), request));
+    }
+    None
+}
+
+/// Continue a Simple document into `--with`: parse, convert, write into the
+/// target's store, launch. The document is read once and never modified;
+/// from here on the conversation lives in the target harness.
+fn continue_document(
+    input: &DocInput,
+    span_req: Option<&fragment::SpanReq>,
+    with: Option<HarnessId>,
+    out: Option<&std::path::Path>,
+    resume: bool,
+) -> Result<ExitCode, String> {
+    let target = with.ok_or_else(|| {
+        "a Simple document has no harness of its own to resume; \
+         pass --with <harness> (e.g. --with claude_code)"
+            .to_string()
+    })?;
+    let text = match input {
+        DocInput::Stdin => {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                .map_err(|e| format!("reading stdin: {e}"))?;
+            buffer
+        }
+        DocInput::File(path) => {
+            std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?
+        }
+    };
+    let origin = match input {
+        DocInput::Stdin => None,
+        DocInput::File(path) => Some(path.as_path()),
+    };
+    let common = document_to_common(&text, origin)?;
+
+    let mut copy = match span_req {
+        Some(req) => fragment::sliced(&common, req)?,
+        None => common,
+    };
+    fresh_identity(&mut copy, target, out);
+    if copy.meta.id.is_empty() {
+        // An `--out` export keeps the source identity — which stdin may not
+        // carry at all. The target store still needs a file name.
+        copy.meta.id = uuid::Uuid::new_v4().to_string();
+    }
+    // A document without a recorded cwd continues *here*: the target stores
+    // shard by cwd, and "the directory the user ran txcript in" is the only
+    // sensible home for a transcript that never had one.
+    if out.is_none()
+        && copy.meta.cwd.as_deref().unwrap_or("").is_empty()
+        && let Ok(current) = std::env::current_dir()
+    {
+        copy.meta.cwd = Some(current.to_string_lossy().into_owned());
+    }
+    stamp_live_cwd(&mut copy, out);
+    let resume_id = write_and_report(HarnessId::Simple, target, &copy, out)?;
+    // Stdin was consumed by the document; hand the launched harness the
+    // terminal instead, or an interactive resume would read EOF.
+    let stdin_tty = matches!(input, DocInput::Stdin);
+    launch_via(
+        target,
+        &resume_id,
+        copy.meta.cwd.as_deref(),
+        resume,
+        stdin_tty,
+    )
+}
+
+/// Parse a Simple document into the canonical model, backfilling an empty id
+/// from the file stem (the same fallback the file-backed stores use).
+fn document_to_common(
+    text: &str,
+    origin: Option<&std::path::Path>,
+) -> Result<Transcript<Common>, String> {
+    let native = simple::Simple::from_text(text).map_err(|e| e.to_string())?;
+    let mut common = simple::Simple::to_common(&native).map_err(|e| e.to_string())?;
+    if common.meta.id.is_empty()
+        && let Some(stem) = origin.and_then(|p| p.file_stem())
+    {
+        common.meta.id = stem.to_string_lossy().into_owned();
+    }
+    Ok(common)
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::{DocInput, document_source, document_to_common};
+
+    #[test]
+    fn dash_is_stdin_and_session_references_are_not_documents() {
+        assert!(matches!(
+            document_source("-"),
+            Some((DocInput::Stdin, None))
+        ));
+        assert!(matches!(
+            document_source("-#1-3"),
+            Some((DocInput::Stdin, Some(_)))
+        ));
+        assert!(document_source("a57bc87d").is_none());
+        assert!(document_source("Fix the parser").is_none());
+        // A path spelling that names no file is not a document either; the
+        // session lookup owns the error message.
+        assert!(document_source("./no/such/file.json").is_none());
+    }
+
+    #[test]
+    fn an_existing_file_wins_over_the_range_interpretation() {
+        let dir = tempfile::tempdir().unwrap();
+        let hashed = dir.path().join("notes#5.json");
+        std::fs::write(&hashed, "{}").unwrap();
+        // The whole argument names a real file: no range is split off.
+        assert!(matches!(
+            document_source(hashed.to_str().unwrap()),
+            Some((DocInput::File(p), None)) if p == hashed
+        ));
+
+        let plain = dir.path().join("run.json");
+        std::fs::write(&plain, "{}").unwrap();
+        let ranged = format!("{}#1-2", plain.display());
+        assert!(matches!(
+            document_source(&ranged),
+            Some((DocInput::File(p), Some(_))) if p == plain
+        ));
+    }
+
+    #[test]
+    fn an_empty_document_id_falls_back_to_the_file_stem() {
+        let text = r#"{"messages": [{"role": "user", "content": "hi"}]}"#;
+        let from_file = document_to_common(
+            text,
+            Some(std::path::Path::new("/anywhere/dropped-here.json")),
+        )
+        .unwrap();
+        assert_eq!(from_file.meta.id, "dropped-here");
+        // Stdin has no name to borrow; the id stays empty for the caller.
+        assert_eq!(document_to_common(text, None).unwrap().meta.id, "");
     }
 }
 
@@ -970,6 +1171,19 @@ fn launch(
     cwd: Option<&str>,
     resume: bool,
 ) -> Result<ExitCode, String> {
+    launch_via(target, resume_id, cwd, resume, false)
+}
+
+/// [`launch`], optionally reattaching the controlling terminal as the
+/// harness's stdin — needed when the session document was itself read from
+/// stdin, which an interactive resume would otherwise find at EOF.
+fn launch_via(
+    target: HarnessId,
+    resume_id: &str,
+    cwd: Option<&str>,
+    resume: bool,
+    stdin_tty: bool,
+) -> Result<ExitCode, String> {
     let (bin, args) = local::resume_command(target, resume_id);
     if resume {
         // Hand the terminal to the harness — replaces this process on Unix.
@@ -994,7 +1208,12 @@ fn launch(
         if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
             std::thread::sleep(std::time::Duration::from_millis(600));
         }
-        handoff(&bin, &args, workdir.as_deref())
+        handoff(
+            &bin,
+            &args,
+            workdir.as_deref(),
+            stdin_tty.then(tty_stdin).flatten(),
+        )
     } else {
         println!(
             "  resume with: {}",
@@ -1037,6 +1256,7 @@ fn handoff(
     bin: &str,
     args: &[String],
     workdir: Option<&std::path::Path>,
+    stdin: Option<std::fs::File>,
 ) -> Result<ExitCode, String> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(bin);
@@ -1044,9 +1264,20 @@ fn handoff(
     if let Some(dir) = workdir {
         cmd.current_dir(dir);
     }
+    if let Some(stdin) = stdin {
+        cmd.stdin(stdin);
+    }
     // `exec` only returns if it failed to launch.
     let e = cmd.exec();
     Err(format!("failed to launch `{bin}`: {e} (is it on PATH?)"))
+}
+
+/// The controlling terminal's input stream, if there is one. `None` (in a
+/// truly headless run) leaves the exhausted pipe in place, which the
+/// harness will see as EOF — the honest signal available.
+fn tty_stdin() -> Option<std::fs::File> {
+    let device = if cfg!(windows) { "CONIN$" } else { "/dev/tty" };
+    std::fs::File::open(device).ok()
 }
 
 #[cfg(not(unix))]
@@ -1054,12 +1285,16 @@ fn handoff(
     bin: &str,
     args: &[String],
     workdir: Option<&std::path::Path>,
+    stdin: Option<std::fs::File>,
 ) -> Result<ExitCode, String> {
     let spawn = |program: &str| {
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
+        }
+        if let Some(stdin) = stdin.as_ref().and_then(|f| f.try_clone().ok()) {
+            cmd.stdin(stdin);
         }
         cmd.status()
     };

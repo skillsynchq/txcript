@@ -29,5 +29,8 @@ txcript = { version = "0.7.0", path = "..", features = ["opencode", "search"] }
 # v7 for codex rollouts, v4 for every other harness — see `fresh_identity`.
 uuid = { version = "1.23.4", features = ["v4", "v7"] }
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true
