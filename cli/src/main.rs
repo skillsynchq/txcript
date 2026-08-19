@@ -845,25 +845,32 @@ enum DocInput {
 }
 
 /// Recognize a document argument. `-` is stdin; an argument (or its part
-/// before a `#range` suffix) naming an existing file is that file. A whole
-/// argument that is an existing file wins over the range interpretation, so
-/// a filename containing `#` still opens. Everything else is a session
-/// reference for the discovery path.
+/// before a `#range` suffix) naming an existing readable path is that
+/// document. A whole argument that names one wins over the range
+/// interpretation, so a filename containing `#` still opens. Everything
+/// else is a session reference for the discovery path.
 fn document_source(input: &str) -> Option<(DocInput, Option<fragment::SpanReq>)> {
     if input == "-" {
         return Some((DocInput::Stdin, None));
     }
-    if std::path::Path::new(input).is_file() {
+    if readable_document(input) {
         return Some((DocInput::File(PathBuf::from(input)), None));
     }
     let (src, request) = fragment::parse_ref(input);
     if src == "-" {
         return Some((DocInput::Stdin, request));
     }
-    if std::path::Path::new(src).is_file() {
+    if readable_document(src) {
         return Some((DocInput::File(PathBuf::from(src)), request));
     }
     None
+}
+
+/// Anything openable that isn't a directory: regular files, and the pipes
+/// behind process substitution (`<(my-agent --dump)` arrives as
+/// `/dev/fd/N`, a FIFO — `is_file()` alone would refuse it).
+fn readable_document(path: &str) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| !m.is_dir())
 }
 
 /// Continue a Simple document into `--with`: parse, convert, write into the
@@ -892,9 +899,11 @@ fn continue_document(
             std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?
         }
     };
+    // Only a real file's stem is a meaningful identity; a process
+    // substitution's `/dev/fd/N` would leak "N" as the session id.
     let origin = match input {
         DocInput::Stdin => None,
-        DocInput::File(path) => Some(path.as_path()),
+        DocInput::File(path) => Some(path.as_path()).filter(|p| p.is_file()),
     };
     let common = document_to_common(&text, origin)?;
 
@@ -986,6 +995,24 @@ mod document_tests {
             document_source(&ranged),
             Some((DocInput::File(p), Some(_))) if p == plain
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_a_document_like_process_substitution_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fd-like");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(matches!(
+            document_source(fifo.to_str().unwrap()),
+            Some((DocInput::File(p), None)) if p == fifo
+        ));
+        // A directory is never a document.
+        assert!(document_source(dir.path().to_str().unwrap()).is_none());
     }
 
     #[test]
@@ -1185,42 +1212,55 @@ fn launch_via(
     stdin_tty: bool,
 ) -> Result<ExitCode, String> {
     let (bin, args) = local::resume_command(target, resume_id);
-    if resume {
-        // Hand the terminal to the harness — replaces this process on Unix.
-        let workdir = resume_workdir(cwd);
-        // The id inside the command came from a session file; scrub it for
-        // display (the exec below still gets the exact argv).
-        let shown = style::scrub(
-            &std::iter::once(&bin)
-                .chain(&args)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-        match &workdir {
-            Some(dir) => eprintln!(
-                "resuming: {shown} {}",
-                style::dim(&format!("(in {})", dir.display()), style::enabled_err())
-            ),
-            None => eprintln!("resuming: {shown}"),
-        }
-        // Brief pause so users can read or cancel before exec.
-        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-            std::thread::sleep(std::time::Duration::from_millis(600));
-        }
-        handoff(
-            &bin,
-            &args,
-            workdir.as_deref(),
-            stdin_tty.then(tty_stdin).flatten(),
-        )
-    } else {
-        println!(
-            "  resume with: {}",
-            style::scrub(&format!("{} {}", bin, args.join(" ")))
-        );
-        Ok(ExitCode::SUCCESS)
+    if !resume {
+        return print_resume_command(&bin, &args);
     }
+    // The session document consumed stdin; the harness needs the controlling
+    // terminal instead — the same reclaim less and fzf do at the end of a
+    // pipeline. Without one (truly headless), exec'ing an interactive
+    // harness onto the spent pipe would just hang it: print the command.
+    let stdin = if stdin_tty {
+        let Some(tty) = tty_stdin() else {
+            eprintln!("stdin carried the session document and no terminal is available");
+            return print_resume_command(&bin, &args);
+        };
+        Some(tty)
+    } else {
+        None
+    };
+    // Hand the terminal to the harness — replaces this process on Unix.
+    let workdir = resume_workdir(cwd);
+    // The id inside the command came from a session file; scrub it for
+    // display (the exec below still gets the exact argv).
+    let shown = style::scrub(
+        &std::iter::once(&bin)
+            .chain(&args)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    match &workdir {
+        Some(dir) => eprintln!(
+            "resuming: {shown} {}",
+            style::dim(&format!("(in {})", dir.display()), style::enabled_err())
+        ),
+        None => eprintln!("resuming: {shown}"),
+    }
+    // Brief pause so users can read or cancel before exec.
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+    handoff(&bin, &args, workdir.as_deref(), stdin)
+}
+
+// Result-shaped to slot into `launch_via`'s return paths.
+#[allow(clippy::unnecessary_wraps)]
+fn print_resume_command(bin: &str, args: &[String]) -> Result<ExitCode, String> {
+    println!(
+        "  resume with: {}",
+        style::scrub(&format!("{} {}", bin, args.join(" ")))
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Return the recorded cwd if it exists; otherwise warn and use the current
@@ -1272,12 +1312,17 @@ fn handoff(
     Err(format!("failed to launch `{bin}`: {e} (is it on PATH?)"))
 }
 
-/// The controlling terminal's input stream, if there is one. `None` (in a
-/// truly headless run) leaves the exhausted pipe in place, which the
-/// harness will see as EOF — the honest signal available.
+/// The controlling terminal, opened the way a shell hands it to an
+/// interactive program: read *and* write. A read-only fd passes `isatty()`
+/// but is not the conventional shape, and TUIs can treat it as
+/// non-interactive. `None` when the process has no controlling terminal.
 fn tty_stdin() -> Option<std::fs::File> {
     let device = if cfg!(windows) { "CONIN$" } else { "/dev/tty" };
-    std::fs::File::open(device).ok()
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device)
+        .ok()
 }
 
 #[cfg(not(unix))]
