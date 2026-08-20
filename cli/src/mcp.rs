@@ -331,6 +331,10 @@ fn chunk_ranges(sizes: &[usize], start: usize, budget: usize) -> Vec<std::ops::R
     chunks
 }
 
+// rmcp's macro emits an `async fn` with no `.await`; clippy 1.98's
+// `unused_async_trait_impl` fires on that generated code, not on ours.
+// `unknown_lints` keeps older clippies quiet about the newer lint name.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for TxcriptServer {
     fn get_info(&self) -> ServerInfo {
