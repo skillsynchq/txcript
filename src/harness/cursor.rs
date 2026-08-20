@@ -1874,7 +1874,7 @@ fn md5_hex(data: &[u8]) -> String {
         *slot = ((f64::sin((i + 1) as f64).abs() * 4_294_967_296.0).floor()) as u32;
     }
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             let start = i * 4;
@@ -2009,7 +2009,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend(bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let start = i * 4;
@@ -2081,8 +2081,10 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len().is_multiple_of(2) {
         bytes
-            .chunks_exact(2)
-            .map(|pair| Ok((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[hi, lo]| Ok((hex_value(*hi)? << 4) | hex_value(*lo)?))
             .collect()
     } else {
         Err("hex string has odd length".to_string())

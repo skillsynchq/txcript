@@ -2204,8 +2204,10 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len().is_multiple_of(2) {
         bytes
-            .chunks_exact(2)
-            .map(|pair| Ok((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[hi, lo]| Ok((hex_value(*hi)? << 4) | hex_value(*lo)?))
             .collect()
     } else {
         Err("hex string has odd length".to_string())
