@@ -10,6 +10,7 @@ mod amp;
 mod antigravity;
 mod claude_code;
 mod codex;
+mod cowork;
 mod cross_harness;
 mod cursor;
 mod cursor_desktop;

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::common::Meta;
-use crate::harness::{amp, antigravity, campfire, claude_code, codex, cursor, grok, pi};
+use crate::harness::{amp, antigravity, campfire, claude_code, codex, cowork, cursor, grok, pi};
 
 #[cfg(feature = "hermes")]
 use crate::harness::hermes;
@@ -110,6 +110,12 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
     scan(
         HarnessId::Antigravity,
         antigravity::AntigravityStore::default_root(),
+        &mut out,
+    );
+    on_store(HarnessId::Cowork, out.len());
+    scan(
+        HarnessId::Cowork,
+        cowork::CoworkStore::default_root(),
         &mut out,
     );
 
@@ -205,6 +211,7 @@ impl Session {
             (HarnessId::Antigravity, Locator::Path(p)) => {
                 go(antigravity::AntigravityStore::default_root(), p)
             }
+            (HarnessId::Cowork, Locator::Path(p)) => go(cowork::CoworkStore::default_root(), p),
             #[cfg(feature = "hermes")]
             (HarnessId::Hermes, Locator::Id(id)) => {
                 hermes::Hermes::to_common(&required(hermes::HermesStore::default_root())?.load(id)?)
@@ -249,6 +256,7 @@ impl Session {
             (HarnessId::Antigravity, Locator::Path(p)) => {
                 go(antigravity::AntigravityStore::default_root(), p)
             }
+            (HarnessId::Cowork, Locator::Path(p)) => go(cowork::CoworkStore::default_root(), p),
             // Errors: the Hermes store is read-only.
             #[cfg(feature = "hermes")]
             (HarnessId::Hermes, Locator::Id(id)) => {
@@ -390,6 +398,13 @@ pub fn write(
             common,
             |s| s.root,
         ),
+        HarnessId::Cowork => go(
+            cowork::CoworkStore::default_root(),
+            cowork::CoworkStore::new,
+            root,
+            common,
+            |s| s.root,
+        ),
         // Simple is an interchange *input*: documents are handed to txcript
         // directly (a file, stdin, the WASM text API) rather than managed in
         // a directory of its own, so there is nowhere to write one back to.
@@ -487,6 +502,12 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),
             HarnessId::Antigravity => ("agy".into(), vec![format!("--conversation={id}")]),
+            // No per-session entry point: the Claude desktop app lists the
+            // session under Cowork once it restarts or rescans.
+            HarnessId::Cowork if cfg!(target_os = "macos") => {
+                ("open".into(), vec!["-a".into(), "Claude".into()])
+            }
+            HarnessId::Cowork => ("Claude".into(), Vec::new()),
             // Unreachable in practice: Simple sessions are neither discovered
             // nor written, so nothing resumes one. There is no native app.
             HarnessId::Simple => ("txcript".into(), Vec::new()),

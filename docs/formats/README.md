@@ -40,6 +40,7 @@ than none.
 | Document | Harness | Parser |
 | --- | --- | --- |
 | [claude-code.md](claude-code.md) | Claude Code (Anthropic) | `src/harness/claude_code.rs` |
+| [cowork.md](cowork.md) | Cowork (Claude desktop app) | `src/harness/cowork.rs` |
 | [codex.md](codex.md) | Codex CLI (OpenAI) | `src/harness/codex.rs` |
 | [opencode.md](opencode.md) | OpenCode (SST) | `src/harness/opencode.rs` |
 | [cursor.md](cursor.md) | Cursor | `src/harness/cursor.rs` |

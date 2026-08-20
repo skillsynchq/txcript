@@ -6,8 +6,8 @@
 use chrono::{DateTime, Utc};
 use txcript::common;
 use txcript::harness::{
-    amp, antigravity, campfire, claude_code, codex, cursor, cursor_desktop, grok, hermes, opencode,
-    pi, simple,
+    amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, grok, hermes,
+    opencode, pi, simple,
 };
 use txcript::{Codec, Common, Transcript, convert};
 
@@ -213,8 +213,15 @@ fn conversation_survives_every_hop() {
         "simple"
     );
 
+    let cowork = convert::<simple::Simple, cowork::Cowork>(&simple).unwrap();
+    assert_eq!(
+        signature(&cowork::Cowork::to_common(&cowork).unwrap()),
+        expected,
+        "cowork"
+    );
+
     // And all the way back to Claude.
-    let round = convert::<simple::Simple, claude_code::ClaudeCode>(&simple).unwrap();
+    let round = convert::<cowork::Cowork, claude_code::ClaudeCode>(&cowork).unwrap();
     assert_eq!(
         signature(&claude_code::ClaudeCode::to_common(&round).unwrap()),
         expected,

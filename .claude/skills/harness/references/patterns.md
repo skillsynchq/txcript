@@ -187,6 +187,43 @@ blindly.
   (RFC 3986 unreserved kept); a session dir is sniffed by the presence of
   either log; discovery meta comes cheap from `summary.json`.
 
+## cowork — app record + embedded Claude Code JSONL, consumer read from the app bundle
+
+- Body = `CoworkSession { header: Header (typed required/meta fields +
+  flatten extra), transcript: Vec<claude_code::Record>, audit: Vec<Value> }`.
+  The conversation IS Claude Code's JSONL under a per-task
+  `CLAUDE_CONFIG_DIR`, so the codec delegates to `claude_code`'s
+  `pub(crate)` `records_to_messages`/`messages_to_records` (extracted for
+  this; the campfire move applied to a non-sibling) with `meta.id` swapped
+  for the `cliSessionId`. Nothing Cowork-specific is re-parsed.
+- **The consumer was read, not probed**: the desktop app has no CLI, so the
+  regeneration contract came from its bundled JS (`npx @electron/asar
+  extract`, then grep the `.vite/build/*.chunk-*.js` for the session
+  manager). Its zod schema for `local_*.json` is `.passthrough()` with five
+  required keys (`sessionId`, `processName`, `cwd`, `createdAt`,
+  `lastActivityAt`); a record failing it is silently not listed. The
+  transcript is located by `cliSessionId` under *any* project slug, so the
+  slug need not match Claude Code's (hash-truncated) encoding of long cwds.
+- Shell gotcha that burned an hour: `grep` was aliased to ugrep, which
+  rejects long-context patterns on minified lines, and BSD grep caps `\{n\}`
+  at 255 — use a Python `re` script for bundle archaeology.
+- `audit.jsonl` is an HMAC chain keyed via Electron `safeStorage`: carried
+  verbatim on native round trips, never written (the app accepts unsigned
+  and absent logs). Synthesized fields: `processName` (`txcript-<8 hex>`),
+  `hostLoopMode: true` (host CLI, not the VM), `initialMessage`,
+  `lastActivityAt` = last message. `cliSessionId` = UUIDv5 of the session id.
+- Ids are `local_<uuid>`; foreign ids get the prefix (the one documented
+  `Meta` change through Common). Store root is the Electron userData dir;
+  account trees are `<org-uuid>/<account-uuid>/` (both levels UUID-shaped —
+  that's the sniff against sibling app state); `save` picks the tree with the
+  youngest record. The app loads records once at startup: a written session
+  shows up after quit + relaunch, and there is no per-session deep link
+  (`claude://resume?session=` targets the app's *Claude Code* surface).
+- Resume verification split: Cowork → Claude Code headless (`claude -p
+  --resume` from an unrelated cwd) and TUI; Claude Code → Cowork only via the
+  app, because the per-task config dir has no credentials (`claude -p` under
+  it says "Not logged in") — the user drives that check.
+
 ## Cross-cutting invariants (all)
 
 - Fallback-to-raw at every level: record → `Other(Value)`, tool →

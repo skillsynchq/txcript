@@ -47,7 +47,7 @@ txcript maps each harness's native transcript format through a typed common mode
 
 ## Highlights
 
-- **12 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
+- **13 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
 - **A format for everyone else**: agents txcript has never heard of emit the documented [Simple](docs/formats/simple.md) interchange JSON — a file or a stream, handed to txcript directly — and their transcripts continue in any supported harness.
 - **Byte-lossless round-trips**: loading and saving a session in its own format reproduces it exactly.
 - **Continue anywhere**: `txcript continue <id> --with <harness>` rewrites a session into another harness's native format and launches it. The original is never modified.
@@ -60,6 +60,7 @@ txcript maps each harness's native transcript format through a typed common mode
 ```mermaid
 flowchart LR
     claude["Claude Code"] <--> common(("Transcript&lt;Common&gt;"))
+    cowork["Cowork"] <--> common
     codex["Codex"] <--> common
     opencode["OpenCode"] <--> common
     pi["pi"] <--> common
@@ -78,6 +79,7 @@ Discovery, listing, search, `view`, and native round-trips work for every harnes
 | Harness | id | Sessions on disk | Native format | Convert | Continue into | Doc |
 |---|---|---|---|:---:|:---:|---|
 | [Claude Code](https://claude.com/claude-code) | `claude_code` | `~/.claude/projects/` | JSONL | ⇄ | ✓ | [spec](docs/formats/claude-code.md) |
+| [Cowork](https://claude.com/product/cowork) | `cowork` | `<Claude app data>/local-agent-mode-sessions/` | session record + Claude Code JSONL | ⇄ | ✓ | [spec](docs/formats/cowork.md) |
 | [Codex](https://github.com/openai/codex) | `codex` | `~/.codex/sessions/` | rollout JSONL | ⇄ | ✓ | [spec](docs/formats/codex.md) |
 | [OpenCode](https://opencode.ai) | `opencode` | `~/.local/share/opencode/opencode.db` | SQLite | ⇄ | ✓ | [spec](docs/formats/opencode.md) |
 | [pi](https://pi.dev) | `pi` | `~/.pi/agent/sessions/` | JSONL | ⇄ | ✓ | [spec](docs/formats/pi.md) |
@@ -275,7 +277,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","hermes","amp","antigravity","simple"]
+harnesses(); // ["claude_code","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","hermes","amp","antigravity","simple","cowork"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -291,6 +293,7 @@ Text-in / text-out: `input` is the source harness's native session text and the 
 | `amp` | `amp threads export` JSON |
 | `antigravity` | JSON dump of the conversation database, protobuf blobs hex-encoded |
 | `simple` | the [Simple](docs/formats/simple.md) interchange JSON document |
+| `cowork` | JSON bundle of the session record, Claude Code transcript, and audit log |
 
 To build the wasm from source instead:
 

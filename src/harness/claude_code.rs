@@ -146,157 +146,174 @@ impl<'de> Deserialize<'de> for Record {
 
 impl Codec for ClaudeCode {
     fn to_common(transcript: &Transcript<Self>) -> Result<Transcript<Common>> {
-        let fallback_ts = transcript.meta.timestamp;
-        let mut messages = Vec::with_capacity(transcript.body.len());
-        // The uuid of the slash command still awaiting its output, so the
-        // `local_command` line that follows pairs to the right call.
-        let mut open_command: Option<&str> = None;
-
-        for record in &transcript.body {
-            let (role, entry) = match record {
-                Record::User(e) => (Role::User, e),
-                Record::Assistant(e) => (Role::Assistant, e),
-                // Newer CLI versions write the same command envelopes on
-                // `system` lines, which have no message wrapper at all.
-                Record::Other(value) => {
-                    messages.extend(system_line_message(value, fallback_ts, &mut open_command));
-                    continue;
-                }
-                // Summaries, titles, snapshots carry no conversational turn.
-                Record::Summary(_) => continue,
-            };
-
-            // Older CLI versions write them as the whole body of a `user`
-            // line; either way they are the user driving the harness, not
-            // conversation, so they become a command call rather than text.
-            let content = match envelope_body(&entry.message.content).and_then(parse_envelope) {
-                Some(envelope) => envelope.into_blocks(
-                    &entry.uuid,
-                    entry.parent_uuid.as_deref(),
-                    &mut open_command,
-                ),
-                None => parse_blocks(&entry.message.content),
-            };
-
-            // An entry whose blocks parse to nothing carries no turn either —
-            // a dropped caveat and an empty body are alike here.
-            if !content.is_empty() {
-                messages.push(Message {
-                    role,
-                    content,
-                    timestamp: entry
-                        .timestamp
-                        .as_deref()
-                        .and_then(parse_ts)
-                        .unwrap_or(fallback_ts),
-                    model: entry.message.model.clone(),
-                    stop_reason: entry.message.stop_reason.as_deref().map(parse_stop_reason),
-                    usage: entry.message.usage.as_ref().and_then(parse_usage),
-                });
-            }
-        }
-
-        Ok(Transcript::new(transcript.meta.clone(), messages))
+        Ok(Transcript::new(
+            transcript.meta.clone(),
+            records_to_messages(&transcript.body, transcript.meta.timestamp),
+        ))
     }
 
     fn from_common(transcript: &Transcript<Common>) -> Result<Transcript<Self>> {
-        let meta = &transcript.meta;
-        let session_id = if meta.id.is_empty() {
-            Uuid::new_v4().to_string()
-        } else {
-            meta.id.clone()
-        };
-        let mut records = Vec::with_capacity(transcript.body.len() + 1);
+        Ok(Transcript::new(
+            transcript.meta.clone(),
+            messages_to_records(&transcript.meta, &transcript.body),
+        ))
+    }
+}
 
-        // Ids of the commands written so far, so their output lands on a
-        // `local_command` line instead of a stray `tool_result`.
-        let mut command_ids = std::collections::HashSet::new();
-        // Every call the transcript makes. A lone result naming none of them
-        // cannot replay as a `tool_result` — the API rejects an id it never
-        // issued — so it takes the `local_command` line too, which preserves
-        // the text and still loads.
-        let called: std::collections::HashSet<&str> = transcript
-            .body
-            .iter()
-            .flat_map(|msg| &msg.content)
-            .filter_map(|block| match block {
-                Block::ToolUse { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-        let mut parent_uuid: Option<String> = None;
-        for (i, msg) in transcript.body.iter().enumerate() {
-            let uuid = entry_uuid(&session_id, i);
+/// The conversation carried by a sequence of records; `fallback_ts` dates
+/// entries that carry no timestamp of their own. Shared with harnesses that
+/// embed Claude Code's JSONL (Cowork).
+pub(crate) fn records_to_messages(records: &[Record], fallback_ts: DateTime<Utc>) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(records.len());
+    // The uuid of the slash command still awaiting its output, so the
+    // `local_command` line that follows pairs to the right call.
+    let mut open_command: Option<&str> = None;
 
-            // Local-command turns go back as the native envelopes, not as
-            // message blocks: `tool_use` on a user turn is not a shape the
-            // Anthropic API accepts, so a resumed session would fail to load.
-            if msg.role == Role::User
-                && let Some(record) = local_command_record(
-                    msg,
-                    &mut command_ids,
-                    &called,
-                    &uuid,
-                    parent_uuid.as_deref(),
-                    &session_id,
-                    meta,
-                )
-            {
-                records.push(record);
-                parent_uuid = Some(uuid);
+    for record in records {
+        let (role, entry) = match record {
+            Record::User(e) => (Role::User, e),
+            Record::Assistant(e) => (Role::Assistant, e),
+            // Newer CLI versions write the same command envelopes on
+            // `system` lines, which have no message wrapper at all.
+            Record::Other(value) => {
+                messages.extend(system_line_message(value, fallback_ts, &mut open_command));
                 continue;
             }
+            // Summaries, titles, snapshots carry no conversational turn.
+            Record::Summary(_) => continue,
+        };
 
-            let api = ApiMessage {
-                role: Some(role_str(msg.role).to_string()),
-                content: serialize_blocks(&msg.content),
-                model: msg.model.clone(),
-                stop_reason: msg.stop_reason.as_ref().map(stop_reason_str),
-                usage: msg.usage.as_ref().map(serialize_usage),
-                extra: Map::new(),
-            };
-            let entry = EntryLine {
-                parent_uuid: parent_uuid.clone(),
-                uuid: uuid.clone(),
-                timestamp: Some(msg.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
-                session_id: Some(session_id.clone()),
-                cwd: meta.cwd.clone(),
-                git_branch: meta.git_branch.clone(),
-                version: meta.cli_version.clone(),
-                message: api,
-                extra: Map::new(),
-            };
-            records.push(match msg.role {
-                Role::User => Record::User(entry),
-                Role::Assistant => Record::Assistant(entry),
+        // Older CLI versions write them as the whole body of a `user`
+        // line; either way they are the user driving the harness, not
+        // conversation, so they become a command call rather than text.
+        let content = match envelope_body(&entry.message.content).and_then(parse_envelope) {
+            Some(envelope) => {
+                envelope.into_blocks(&entry.uuid, entry.parent_uuid.as_deref(), &mut open_command)
+            }
+            None => parse_blocks(&entry.message.content),
+        };
+
+        // An entry whose blocks parse to nothing carries no turn either —
+        // a dropped caveat and an empty body are alike here.
+        if !content.is_empty() {
+            messages.push(Message {
+                role,
+                content,
+                timestamp: entry
+                    .timestamp
+                    .as_deref()
+                    .and_then(parse_ts)
+                    .unwrap_or(fallback_ts),
+                model: entry.message.model.clone(),
+                stop_reason: entry.message.stop_reason.as_deref().map(parse_stop_reason),
+                usage: entry.message.usage.as_ref().and_then(parse_usage),
             });
-            parent_uuid = Some(uuid);
         }
-
-        // A leading summary gives `claude --resume` a friendly title — but its
-        // `leafUuid` must name a real user/assistant line in this file. Claude
-        // Code resolves a session by walking to the leaf the summaries point
-        // at; a summary whose leafUuid matches nothing leaves it with no leaf
-        // and the whole session reads as missing ("No conversation found with
-        // session ID"). A `local_command` line is not an eligible leaf either,
-        // so anchor to the last real turn.
-        if let Some(title) = meta.title.as_deref().filter(|t| !t.is_empty())
-            && let Some(leaf) = records.iter().rev().find_map(|record| match record {
-                Record::User(entry) | Record::Assistant(entry) => Some(entry.uuid.clone()),
-                _ => None,
-            })
-        {
-            records.insert(
-                0,
-                Record::Summary(SummaryLine {
-                    summary: title.to_string(),
-                    extra: Map::from_iter([("leafUuid".into(), Value::String(leaf))]),
-                }),
-            );
-        }
-
-        Ok(Transcript::new(meta.clone(), records))
     }
+
+    messages
+}
+
+/// The native records for a canonical conversation: one entry line per
+/// message (local-command turns as their envelopes), a linear `parentUuid`
+/// chain, and a leading summary line when `meta.title` is set. `meta.id` is
+/// the `sessionId` stamped on every line (a fresh UUID when empty). Shared
+/// with harnesses that embed Claude Code's JSONL (Cowork).
+pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Record> {
+    let session_id = if meta.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        meta.id.clone()
+    };
+    let mut records = Vec::with_capacity(messages.len() + 1);
+
+    // Ids of the commands written so far, so their output lands on a
+    // `local_command` line instead of a stray `tool_result`.
+    let mut command_ids = std::collections::HashSet::new();
+    // Every call the transcript makes. A lone result naming none of them
+    // cannot replay as a `tool_result` — the API rejects an id it never
+    // issued — so it takes the `local_command` line too, which preserves
+    // the text and still loads.
+    let called: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(|msg| &msg.content)
+        .filter_map(|block| match block {
+            Block::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut parent_uuid: Option<String> = None;
+    for (i, msg) in messages.iter().enumerate() {
+        let uuid = entry_uuid(&session_id, i);
+
+        // Local-command turns go back as the native envelopes, not as
+        // message blocks: `tool_use` on a user turn is not a shape the
+        // Anthropic API accepts, so a resumed session would fail to load.
+        if msg.role == Role::User
+            && let Some(record) = local_command_record(
+                msg,
+                &mut command_ids,
+                &called,
+                &uuid,
+                parent_uuid.as_deref(),
+                &session_id,
+                meta,
+            )
+        {
+            records.push(record);
+            parent_uuid = Some(uuid);
+            continue;
+        }
+
+        let api = ApiMessage {
+            role: Some(role_str(msg.role).to_string()),
+            content: serialize_blocks(&msg.content),
+            model: msg.model.clone(),
+            stop_reason: msg.stop_reason.as_ref().map(stop_reason_str),
+            usage: msg.usage.as_ref().map(serialize_usage),
+            extra: Map::new(),
+        };
+        let entry = EntryLine {
+            parent_uuid: parent_uuid.clone(),
+            uuid: uuid.clone(),
+            timestamp: Some(msg.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            session_id: Some(session_id.clone()),
+            cwd: meta.cwd.clone(),
+            git_branch: meta.git_branch.clone(),
+            version: meta.cli_version.clone(),
+            message: api,
+            extra: Map::new(),
+        };
+        records.push(match msg.role {
+            Role::User => Record::User(entry),
+            Role::Assistant => Record::Assistant(entry),
+        });
+        parent_uuid = Some(uuid);
+    }
+
+    // A leading summary gives `claude --resume` a friendly title — but its
+    // `leafUuid` must name a real user/assistant line in this file. Claude
+    // Code resolves a session by walking to the leaf the summaries point
+    // at; a summary whose leafUuid matches nothing leaves it with no leaf
+    // and the whole session reads as missing ("No conversation found with
+    // session ID"). A `local_command` line is not an eligible leaf either,
+    // so anchor to the last real turn.
+    if let Some(title) = meta.title.as_deref().filter(|t| !t.is_empty())
+        && let Some(leaf) = records.iter().rev().find_map(|record| match record {
+            Record::User(entry) | Record::Assistant(entry) => Some(entry.uuid.clone()),
+            _ => None,
+        })
+    {
+        records.insert(
+            0,
+            Record::Summary(SummaryLine {
+                summary: title.to_string(),
+                extra: Map::from_iter([("leafUuid".into(), Value::String(leaf))]),
+            }),
+        );
+    }
+
+    records
 }
 
 impl TextCodec for ClaudeCode {
@@ -1005,7 +1022,7 @@ fn entry_uuid(session_id: &str, index: usize) -> String {
 
 /// Extract session metadata from the records. `id` is left empty when no
 /// `sessionId` is present; a [`Store`] fills it from the filename.
-fn meta_from_records(records: &[Record]) -> Meta {
+pub(crate) fn meta_from_records(records: &[Record]) -> Meta {
     let mut meta = Meta {
         id: String::new(),
         timestamp: Utc::now(),
@@ -1142,7 +1159,7 @@ impl From<MetaEntryLine> for EntryLine {
 /// preserved [`Record::Other`] `Value`: an unknown or non-string tag, or the
 /// rare known-tag line whose body fails its typed schema. Invalid JSON
 /// parses to `None` and is skipped, exactly as under [`jsonl::parse`].
-fn record_from_line(line: &str) -> Option<Record> {
+pub(crate) fn record_from_line(line: &str) -> Option<Record> {
     let other = || serde_json::from_str::<Value>(line).ok().map(Record::Other);
     match serde_json::from_str::<jsonl::TypeProbe>(line) {
         // A failed probe isn't necessarily junk: a non-string `type` also
@@ -1191,7 +1208,7 @@ fn scan_line(line: &str) -> Option<Record> {
 
 /// [`meta_from_records`] over a shallow scan of the raw text — equivalent to
 /// `from_text(text)?.meta`, but discovery never builds message payloads.
-fn meta_from_text(text: &str) -> Meta {
+pub(crate) fn meta_from_text(text: &str) -> Meta {
     let records: Vec<Record> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -1203,7 +1220,7 @@ fn meta_from_text(text: &str) -> Meta {
 /// Claude's project-dir encoding: every `/` and `.` becomes `-`. Windows
 /// cwds encode the same way with `\` and the drive `:` also mapped
 /// (`C:\Users\x` → `C--Users-x`).
-fn encode_project_dir(path: &str) -> String {
+pub(crate) fn encode_project_dir(path: &str) -> String {
     path.chars()
         .map(|c| {
             if matches!(c, '/' | '.' | '\\' | ':') {
@@ -1215,7 +1232,7 @@ fn encode_project_dir(path: &str) -> String {
         .collect()
 }
 
-fn file_fingerprint(path: &Path) -> String {
+pub(crate) fn file_fingerprint(path: &Path) -> String {
     match fs::metadata(path) {
         // An unreadable file has no fingerprint.
         Err(_) => String::new(),

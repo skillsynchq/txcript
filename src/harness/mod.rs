@@ -10,6 +10,7 @@ pub mod antigravity;
 pub mod campfire;
 pub mod claude_code;
 pub mod codex;
+pub mod cowork;
 pub mod cursor;
 pub mod cursor_desktop;
 pub mod grok;
