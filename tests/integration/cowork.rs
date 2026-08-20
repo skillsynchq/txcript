@@ -615,7 +615,10 @@ fn save_picks_the_most_recently_active_account() {
     std::fs::create_dir_all(&active).unwrap();
     std::fs::write(stale.join("local_old.json"), header_json()).unwrap();
     let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    std::fs::File::open(stale.join("local_old.json"))
+    // Write access: Windows refuses to touch the mtime of a read-only handle.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(stale.join("local_old.json"))
         .unwrap()
         .set_modified(old)
         .unwrap();
