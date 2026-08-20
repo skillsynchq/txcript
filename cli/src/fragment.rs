@@ -30,6 +30,7 @@ pub struct SpanReq {
 /// Ambiguity guard: callers that can cheaply check "does the *whole* input
 /// name a session?" (a title literally containing `#12`) should do so first
 /// and skip the fragment interpretation on a hit.
+#[must_use]
 pub fn parse_ref(input: &str) -> (&str, Option<SpanReq>) {
     match input.rfind('#') {
         // No `#` at all: the input is a plain source.
@@ -77,7 +78,10 @@ fn parse_range(s: &str) -> Option<SpanReq> {
 
 impl SpanReq {
     /// Convert to a concrete [`Span`] against a session of `len` messages.
-    /// Errors carry the user-facing 1-based numbers.
+    ///
+    /// # Errors
+    /// When the range is empty, inverted, or past `len`; the message carries
+    /// the user-facing 1-based numbers.
     pub fn resolve(&self, len: usize) -> Result<Span, String> {
         let start = self.start.unwrap_or(1);
         let end = self.end.unwrap_or(len);
@@ -113,7 +117,8 @@ impl std::fmt::Display for SpanReq {
 }
 
 /// Human-facing `#a-b` (`#a` for a single message) for a resolved [`Span`].
-fn format_span(span: &Span) -> String {
+#[must_use]
+pub fn format_span(span: &Span) -> String {
     match span.0.len() {
         1 => format!("#{}", span.0.start + 1),
         _ => format!("#{}-{}", span.0.start + 1, span.0.end),
@@ -121,8 +126,11 @@ fn format_span(span: &Span) -> String {
 }
 
 /// The transcript restricted to `req`: same meta, only the spanned messages.
-/// Refuses ranges that cut a tool call away from its result — the sliced
-/// session would confuse the harness it's continued in.
+///
+/// # Errors
+/// When `req` doesn't resolve against the transcript, or the range cuts a
+/// tool call away from its result — the sliced session would confuse the
+/// harness it's continued in; the message suggests the nearest valid range.
 pub fn sliced(common: &Transcript<Common>, req: &SpanReq) -> Result<Transcript<Common>, String> {
     let span = req.resolve(common.body.len())?;
     validate_tool_pairing(&common.body, &span)?;

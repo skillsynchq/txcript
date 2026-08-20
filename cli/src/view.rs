@@ -23,7 +23,10 @@ pub fn cmd_view(source: &str, from: Option<HarnessId>) -> Result<ExitCode, Strin
 
     let session = super::find_session(&sessions, from, src)?.ok_or_else(|| {
         let scope = from.map_or(String::new(), |h| format!(" {h}"));
-        format!("no local{scope} session matches `{src}` (try `txcript list`)")
+        format!(
+            "no local{scope} session matches `{src}` (try `{} list`)",
+            crate::program()
+        )
     })?;
     let common = session
         .read()
