@@ -279,6 +279,7 @@ pub struct Index {
     by_key: HashMap<DocKey, usize>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct Doc {
     key: DocKey,
     meta: Meta,
@@ -291,6 +292,14 @@ struct Doc {
 /// splitting, UTF-32 transcoding) is the expensive part of an insert; build
 /// `Extracted`s on worker threads and fold each into the index with
 /// [`Index::insert_extracted`].
+///
+/// Serializable, so callers that keep a persistent cache can store the
+/// extracted form and skip re-parsing unchanged sessions: deserializing an
+/// `Extracted` costs a UTF-32 transcode of its lines, not a session parse.
+/// The serialized shape is internal — it has no stability guarantee across
+/// crate versions, and a cache should key on the version that wrote it.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Extracted(Doc);
 
 impl Extracted {
@@ -305,6 +314,18 @@ impl Extracted {
             chars: lines.iter().map(|l| l.text.len()).sum(),
             lines,
         })
+    }
+
+    /// The document this extraction belongs to.
+    #[must_use]
+    pub fn key(&self) -> &DocKey {
+        &self.0.key
+    }
+
+    /// The session metadata captured at extraction.
+    #[must_use]
+    pub fn meta(&self) -> &Meta {
+        &self.0.meta
     }
 }
 
@@ -776,11 +797,29 @@ fn fold(c: char) -> char {
 // ── extraction ─────────────────────────────────────────────────────────
 
 /// One searchable line, pre-converted to UTF-32 so queries never transcode.
+#[derive(Serialize, Deserialize)]
 struct Line {
     message: u32,
     block: u32,
     origin: Origin,
+    #[serde(with = "utf32_text")]
     text: Utf32String,
+}
+
+/// `Utf32String` as plain text on the wire: the UTF-32 form is a matcher
+/// detail, and the transcode back is what deserializing pays instead of a
+/// session parse.
+mod utf32_text {
+    use nucleo_matcher::Utf32String;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(text: &Utf32String, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&text.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Utf32String, D::Error> {
+        String::deserialize(d).map(Utf32String::from)
+    }
 }
 
 impl Line {

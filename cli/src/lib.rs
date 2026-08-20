@@ -48,6 +48,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use txcript::harness::{amp, simple};
 use txcript::{Codec, Common, HarnessId, TextCodec, Transcript, local};
 
+pub mod cache;
 pub mod fragment;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -67,6 +68,17 @@ const HARNESSES: &str = "harnesses: claude_code, codex, opencode, pi, campfire, 
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+    /// Keep a persistent search cache at this path, so `query` (and the MCP
+    /// search tool) re-read only the sessions that changed since the last
+    /// run. Without it every run parses every session afresh.
+    #[arg(
+        long,
+        global = true,
+        env = "TXCRIPT_CACHE",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    pub cache: Option<PathBuf>,
 }
 
 /// Every `txcript` subcommand: the session commands plus the binary's own.
@@ -189,11 +201,14 @@ pub enum SessionCommand {
 }
 
 /// Settings for [`run_session`]. `Default` is the `txcript` binary's own
-/// behavior: hints name `txcript`.
+/// behavior: hints name `txcript`, and nothing is cached between runs.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// The program name used in hints, as in "try `<program> list`".
     pub program: Option<String>,
+    /// A persistent search cache (see [`cache`]). `None` keeps `query`
+    /// stateless: every run parses every session.
+    pub cache: Option<PathBuf>,
 }
 
 static PROGRAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -241,14 +256,18 @@ impl clap::builder::TypedValueParser for HarnessParser {
 /// stderr. This is the whole of the `txcript` binary.
 #[must_use]
 pub fn run(cli: Cli) -> ExitCode {
+    let options = Options {
+        program: None,
+        cache: cli.cache,
+    };
     let result = match cli.command {
-        Command::Session(command) => run_session(command, &Options::default()),
+        Command::Session(command) => run_session(command, &options),
         #[cfg(feature = "mcp")]
         Command::Mcp => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("starting the async runtime: {e}"))
-            .and_then(|runtime| runtime.block_on(mcp::serve())),
+            .and_then(|runtime| runtime.block_on(mcp::serve(options.cache))),
         Command::Completion { shell } => {
             // Render to a buffer first: a failed stdout write means the
             // reader is gone (`… | head`), which should end quietly, not
@@ -277,6 +296,7 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
         // First caller wins; the name can't meaningfully change mid-process.
         let _ = PROGRAM.set(program.clone());
     }
+    let cache = options.cache.as_deref();
     match command {
         SessionCommand::List {
             from,
@@ -301,7 +321,7 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             with,
             from,
             cwd,
-        } => query::cmd_query(pattern, with, from, cwd.as_deref()),
+        } => query::cmd_query(pattern, with, from, cwd.as_deref(), cache),
     }
 }
 
@@ -1571,10 +1591,19 @@ mod spin {
 pub use query::{Sessions, build_index, doc_key};
 
 mod query {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
 
     use txcript::search::{DocKey, DocMatch, Extracted, Index, Origin, Query};
     use txcript::{HarnessId, local};
+
+    /// One unit of index-building work, per session.
+    enum Work {
+        /// Parse the session from its store and extract it.
+        Parse(usize),
+        /// Deserialize the cached extraction.
+        Thaw(usize, Vec<u8>),
+    }
 
     /// The sessions behind an index, keyed by the full [`DocKey`] — source
     /// included — so two sessions sharing a (harness, id), as Claude Code
@@ -1594,17 +1623,22 @@ mod query {
 
     /// Build the same filtered index used by the CLI for the MCP search tool.
     #[cfg(feature = "mcp")]
-    pub(super) fn index_for(from: Option<HarnessId>, cwd: Option<&std::path::Path>) -> Index {
-        build_index(from, cwd).0
+    pub(super) fn index_for(
+        from: Option<HarnessId>,
+        cwd: Option<&Path>,
+        cache: Option<&Path>,
+    ) -> Index {
+        build_index(from, cwd, cache).0
     }
 
     pub(super) fn cmd_query(
         pattern: Option<String>,
         with: Option<HarnessId>,
         from: Option<HarnessId>,
-        cwd: Option<&std::path::Path>,
+        cwd: Option<&Path>,
+        cache: Option<&Path>,
     ) -> Result<std::process::ExitCode, String> {
-        let (index, sessions) = build_index(from, cwd);
+        let (index, sessions) = build_index(from, cwd, cache);
         match pattern {
             Some(pattern) => {
                 if with.is_some() {
@@ -1628,23 +1662,67 @@ mod query {
     }
 
     /// Build the search index and session lookup over every local session
-    /// passing the `from`/`cwd` filters. Sessions parse and extract on every
-    /// core: workers pull the next undrained session, parse it, extract its
-    /// searchable lines, and send the result back over a bounded channel;
-    /// this thread folds arrivals into the index as they land, so at most a
-    /// few extracted documents are ever in flight.
+    /// passing the `from`/`cwd` filters.
+    ///
+    /// Sessions parse and extract on every core: workers pull the next
+    /// undrained session, parse it, extract its searchable lines, and send
+    /// the result back over a bounded channel; this thread folds arrivals
+    /// into the index as they land, so at most a few extracted documents are
+    /// ever in flight.
+    ///
+    /// With a `cache` path, sessions whose change cursor (see
+    /// [`local::fingerprints`]) matches the cached one are thawed from the
+    /// cache instead of parsed, and the cache is brought up to date
+    /// afterwards. A cache that can't be opened is reported on stderr and
+    /// skipped: the index is built the stateless way.
     #[must_use]
     pub fn build_index(
         from: Option<HarnessId>,
-        cwd: Option<&std::path::Path>,
+        cwd: Option<&Path>,
+        cache: Option<&Path>,
     ) -> (Index, Sessions) {
         let found = super::discover_with_spinner();
         let spinner = super::spin::Spinner::start("indexing…");
+        let mut cache = cache.and_then(|path| match super::cache::Cache::open(path) {
+            Ok(cache) => Some(cache),
+            Err(e) => {
+                eprintln!("warning: search cache unavailable ({e}); indexing without it");
+                None
+            }
+        });
+        // Every session on disk, filtered or not: the cache is pruned against
+        // this set, never against one command's filtered view of it.
+        let live: HashSet<DocKey> = if cache.is_some() {
+            found.iter().map(doc_key).collect()
+        } else {
+            HashSet::new()
+        };
         let scoped: Vec<local::Session> = found
             .into_iter()
             .filter(|session| super::selected(session, from, cwd))
             .collect();
         let total = scoped.len();
+
+        // Cursors for the cache check. Empty cursors never hit, so a session
+        // whose store can't say whether it changed is parsed every time.
+        let cursors = cache
+            .as_ref()
+            .map(|_| local::fingerprints(&scoped))
+            .unwrap_or_default();
+        // One work item per session: thaw the cached bytes when the cursor
+        // still matches, parse the session otherwise. Only the SQLite read
+        // happens here; deserializing is CPU work like parsing, and the
+        // workers share it across cores the same way.
+        let work: Vec<Work> = (0..total)
+            .map(|i| {
+                cache
+                    .as_ref()
+                    .and_then(|cache| cache.get_raw(&doc_key(&scoped[i]), &cursors[i]))
+                    .map_or(Work::Parse(i), |bytes| Work::Thaw(i, bytes))
+            })
+            .collect();
+        let from_cache = work.iter().filter(|w| matches!(w, Work::Thaw(..))).count();
+
         let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let mut index = Index::new();
         // Which sessions parsed cleanly, by position in `scoped`; the lookup
@@ -1655,18 +1733,25 @@ mod query {
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let tx = tx.clone();
-                let (next, scoped) = (&next, &scoped);
+                let (next, scoped, work) = (&next, &scoped, &work);
                 scope.spawn(move || {
                     std::iter::from_fn(|| {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        (i < scoped.len()).then_some(i)
+                        let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        work.get(n)
                     })
-                    // Unreadable sessions are skipped, matching discover.
-                    .filter_map(|i| {
-                        scoped[i]
-                            .read()
-                            .ok()
-                            .map(|common| (i, Extracted::new(doc_key(&scoped[i]), &common)))
+                    .filter_map(|item| match item {
+                        // Unreadable sessions are skipped, matching discover.
+                        Work::Parse(i) => scoped[*i].read().ok().map(|common| {
+                            (*i, Extracted::new(doc_key(&scoped[*i]), &common), true)
+                        }),
+                        // A row that no longer deserializes (a hand-edited
+                        // or truncated cache) is re-parsed and rewritten.
+                        Work::Thaw(i, bytes) => match serde_json::from_slice(bytes) {
+                            Ok(doc) => Some((*i, doc, false)),
+                            Err(_) => scoped[*i].read().ok().map(|common| {
+                                (*i, Extracted::new(doc_key(&scoped[*i]), &common), true)
+                            }),
+                        },
                     })
                     .for_each(|extracted| {
                         // A send only fails when the receiver is gone, and
@@ -1679,18 +1764,35 @@ mod query {
             // when the last of them finishes.
             drop(tx);
             let mut arrived = Vec::with_capacity(total);
-            for (i, extracted) in rx {
+            for (i, extracted, fresh) in rx {
                 if arrived.len() % 32 == 0 {
-                    spinner.set(format!("indexing… ({}/{total})", arrived.len()));
+                    spinner.set(match from_cache {
+                        0 => format!("indexing… ({}/{total})", arrived.len()),
+                        n => format!("indexing… ({}/{total}, {n} cached)", arrived.len()),
+                    });
                 }
-                arrived.push((i, extracted));
+                arrived.push((i, extracted, fresh));
                 indexed[i] = true;
+            }
+            // Freshly parsed documents go into the cache before the index
+            // takes ownership of them. Best-effort: a cache write failure
+            // costs the next run a re-parse, not this run its results.
+            if let Some(cache) = cache.as_mut() {
+                let written = cache.put_many(
+                    arrived
+                        .iter()
+                        .filter(|(_, _, fresh)| *fresh)
+                        .map(|(i, doc, _)| (doc, cursors[*i].as_str())),
+                );
+                if let Err(e) = written.and_then(|()| cache.retain(&live)) {
+                    eprintln!("warning: search cache not updated: {e}");
+                }
             }
             // Insert in discovery order, not arrival order: document order
             // breaks full score-and-timestamp ties in query results, and it
             // should not vary run to run.
-            arrived.sort_unstable_by_key(|&(i, _)| i);
-            for (_, extracted) in arrived {
+            arrived.sort_unstable_by_key(|&(i, _, _)| i);
+            for (_, extracted, _) in arrived {
                 index.insert_extracted(extracted);
             }
         });

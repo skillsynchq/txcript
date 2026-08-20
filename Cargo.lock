@@ -1311,6 +1311,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

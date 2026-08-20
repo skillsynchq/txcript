@@ -1,6 +1,6 @@
 //! Read-only MCP tools over local coding-agent sessions.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -155,12 +155,16 @@ fn origin_name(origin: Origin) -> &'static str {
 #[derive(Clone)]
 struct TxcriptServer {
     tool_router: ToolRouter<Self>,
+    /// Persistent search cache for `search_sessions`; `None` rebuilds the
+    /// index from scratch on every call.
+    cache: Option<PathBuf>,
 }
 
 impl TxcriptServer {
-    fn new() -> Self {
+    fn new(cache: Option<PathBuf>) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            cache,
         }
     }
 }
@@ -214,7 +218,7 @@ impl TxcriptServer {
     ) -> Result<Json<SearchResults>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         let cwd = request.cwd.as_deref().map(Path::new);
-        let index = super::query::index_for(from, cwd);
+        let index = super::query::index_for(from, cwd, self.cache.as_deref());
         let mut query = Query::fuzzy(request.pattern);
         // Match the CLI's one-shot output bounds.
         query.limit = Some(20);
@@ -359,8 +363,8 @@ fn parse_from(from: Option<&str>) -> Result<Option<HarnessId>, ErrorData> {
     })
 }
 
-pub async fn serve() -> Result<ExitCode, String> {
-    let service = TxcriptServer::new()
+pub async fn serve(cache: Option<PathBuf>) -> Result<ExitCode, String> {
+    let service = TxcriptServer::new(cache)
         .serve(stdio())
         .await
         .map_err(|error| format!("starting MCP stdio server: {error}"))?;
@@ -377,7 +381,7 @@ mod tests {
 
     #[test]
     fn exposes_exactly_the_three_session_tools() {
-        let mut names = TxcriptServer::new()
+        let mut names = TxcriptServer::new(None)
             .tool_router
             .list_all()
             .into_iter()

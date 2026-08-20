@@ -15,6 +15,7 @@
 //! Everything here uses each harness's default on-disk location. For custom
 //! roots, use the per-harness [`Store`]s directly.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -278,6 +279,134 @@ impl Session {
     #[must_use]
     pub fn resume_command(&self) -> (String, Vec<String>) {
         resume_command(self.harness, &self.meta.id)
+    }
+}
+
+/// Per-session change cursors, positionally aligned with `sessions` — the
+/// batched form of [`Store::fingerprints`] across every harness, for callers
+/// that cache parsed transcripts and want to know which ones to re-read.
+/// A cursor is an opaque string that changes whenever the session's backing
+/// data does; an empty string means the backend could not establish one, and
+/// a cache should treat the session as changed.
+///
+/// File-backed sessions fall back to the file's mtime and size when their
+/// store reports nothing. Stores are queried once per harness.
+#[must_use]
+pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
+    let mut by_harness: HashMap<HarnessId, Vec<usize>> = HashMap::new();
+    for (i, s) in sessions.iter().enumerate() {
+        by_harness.entry(s.harness).or_default().push(i);
+    }
+
+    let mut out = vec![String::new(); sessions.len()];
+    for (harness, at) in by_harness {
+        let group = Group {
+            at: &at,
+            sessions,
+            out: &mut out,
+        };
+        match harness {
+            HarnessId::ClaudeCode => group.files(claude_code::ClaudeStore::default_root()),
+            HarnessId::Codex => group.files(codex::CodexStore::default_root()),
+            HarnessId::Pi => group.files(pi::PiStore::default_root()),
+            HarnessId::Campfire => group.files(campfire::CampfireStore::default_root()),
+            HarnessId::Cursor => group.files(cursor::CursorStore::default_root()),
+            HarnessId::Grok => group.files(grok::GrokStore::default_root()),
+            HarnessId::Amp => group.files(amp::AmpStore::default_root()),
+            HarnessId::Antigravity => group.files(antigravity::AntigravityStore::default_root()),
+            HarnessId::Cowork => group.files(cowork::CoworkStore::default_root()),
+            #[cfg(feature = "hermes")]
+            HarnessId::Hermes => group.ids(hermes::HermesStore::default_root()),
+            #[cfg(feature = "opencode")]
+            HarnessId::CursorDesktop => {
+                group.ids(cursor_desktop::CursorDesktopStore::default_root());
+            }
+            #[cfg(feature = "opencode")]
+            HarnessId::OpenCode => group.ids(opencode::OpenCodeStore::default_db()),
+            // Not discovered (no store), or compiled out: no cursor.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One harness's slice of a [`fingerprints`] call: which sessions, and where
+/// their cursors go.
+struct Group<'a> {
+    at: &'a [usize],
+    sessions: &'a [Session],
+    out: &'a mut [String],
+}
+
+impl Group<'_> {
+    fn files<S>(self, store: Option<S>)
+    where
+        S: Store<Ref = PathBuf>,
+    {
+        let paths: Vec<PathBuf> = self
+            .at
+            .iter()
+            .filter_map(|&i| self.sessions[i].path().cloned())
+            .collect();
+        let by_path = store
+            .and_then(|s| s.fingerprints(&paths).ok())
+            .unwrap_or_default();
+        for &i in self.at {
+            if let Some(p) = self.sessions[i].path() {
+                let known = by_path
+                    .get(&p.to_string_lossy().into_owned())
+                    .cloned()
+                    .unwrap_or_default();
+                self.out[i] = if known.is_empty() {
+                    claude_code::file_fingerprint(p)
+                } else {
+                    known
+                };
+            }
+        }
+    }
+
+    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    fn ids<S>(self, store: Option<S>)
+    where
+        S: Store<Ref = String>,
+    {
+        let ids: Vec<String> = self
+            .at
+            .iter()
+            .filter_map(|&i| self.sessions[i].id().cloned())
+            .collect();
+        let by_id = store
+            .and_then(|s| s.fingerprints(&ids).ok())
+            .unwrap_or_default();
+        for &i in self.at {
+            if let Some(id) = self.sessions[i].id() {
+                self.out[i] = by_id.get(id).cloned().unwrap_or_default();
+            }
+        }
+    }
+}
+
+impl Session {
+    /// The file behind a file-backed session.
+    // Option for symmetry with `id`: without the SQLite features every
+    // session is file-backed and the None arm compiles out.
+    #[allow(clippy::unnecessary_wraps)]
+    fn path(&self) -> Option<&PathBuf> {
+        match &self.locator {
+            Locator::Path(p) => Some(p),
+            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            Locator::Id(_) => None,
+        }
+    }
+
+    /// The database id behind an id-backed session.
+    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    fn id(&self) -> Option<&String> {
+        match &self.locator {
+            Locator::Id(id) => Some(id),
+            Locator::Path(_) => None,
+        }
     }
 }
 
