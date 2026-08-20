@@ -51,7 +51,7 @@ use txcript::{Codec, Common, HarnessId, TextCodec, Transcript, local};
 pub mod cache;
 pub mod fragment;
 #[cfg(feature = "mcp")]
-mod mcp;
+pub mod mcp;
 mod view;
 
 const HARNESSES: &str = "harnesses: claude_code, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, hermes, \

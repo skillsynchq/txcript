@@ -152,16 +152,23 @@ fn origin_name(origin: Origin) -> &'static str {
     }
 }
 
+/// The read-only session MCP server used by `txcript mcp`.
+///
+/// The type also implements [`ServerHandler`], so a larger MCP server can
+/// delegate session tool listing and calls to it.
 #[derive(Clone)]
-struct TxcriptServer {
+pub struct SessionServer {
     tool_router: ToolRouter<Self>,
     /// Persistent search cache for `search_sessions`; `None` rebuilds the
     /// index from scratch on every call.
     cache: Option<PathBuf>,
 }
 
-impl TxcriptServer {
-    fn new(cache: Option<PathBuf>) -> Self {
+impl SessionServer {
+    /// Create the session server. `cache` has the same semantics as the CLI's
+    /// global `--cache`: `None` rebuilds the search index on each call.
+    #[must_use]
+    pub fn new(cache: Option<PathBuf>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             cache,
@@ -174,7 +181,7 @@ impl TxcriptServer {
     clippy::unused_self,
     reason = "rmcp routes tools through methods on the server instance"
 )]
-impl TxcriptServer {
+impl SessionServer {
     /// List local sessions newest-first, with the same harness and working
     /// directory filters as `txcript list`, paged by `limit`/`offset`.
     #[tool(
@@ -340,7 +347,7 @@ fn chunk_ranges(sizes: &[usize], start: usize, budget: usize) -> Vec<std::ops::R
 // `unknown_lints` keeps older clippies quiet about the newer lint name.
 #[allow(unknown_lints, clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for TxcriptServer {
+impl ServerHandler for SessionServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
@@ -363,8 +370,12 @@ fn parse_from(from: Option<&str>) -> Result<Option<HarnessId>, ErrorData> {
     })
 }
 
+/// Serve the session tools over stdio until the client disconnects.
+///
+/// # Errors
+/// When the stdio service cannot start or fails while running.
 pub async fn serve(cache: Option<PathBuf>) -> Result<ExitCode, String> {
-    let service = TxcriptServer::new(cache)
+    let service = SessionServer::new(cache)
         .serve(stdio())
         .await
         .map_err(|error| format!("starting MCP stdio server: {error}"))?;
@@ -381,7 +392,7 @@ mod tests {
 
     #[test]
     fn exposes_exactly_the_three_session_tools() {
-        let mut names = TxcriptServer::new(None)
+        let mut names = SessionServer::new(None)
             .tool_router
             .list_all()
             .into_iter()
@@ -393,14 +404,14 @@ mod tests {
 
     #[test]
     fn list_and_search_schemas_expose_cli_filters_as_optional() {
-        let list = TxcriptServer::list_sessions_tool_attr();
+        let list = SessionServer::list_sessions_tool_attr();
         assert!(list.input_schema["properties"].get("from").is_some());
         assert!(list.input_schema["properties"].get("cwd").is_some());
         assert!(list.input_schema["properties"].get("limit").is_some());
         assert!(list.input_schema["properties"].get("offset").is_some());
         assert!(list.input_schema.get("required").is_none());
 
-        let search = TxcriptServer::search_sessions_tool_attr();
+        let search = SessionServer::search_sessions_tool_attr();
         assert!(search.input_schema["properties"].get("pattern").is_some());
         assert!(search.input_schema["properties"].get("from").is_some());
         assert!(search.input_schema["properties"].get("cwd").is_some());
@@ -409,7 +420,7 @@ mod tests {
             serde_json::json!(["pattern"])
         );
 
-        let read = TxcriptServer::read_session_tool_attr();
+        let read = SessionServer::read_session_tool_attr();
         assert_eq!(read.input_schema["required"], serde_json::json!(["id"]));
     }
 
