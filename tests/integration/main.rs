@@ -19,6 +19,7 @@ mod cursor_desktop;
 mod fx;
 mod grok;
 mod hermes;
+mod kimi;
 mod opencode;
 mod path_safety;
 mod pi;
