@@ -234,6 +234,7 @@ pub struct Saved<R> {
 pub enum HarnessId {
     ClaudeCode,
     ClaudeChat,
+    ChatGpt,
     Codex,
     OpenCode,
     Pi,
@@ -250,9 +251,10 @@ pub enum HarnessId {
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 15] = [
+    pub const ALL: [HarnessId; 16] = [
         HarnessId::ClaudeCode,
         HarnessId::ClaudeChat,
+        HarnessId::ChatGpt,
         HarnessId::Codex,
         HarnessId::OpenCode,
         HarnessId::Pi,
@@ -274,6 +276,7 @@ impl HarnessId {
         match self {
             HarnessId::ClaudeCode => "claude_code",
             HarnessId::ClaudeChat => "claude_chat",
+            HarnessId::ChatGpt => "chatgpt",
             HarnessId::Codex => "codex",
             HarnessId::OpenCode => "opencode",
             HarnessId::Pi => "pi",
@@ -306,6 +309,9 @@ impl FromStr for HarnessId {
             "claude" | "claude_code" | "claude-code" | "claudecode" => Ok(HarnessId::ClaudeCode),
             "claude_chat" | "claude-chat" | "claude_web" | "claude-web" => {
                 Ok(HarnessId::ClaudeChat)
+            }
+            "chatgpt" | "chat_gpt" | "chat-gpt" | "openai_chat" | "openai-chat" => {
+                Ok(HarnessId::ChatGpt)
             }
             "codex" => Ok(HarnessId::Codex),
             "opencode" | "open_code" | "open-code" => Ok(HarnessId::OpenCode),

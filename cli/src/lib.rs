@@ -24,6 +24,7 @@
 //!     [--with <harness>]                    #   continue the pick in <harness>
 //!     [--cwd <dir>]                         #   only sessions recorded in <dir>
 //! txcript mcp                           # serve MCP over stdio
+//! txcript chatgpt login                 # authenticate the live ChatGPT source
 //! txcript completion <shell>            # print a completion script
 //! ```
 //!
@@ -46,7 +47,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use txcript::harness::{amp, claude_chat, simple};
+use txcript::harness::{amp, chatgpt, claude_chat, simple};
 use txcript::{Codec, Common, HarnessId, Store, TextCodec, Transcript, local};
 
 pub mod cache;
@@ -58,7 +59,7 @@ pub mod mcp;
 mod pager;
 mod view;
 
-pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
+pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
      amp, antigravity, simple, cowork";
 
 /// The `txcript` binary's command line.
@@ -93,11 +94,31 @@ pub enum Command {
     /// Serve the Model Context Protocol over stdin/stdout
     #[cfg(feature = "mcp")]
     Mcp,
+    /// Manage txcript's dedicated `ChatGPT` login
+    Chatgpt {
+        #[command(subcommand)]
+        command: ChatGptCommand,
+    },
     /// Print a completion script for a shell (add it to your shell config)
     Completion {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+/// Authentication commands for the live, pull-only `ChatGPT` source.
+#[derive(Subcommand)]
+pub enum ChatGptCommand {
+    /// Sign in through `OpenAI` OAuth and save credentials under ~/.txcript
+    Login {
+        /// Print the login URL without opening the system browser
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Remove txcript's dedicated `ChatGPT` credentials
+    Logout,
+    /// Show whether txcript has a `ChatGPT` login
+    Status,
 }
 
 /// The session commands — `list`, `continue`, `view`, `export`, `query` — as one clap
@@ -298,6 +319,7 @@ pub fn run(cli: Cli) -> ExitCode {
             .build()
             .map_err(|e| format!("starting the async runtime: {e}"))
             .and_then(|runtime| runtime.block_on(mcp::serve(options.cache))),
+        Command::Chatgpt { command } => run_chatgpt(&command),
         Command::Completion { shell } => {
             // Render to a buffer first: a failed stdout write means the
             // reader is gone (`… | head`), which should end quietly, not
@@ -312,6 +334,64 @@ pub fn run(cli: Cli) -> ExitCode {
         eprintln!("error: {e}");
         ExitCode::FAILURE
     })
+}
+
+fn run_chatgpt(command: &ChatGptCommand) -> Result<ExitCode, String> {
+    match command {
+        ChatGptCommand::Login { no_open } => {
+            let login = chatgpt::begin_login().map_err(|error| error.to_string())?;
+            println!("Open this URL to sign in:\n{}", login.auth_url());
+            if !*no_open {
+                open_url(login.auth_url());
+            }
+            let status = login.wait().map_err(|error| error.to_string())?;
+            println!("ChatGPT login saved to {}", status.path.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        ChatGptCommand::Logout => {
+            if chatgpt::logout().map_err(|error| error.to_string())? {
+                println!("removed txcript's ChatGPT login");
+            } else {
+                println!("txcript was not logged in to ChatGPT");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ChatGptCommand::Status => {
+            let status = chatgpt::auth_status().map_err(|error| error.to_string())?;
+            if status.logged_in {
+                let account = status
+                    .account_id
+                    .as_deref()
+                    .map_or(String::new(), |id| format!(" (account {id})"));
+                let expiry = status.expires_at.map_or(String::new(), |time| {
+                    format!(", access token expires {time}")
+                });
+                println!("logged in{account}{expiry}");
+            } else {
+                println!("not logged in (run `txcript chatgpt login`)");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).status();
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).status();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let result: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no browser launcher for this platform",
+    ));
+    if !result.is_ok_and(|status| status.success()) {
+        eprintln!("warning: could not open a browser; use the URL printed above");
+    }
 }
 
 /// Run one session command. `continue` and the `query` picker hand the
@@ -464,6 +544,25 @@ pub(crate) fn load_direct_claude_chat(
             .map_err(|e| e.to_string())?;
         let native = store.load(&reference).map_err(|e| e.to_string())?;
         let common = claude_chat::ClaudeChat::to_common(&native).map_err(|e| e.to_string())?;
+        Ok((common, request))
+    })())
+}
+
+/// An exact `ChatGPT` conversation UUID can be loaded without enumerating the
+/// account. Titles and id prefixes still require explicit live discovery.
+pub(crate) fn load_direct_chatgpt(source: &str, from: Option<HarnessId>) -> Option<LoadedSession> {
+    if from != Some(HarnessId::ChatGpt) {
+        return None;
+    }
+    let (id, request) = fragment::parse_ref(source);
+    let conversation_id = uuid::Uuid::parse_str(id).ok()?.to_string();
+    Some((|| {
+        let store = chatgpt::ChatGptStore::from_auth_file().map_err(|error| error.to_string())?;
+        let reference = store
+            .conversation_ref(conversation_id)
+            .map_err(|error| error.to_string())?;
+        let native = store.load(&reference).map_err(|error| error.to_string())?;
+        let common = chatgpt::ChatGpt::to_common(&native).map_err(|error| error.to_string())?;
         Ok((common, request))
     })())
 }
@@ -818,6 +917,12 @@ mod identity_tests {
     fn claude_chat_as_a_target_uses_the_normal_write_boundary() {
         assert!(ensure_resumable_source(HarnessId::Codex, HarnessId::ClaudeChat).is_ok());
     }
+
+    #[test]
+    fn chatgpt_is_refused_even_for_an_in_place_continue() {
+        let error = ensure_resumable_source(HarnessId::ChatGpt, HarnessId::ChatGpt).unwrap_err();
+        assert!(error.contains("pull-only"));
+    }
 }
 
 fn cmd_list(
@@ -846,6 +951,9 @@ fn cmd_list(
         match from {
             Some(HarnessId::ClaudeChat) => {
                 println!("no Claude Chat sessions found{scope}{when}");
+            }
+            Some(HarnessId::ChatGpt) => {
+                println!("no ChatGPT sessions found{scope}{when}");
             }
             Some(h) => println!("no local {h} sessions found{scope}{when}"),
             None => println!("no local sessions found{scope}{when}"),
@@ -940,6 +1048,7 @@ mod style {
         match h {
             HarnessId::ClaudeCode => "\x1b[33m",       // yellow
             HarnessId::ClaudeChat => "\x1b[38;5;214m", // amber
+            HarnessId::ChatGpt => "\x1b[38;5;71m",     // OpenAI green
             HarnessId::Codex => "\x1b[36m",            // cyan
             HarnessId::OpenCode => "\x1b[32m",         // green
             HarnessId::Pi => "\x1b[35m",               // magenta
@@ -989,8 +1098,22 @@ fn cmd_continue(
         let target = with.unwrap_or(HarnessId::ClaudeChat);
         ensure_resumable_source(HarnessId::ClaudeChat, target)?;
         let (common, request) = loaded?;
-        return continue_loaded_claude_chat(
+        return continue_loaded_remote(
             common,
+            HarnessId::ClaudeChat,
+            target,
+            request.as_ref(),
+            out.map(PathBuf::as_path),
+            out.is_none() && !no_resume,
+        );
+    }
+    if let Some(loaded) = load_direct_chatgpt(id, from) {
+        let target = with.unwrap_or(HarnessId::ChatGpt);
+        ensure_resumable_source(HarnessId::ChatGpt, target)?;
+        let (common, request) = loaded?;
+        return continue_loaded_remote(
+            common,
+            HarnessId::ChatGpt,
             target,
             request.as_ref(),
             out.map(PathBuf::as_path),
@@ -1327,8 +1450,9 @@ fn continue_session(
     launch(target, &resume_id, found.meta.cwd.as_deref(), resume)
 }
 
-fn continue_loaded_claude_chat(
+fn continue_loaded_remote(
     common: Transcript<Common>,
+    source: HarnessId,
     target: HarnessId,
     span_req: Option<&fragment::SpanReq>,
     out: Option<&std::path::Path>,
@@ -1341,7 +1465,7 @@ fn continue_loaded_claude_chat(
     };
     fresh_identity(&mut copy, target, out);
     stamp_live_cwd(&mut copy, out);
-    let resume_id = write_and_report(HarnessId::ClaudeChat, target, &copy, out)?;
+    let resume_id = write_and_report(source, target, &copy, out)?;
     launch(target, &resume_id, cwd.as_deref(), resume)
 }
 
@@ -1349,6 +1473,11 @@ fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), S
     if source == HarnessId::ClaudeChat && target == HarnessId::ClaudeChat {
         Err(
             "Claude Chat is pull-only: choose another --with harness; txcript never continues conversations in Claude"
+                .to_string(),
+        )
+    } else if source == HarnessId::ChatGpt && target == HarnessId::ChatGpt {
+        Err(
+            "ChatGPT is pull-only: choose another --with harness; txcript never continues conversations in ChatGPT"
                 .to_string(),
         )
     } else {
@@ -1522,9 +1651,10 @@ fn resume_workdir(cwd: Option<&str>) -> Option<PathBuf> {
 
 fn discover_with_spinner(from: Option<HarnessId>) -> Result<Vec<local::Session>, String> {
     let spinner = spin::Spinner::start("searching local sessions…");
-    let sessions = if let Some(HarnessId::ClaudeChat) = from {
-        spinner.set("reading Claude Chat…".to_string());
-        local::discover_harness(HarnessId::ClaudeChat).map_err(|error| error.to_string())?
+    let sessions = if matches!(from, Some(HarnessId::ClaudeChat | HarnessId::ChatGpt)) {
+        let harness = from.unwrap_or(HarnessId::ClaudeChat);
+        spinner.set(format!("reading {harness}…"));
+        local::discover_harness(harness).map_err(|error| error.to_string())?
     } else {
         local::discover_with(|harness, count| {
             spinner.set(format!("scanning {harness}… ({count} found)"));

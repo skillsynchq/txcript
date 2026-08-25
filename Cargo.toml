@@ -52,6 +52,7 @@ nucleo-matcher = { version = "0.3.1", optional = true }
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = { version = "0.10.9", optional = true }
 thiserror = "2.0.18"
 futures-util = { version = "0.3.33", optional = true }
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time"], optional = true }
@@ -65,7 +66,6 @@ aes = { version = "0.8.4", optional = true }
 cbc = { version = "0.1.2", features = ["alloc", "block-padding"], optional = true }
 pbkdf2 = { version = "0.12.2", optional = true }
 sha1 = { version = "0.10.6", optional = true }
-sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 criterion = "0.8.2"
@@ -97,7 +97,7 @@ harness = false
 required-features = ["search"]
 
 [features]
-default = ["opencode", "hermes", "claude_chat", "search"]
+default = ["opencode", "hermes", "claude_chat", "chatgpt", "search"]
 # The OpenCode harness store reads OpenCode's SQLite database. The OpenCode
 # codec itself is always available; only the on-disk store needs rusqlite.
 opencode = ["dep:rusqlite"]
@@ -117,6 +117,16 @@ claude_chat = [
     "dep:cbc",
     "dep:pbkdf2",
     "dep:sha1",
+    "dep:sha2",
+]
+# ChatGPT is a live, read-only remote store. Its codec remains available
+# featureless; the feature adds a dedicated OAuth login and browser-compatible
+# HTTPS access to ChatGPT's private read endpoints.
+chatgpt = [
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:wreq",
+    "dep:wreq-util",
     "dep:sha2",
 ]
 # Fuzzy/substring search over transcripts (`txcript::search`). nucleo-matcher

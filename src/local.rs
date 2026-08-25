@@ -26,6 +26,8 @@ use crate::harness::{
     amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, pi,
 };
 
+#[cfg(feature = "chatgpt")]
+use crate::harness::chatgpt;
 #[cfg(feature = "claude_chat")]
 use crate::harness::claude_chat;
 
@@ -54,7 +56,9 @@ pub struct Session {
 enum Locator {
     Path(PathBuf),
     #[cfg(feature = "claude_chat")]
-    Remote(claude_chat::ClaudeChatRef),
+    ClaudeChatRemote(claude_chat::ClaudeChatRef),
+    #[cfg(feature = "chatgpt")]
+    ChatGptRemote(chatgpt::ChatGptRef),
     #[cfg(any(feature = "opencode", feature = "hermes"))]
     Id(String),
 }
@@ -91,8 +95,7 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
         claude_code::ClaudeStore::default_root(),
         &mut out,
     );
-    // Claude Chat is deliberately excluded from aggregate discovery. Listing
-    // remote conversations requires an explicit Claude Chat source selection.
+    // Live web harnesses are deliberately excluded from aggregate discovery.
     on_store(HarnessId::Codex, out.len());
     scan(
         HarnessId::Codex,
@@ -180,7 +183,7 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
     out
 }
 
-/// Discover one harness, surfacing remote errors when Claude Chat is
+/// Discover one harness, surfacing remote errors when a live source is
 /// explicitly requested. Other harnesses retain the tolerant aggregate scan.
 ///
 /// # Errors
@@ -202,6 +205,21 @@ pub fn discover_harness(harness: HarnessId) -> Result<Vec<Session>> {
                     .to_string(),
         });
     }
+    #[cfg(feature = "chatgpt")]
+    if harness == HarnessId::ChatGpt {
+        let mut out = Vec::new();
+        discover_chatgpt_into(&mut out)?;
+        out.sort_by_key(|session| std::cmp::Reverse(session.meta.timestamp));
+        return Ok(out);
+    }
+    #[cfg(not(feature = "chatgpt"))]
+    if harness == HarnessId::ChatGpt {
+        return Err(Error::Remote {
+            harness: "chatgpt",
+            detail: "live ChatGPT support was not compiled in (enable the `chatgpt` feature)"
+                .to_string(),
+        });
+    }
     Ok(discover()
         .into_iter()
         .filter(|session| session.harness == harness)
@@ -210,8 +228,8 @@ pub fn discover_harness(harness: HarnessId) -> Result<Vec<Session>> {
 
 /// The sessions a `--from` selection names: every local harness when
 /// `from` is `None`, else that one harness. This is the only path that
-/// reaches Claude Chat, and only when it is named explicitly — an omitted
-/// `from` never contacts it.
+/// reaches a live web source, and only when it is named explicitly — an omitted
+/// `from` never contacts either one.
 ///
 /// # Errors
 /// When the explicitly selected live backend rejects access or changes shape.
@@ -230,7 +248,21 @@ fn discover_claude_chat_into(out: &mut Vec<Session>) -> Result<()> {
             harness: HarnessId::ClaudeChat,
             meta: discovered.meta,
             updated_at: discovered.reference.updated_at,
-            locator: Locator::Remote(discovered.reference),
+            locator: Locator::ClaudeChatRemote(discovered.reference),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "chatgpt")]
+fn discover_chatgpt_into(out: &mut Vec<Session>) -> Result<()> {
+    let store = chatgpt::ChatGptStore::from_auth_file()?;
+    for discovered in Store::discover(&store)? {
+        out.push(Session {
+            harness: HarnessId::ChatGpt,
+            meta: discovered.meta,
+            updated_at: discovered.reference.updated_at,
+            locator: Locator::ChatGptRemote(discovered.reference),
         });
     }
     Ok(())
@@ -248,8 +280,12 @@ impl Session {
         match &self.locator {
             Locator::Path(p) => p.display().to_string(),
             #[cfg(feature = "claude_chat")]
-            Locator::Remote(reference) => {
+            Locator::ClaudeChatRemote(reference) => {
                 format!("https://claude.ai/chat/{}", reference.conversation_uuid)
+            }
+            #[cfg(feature = "chatgpt")]
+            Locator::ChatGptRemote(reference) => {
+                format!("https://chatgpt.com/c/{}", reference.conversation_id)
             }
             #[cfg(feature = "opencode")]
             Locator::Id(id) => format!("{} db session {id}", self.harness),
@@ -274,9 +310,14 @@ impl Session {
                 go(claude_code::ClaudeStore::default_root(), p)
             }
             #[cfg(feature = "claude_chat")]
-            (HarnessId::ClaudeChat, Locator::Remote(reference)) => {
+            (HarnessId::ClaudeChat, Locator::ClaudeChatRemote(reference)) => {
                 let store = claude_chat::ClaudeChatStore::from_desktop()?;
                 claude_chat::ClaudeChat::to_common(&store.load(reference)?)
+            }
+            #[cfg(feature = "chatgpt")]
+            (HarnessId::ChatGpt, Locator::ChatGptRemote(reference)) => {
+                let store = chatgpt::ChatGptStore::from_auth_file()?;
+                chatgpt::ChatGpt::to_common(&store.load(reference)?)
             }
             (HarnessId::Codex, Locator::Path(p)) => go(codex::CodexStore::default_root(), p),
             (HarnessId::Pi, Locator::Path(p)) => go(pi::PiStore::default_root(), p),
@@ -325,8 +366,12 @@ impl Session {
                 go(claude_code::ClaudeStore::default_root(), p)
             }
             #[cfg(feature = "claude_chat")]
-            (HarnessId::ClaudeChat, Locator::Remote(reference)) => {
+            (HarnessId::ClaudeChat, Locator::ClaudeChatRemote(reference)) => {
                 claude_chat::ClaudeChatStore::from_desktop()?.delete(reference)
+            }
+            #[cfg(feature = "chatgpt")]
+            (HarnessId::ChatGpt, Locator::ChatGptRemote(reference)) => {
+                chatgpt::ChatGptStore::from_auth_file()?.delete(reference)
             }
             (HarnessId::Codex, Locator::Path(p)) => go(codex::CodexStore::default_root(), p),
             (HarnessId::Pi, Locator::Path(p)) => go(pi::PiStore::default_root(), p),
@@ -391,7 +436,13 @@ pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
         match harness {
             HarnessId::ClaudeCode => group.files(claude_code::ClaudeStore::default_root()),
             #[cfg(feature = "claude_chat")]
-            HarnessId::ClaudeChat => group.remote(claude_chat::ClaudeChatStore::from_desktop()),
+            HarnessId::ClaudeChat => {
+                group.claude_chat_remote(claude_chat::ClaudeChatStore::from_desktop());
+            }
+            #[cfg(feature = "chatgpt")]
+            HarnessId::ChatGpt => {
+                group.chatgpt_remote(chatgpt::ChatGptStore::from_auth_file());
+            }
             HarnessId::Codex => group.files(codex::CodexStore::default_root()),
             HarnessId::Pi => group.files(pi::PiStore::default_root()),
             HarnessId::Campfire => group.files(campfire::CampfireStore::default_root()),
@@ -453,18 +504,36 @@ impl Group<'_> {
     }
 
     #[cfg(feature = "claude_chat")]
-    fn remote(self, store: Result<claude_chat::ClaudeChatStore>) {
+    fn claude_chat_remote(self, store: Result<claude_chat::ClaudeChatStore>) {
         let refs: Vec<claude_chat::ClaudeChatRef> = self
             .at
             .iter()
-            .filter_map(|&index| self.sessions[index].remote().cloned())
+            .filter_map(|&index| self.sessions[index].claude_chat_remote().cloned())
             .collect();
         let by_ref = store
             .ok()
             .and_then(|store| store.fingerprints(&refs).ok())
             .unwrap_or_default();
         for &index in self.at {
-            if let Some(reference) = self.sessions[index].remote() {
+            if let Some(reference) = self.sessions[index].claude_chat_remote() {
+                self.out[index] = by_ref.get(&reference.key()).cloned().unwrap_or_default();
+            }
+        }
+    }
+
+    #[cfg(feature = "chatgpt")]
+    fn chatgpt_remote(self, store: Result<chatgpt::ChatGptStore>) {
+        let refs: Vec<chatgpt::ChatGptRef> = self
+            .at
+            .iter()
+            .filter_map(|&index| self.sessions[index].chatgpt_remote().cloned())
+            .collect();
+        let by_ref = store
+            .ok()
+            .and_then(|store| store.fingerprints(&refs).ok())
+            .unwrap_or_default();
+        for &index in self.at {
+            if let Some(reference) = self.sessions[index].chatgpt_remote() {
                 self.out[index] = by_ref.get(&reference.key()).cloned().unwrap_or_default();
             }
         }
@@ -500,17 +569,33 @@ impl Session {
         match &self.locator {
             Locator::Path(p) => Some(p),
             #[cfg(feature = "claude_chat")]
-            Locator::Remote(_) => None,
+            Locator::ClaudeChatRemote(_) => None,
+            #[cfg(feature = "chatgpt")]
+            Locator::ChatGptRemote(_) => None,
             #[cfg(any(feature = "opencode", feature = "hermes"))]
             Locator::Id(_) => None,
         }
     }
 
     #[cfg(feature = "claude_chat")]
-    fn remote(&self) -> Option<&claude_chat::ClaudeChatRef> {
+    fn claude_chat_remote(&self) -> Option<&claude_chat::ClaudeChatRef> {
         match &self.locator {
-            Locator::Remote(reference) => Some(reference),
+            Locator::ClaudeChatRemote(reference) => Some(reference),
             Locator::Path(_) => None,
+            #[cfg(feature = "chatgpt")]
+            Locator::ChatGptRemote(_) => None,
+            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            Locator::Id(_) => None,
+        }
+    }
+
+    #[cfg(feature = "chatgpt")]
+    fn chatgpt_remote(&self) -> Option<&chatgpt::ChatGptRef> {
+        match &self.locator {
+            Locator::ChatGptRemote(reference) => Some(reference),
+            Locator::Path(_) => None,
+            #[cfg(feature = "claude_chat")]
+            Locator::ClaudeChatRemote(_) => None,
             #[cfg(any(feature = "opencode", feature = "hermes"))]
             Locator::Id(_) => None,
         }
@@ -523,7 +608,9 @@ impl Session {
             Locator::Id(id) => Some(id),
             Locator::Path(_) => None,
             #[cfg(feature = "claude_chat")]
-            Locator::Remote(_) => None,
+            Locator::ClaudeChatRemote(_) => None,
+            #[cfg(feature = "chatgpt")]
+            Locator::ChatGptRemote(_) => None,
         }
     }
 }
@@ -577,12 +664,17 @@ pub fn write(
 
     match target {
         HarnessId::ClaudeCode => write_claude_code(common, root),
-        // Like Amp, Claude Chat is server-authoritative and has no import.
-        // Its additional in-place-resume refusal lives in the CLI because
-        // that path deliberately bypasses `write` for existing sessions.
+        // Live web sources are server-authoritative and have no import. Their
+        // additional in-place-resume refusals live in the CLI because that
+        // path deliberately bypasses `write` for existing sessions.
         HarnessId::ClaudeChat => Err(Error::Unconvertible {
             harness: "claude_chat",
             detail: "Claude Chat is a live read-only source; sessions can be pulled out and converted into another harness, but never continued into Claude"
+                .to_string(),
+        }),
+        HarnessId::ChatGpt => Err(Error::Unconvertible {
+            harness: "chatgpt",
+            detail: "ChatGPT is a live read-only source; sessions can be pulled out and converted into another harness, but never continued into ChatGPT"
                 .to_string(),
         }),
         HarnessId::Codex => go(
@@ -847,7 +939,9 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
         match harness {
             HarnessId::ClaudeCode => ("claude".into(), vec!["--resume".into(), id]),
             // Source-only harnesses: the CLI refuses before this fallback.
-            HarnessId::ClaudeChat | HarnessId::Simple => ("txcript".into(), Vec::new()),
+            HarnessId::ClaudeChat | HarnessId::ChatGpt | HarnessId::Simple => {
+                ("txcript".into(), Vec::new())
+            }
             HarnessId::Codex => ("codex".into(), vec!["resume".into(), id]),
             HarnessId::OpenCode => ("opencode".into(), vec!["--session".into(), id]),
             HarnessId::Pi => ("pi".into(), vec!["--session".into(), id]),
@@ -902,7 +996,7 @@ fn mismatch(harness: HarnessId) -> Error {
 }
 
 #[cfg(test)]
-mod claude_chat_gate_tests {
+mod live_remote_gate_tests {
     use super::{HarnessId, discover_scoped, discover_with};
 
     #[test]
@@ -910,17 +1004,20 @@ mod claude_chat_gate_tests {
         let mut scanned = Vec::new();
         let sessions = discover_with(|harness, _| scanned.push(harness));
         assert!(!scanned.contains(&HarnessId::ClaudeChat));
+        assert!(!scanned.contains(&HarnessId::ChatGpt));
         assert!(sessions.iter().all(|s| s.harness != HarnessId::ClaudeChat));
+        assert!(sessions.iter().all(|s| s.harness != HarnessId::ChatGpt));
     }
 
     #[test]
-    fn an_omitted_from_never_yields_claude_chat() {
+    fn an_omitted_from_never_yields_live_web_sessions() {
         let sessions = discover_scoped(None).unwrap_or_else(|e| panic!("{e}"));
         assert!(sessions.iter().all(|s| s.harness != HarnessId::ClaudeChat));
+        assert!(sessions.iter().all(|s| s.harness != HarnessId::ChatGpt));
     }
 
     #[test]
-    fn another_harness_as_from_never_yields_claude_chat() {
+    fn another_harness_as_from_never_yields_live_web_sessions() {
         let sessions = discover_scoped(Some(HarnessId::Codex)).unwrap_or_else(|e| panic!("{e}"));
         assert!(sessions.iter().all(|s| s.harness == HarnessId::Codex));
     }

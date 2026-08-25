@@ -185,7 +185,7 @@ impl SessionServer {
     /// List local sessions newest-first, with the same harness and working
     /// directory filters as `txcript list`, paged by `limit`/`offset`.
     #[tool(
-        description = "List local coding-agent sessions newest-first. Optional `from` and `cwd` filters match the txcript CLI; omitted filters include all harnesses or directories. Claude Chat is not listed here. Optional `limit`/`offset` page the listing; the result carries the pre-paging `total`.",
+        description = "List local coding-agent sessions newest-first. Optional `from` and `cwd` filters match the txcript CLI; omitted filters include all harnesses or directories. Live web sources are not listed here. Optional `limit`/`offset` page the listing; the result carries the pre-paging `total`.",
         annotations(title = "List sessions", read_only_hint = true)
     )]
     fn list_sessions(
@@ -193,11 +193,14 @@ impl SessionServer {
         Parameters(request): Parameters<ListSessionsRequest>,
     ) -> Result<Json<SessionList>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
-        // Enumerating a live claude.ai account is not offered over MCP; the
+        // Enumerating a live web account is not offered over MCP; the
         // refusal is explicit so an agent doesn't read "no sessions" as truth.
-        if from == Some(HarnessId::ClaudeChat) {
+        if matches!(from, Some(HarnessId::ClaudeChat | HarnessId::ChatGpt)) {
+            let name = from.map_or("live source", HarnessId::as_str);
             return Err(ErrorData::invalid_params(
-                "list_sessions does not list Claude Chat; use `txcript list --from claude_chat`",
+                format!(
+                    "list_sessions does not enumerate {name}; use `txcript list --from {name}`"
+                ),
                 None,
             ));
         }
@@ -256,6 +259,12 @@ impl SessionServer {
     ) -> Result<String, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         if let Some(loaded) = super::load_direct_claude_chat(&request.id, from) {
+            let (common, span_req) =
+                loaded.map_err(|error| ErrorData::internal_error(error, None))?;
+            let src = crate::fragment::parse_ref(&request.id).0;
+            return render_read_session(src, &common, span_req.as_ref());
+        }
+        if let Some(loaded) = super::load_direct_chatgpt(&request.id, from) {
             let (common, span_req) =
                 loaded.map_err(|error| ErrorData::internal_error(error, None))?;
             let src = crate::fragment::parse_ref(&request.id).0;
@@ -384,7 +393,7 @@ impl ServerHandler for SessionServer {
     }
 }
 
-/// The same gate as the CLI's `--from`: Claude Chat is read only when the
+/// The same gate as the CLI's `--from`: live sources are read only when the
 /// request names it; an omitted `from` scans local harnesses alone.
 fn discover_scoped(from: Option<HarnessId>) -> Result<Vec<local::Session>, ErrorData> {
     local::discover_scoped(from).map_err(|error| ErrorData::internal_error(error.to_string(), None))
@@ -477,7 +486,21 @@ mod tests {
             }))
             .err()
             .unwrap_or_else(|| panic!("claude_chat listing is refused"));
-        assert!(error.message.contains("does not list Claude Chat"));
+        assert!(error.message.contains("does not enumerate claude_chat"));
+    }
+
+    #[test]
+    fn list_sessions_refuses_chatgpt() {
+        let error = SessionServer::new(None)
+            .list_sessions(Parameters(ListSessionsRequest {
+                from: Some("chatgpt".into()),
+                cwd: None,
+                limit: None,
+                offset: None,
+            }))
+            .err()
+            .unwrap_or_else(|| panic!("chatgpt listing is refused"));
+        assert!(error.message.contains("does not enumerate chatgpt"));
     }
 
     #[test]

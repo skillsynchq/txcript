@@ -8,6 +8,7 @@
 pub mod amp;
 pub mod antigravity;
 pub mod campfire;
+pub mod chatgpt;
 pub mod claude_chat;
 pub mod claude_code;
 pub mod codex;

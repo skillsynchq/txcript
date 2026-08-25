@@ -47,7 +47,7 @@ txcript maps each harness's native transcript format through a typed common mode
 
 ## Highlights
 
-- **14 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
+- **16 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
 - **A format for everyone else**: agents txcript has never heard of emit the documented [Simple](docs/formats/simple.md) interchange JSON — a file or a stream, handed to txcript directly — and their transcripts continue in any supported harness.
 - **Byte-lossless round-trips**: loading and saving a session in its own format reproduces it exactly.
 - **Continue anywhere**: `txcript continue <id> --with <harness>` rewrites a session into another harness's native format and launches it. The original is never modified.
@@ -61,6 +61,7 @@ txcript maps each harness's native transcript format through a typed common mode
 flowchart LR
     claude["Claude Code"] <--> common(("Transcript&lt;Common&gt;"))
     claudechat["Claude Chat"] --> common
+    chatgpt["ChatGPT"] --> common
     cowork["Cowork"] <--> common
     codex["Codex"] <--> common
     opencode["OpenCode"] <--> common
@@ -82,6 +83,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 |---|---|---|---|:---:|:---:|---|
 | [Claude Code](https://claude.com/claude-code) | `claude_code` | `~/.claude/projects/` | JSONL | ⇄ | ✓ | [spec](docs/formats/claude-code.md) |
 | [Claude Chat](https://claude.ai) | `claude_chat` | live `claude.ai` account <sup>4</sup> | private web API | → | — <sup>4</sup> | [spec](docs/formats/claude-chat.md) |
+| [ChatGPT](https://chatgpt.com) | `chatgpt` | live `chatgpt.com` account <sup>5</sup> | private web API | → | — <sup>5</sup> | [spec](docs/formats/chatgpt.md) |
 | [Cowork](https://claude.com/product/cowork) | `cowork` | `<Claude app data>/local-agent-mode-sessions/` | session record + Claude Code JSONL | ⇄ | ✓ | [spec](docs/formats/cowork.md) |
 | [Codex](https://github.com/openai/codex) | `codex` | `~/.codex/sessions/` | rollout JSONL | ⇄ | ✓ | [spec](docs/formats/codex.md) |
 | [OpenCode](https://opencode.ai) | `opencode` | `~/.local/share/opencode/opencode.db` | SQLite | ⇄ | ✓ | [spec](docs/formats/opencode.md) |
@@ -103,6 +105,8 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 <sup>3</sup> Hermes's `state.db` is read-only in txcript and Hermes has no session-import command: sessions convert *from* Hermes, but can't be continued into it.
 
 <sup>4</sup> Claude Chat is a live, pull-only source. On macOS, explicitly selecting `--from claude_chat` reuses the signed-in Claude Desktop session automatically; aggregate discovery does not contact Claude Chat. Environment-supplied session and Cloudflare credentials are rejected in V1. An optional `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restricts discovery, while Desktop auth otherwise uses the app's active organization. Direct Rust calls to `ClaudeChatStore::discover()` produce a compile-time warning that discovery uses an undocumented private endpoint Anthropic can observe or restrict. txcript performs GET requests only and refuses save, delete, same-harness continue, and `--with claude_chat`. Generated files presented on the active branch become Common artifact blocks; Claude Code conversions materialize them beside the generated session and use Claude Code's native `Artifact` tool. Claude's data-export ZIP and `conversations.json` are not supported.
+
+<sup>5</sup> ChatGPT is a live, pull-only source. Run `txcript chatgpt login` once; txcript keeps this OAuth login under `~/.txcript/chatgpt-auth.json`, separate from browsers and Codex. Explicit `--from chatgpt` is required before account discovery; an exact conversation UUID can be read directly without enumerating the account. Conversation traffic is GET-only. OAuth token exchange and refresh are the only POSTs, and txcript refuses save, delete, same-harness continue, and `--with chatgpt`. The consent screen currently uses OpenAI's Codex installed-app flow because ChatGPT exposes neither a supported conversation API nor third-party client registration; the private endpoint and auth flow may change or be restricted. ChatGPT data-export archives are not supported.
 
 ## Install
 
@@ -297,7 +301,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","claude_chat","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","fx","hermes","amp","antigravity","simple","cowork"]
+harnesses(); // ["claude_code","claude_chat","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","fx","hermes","amp","antigravity","simple","cowork"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -306,6 +310,7 @@ Text-in / text-out: `input` is the source harness's native session text and the 
 |---|---|
 | `claude_code`, `codex`, `pi`, `campfire` | session JSONL |
 | `claude_chat` | one live conversation detail response (source-only; no account export arrays) |
+| `chatgpt` | one live conversation detail response (source-only; no account export arrays) |
 | `opencode` | `opencode export` JSON |
 | `cursor` | JSON export of the session's `store.db` |
 | `cursor_desktop` | JSON dump of the session's `state.vscdb` rows |
