@@ -256,7 +256,7 @@ fn discover_claude_chat_into(out: &mut Vec<Session>) -> Result<()> {
 
 #[cfg(feature = "chatgpt")]
 fn discover_chatgpt_into(out: &mut Vec<Session>) -> Result<()> {
-    let store = chatgpt::ChatGptStore::from_auth_file()?;
+    let store = chatgpt::ChatGptStore::from_codex()?;
     for discovered in Store::discover(&store)? {
         out.push(Session {
             harness: HarnessId::ChatGpt,
@@ -316,7 +316,7 @@ impl Session {
             }
             #[cfg(feature = "chatgpt")]
             (HarnessId::ChatGpt, Locator::ChatGptRemote(reference)) => {
-                let store = chatgpt::ChatGptStore::from_auth_file()?;
+                let store = chatgpt::ChatGptStore::from_codex()?;
                 chatgpt::ChatGpt::to_common(&store.load(reference)?)
             }
             (HarnessId::Codex, Locator::Path(p)) => go(codex::CodexStore::default_root(), p),
@@ -371,7 +371,7 @@ impl Session {
             }
             #[cfg(feature = "chatgpt")]
             (HarnessId::ChatGpt, Locator::ChatGptRemote(reference)) => {
-                chatgpt::ChatGptStore::from_auth_file()?.delete(reference)
+                chatgpt::ChatGptStore::from_codex()?.delete(reference)
             }
             (HarnessId::Codex, Locator::Path(p)) => go(codex::CodexStore::default_root(), p),
             (HarnessId::Pi, Locator::Path(p)) => go(pi::PiStore::default_root(), p),
@@ -441,7 +441,7 @@ pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
             }
             #[cfg(feature = "chatgpt")]
             HarnessId::ChatGpt => {
-                group.chatgpt_remote(chatgpt::ChatGptStore::from_auth_file());
+                group.chatgpt_remote(chatgpt::ChatGptStore::from_codex());
             }
             HarnessId::Codex => group.files(codex::CodexStore::default_root()),
             HarnessId::Pi => group.files(pi::PiStore::default_root()),

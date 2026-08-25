@@ -3,9 +3,8 @@
 //!
 //! [`ChatGptStore`] discovers and loads conversations with GET requests.
 //! Conversation writes, deletes, and same-harness continues are refused at
-//! every boundary. OAuth token exchange and refresh are authentication only;
-//! credentials are stored separately under `~/.txcript` and are never read
-//! from a browser profile or Codex.
+//! every boundary. The store reuses Codex's existing `ChatGPT` login from
+//! `CODEX_HOME/auth.json` (or `~/.codex/auth.json`) without modifying it.
 //!
 //! The native [`Conversation`] preserves the complete parent-linked `mapping`
 //! and every unmodeled server field. Conversion follows `current_node` to the
@@ -443,25 +442,22 @@ fn read_only_error() -> Error {
     }
 }
 
-// ── live remote store and dedicated OAuth login ────────────────────────
+// ── live remote store ──────────────────────────────────────────────────
 
 #[cfg(feature = "chatgpt")]
 mod remote {
     use std::collections::HashMap;
-    use std::fs::{self, OpenOptions};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use base64::Engine as _;
     use chrono::{DateTime, Utc};
     use futures_util::StreamExt as _;
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use serde_json::Value;
-    use sha2::{Digest as _, Sha256};
     use uuid::Uuid;
 
     use super::{ChatGpt, Conversation, meta_from_conversation, read_only_error, value_timestamp};
@@ -470,13 +466,9 @@ mod remote {
     use crate::transcript::{Discovered, Harness, Saved, Store, Transcript};
 
     const CHATGPT_BASE_URL: &str = "https://chatgpt.com";
-    const AUTH_BASE_URL: &str = "https://auth.openai.com";
-    // Public installed-app client id used by OpenAI's current PKCE login flow.
-    const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
     const PAGE_SIZE: usize = 100;
     const MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
-    const MAX_AUTH_BYTES: u64 = 1024 * 1024;
-    const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
+    const MAX_CODEX_AUTH_BYTES: usize = 1024 * 1024;
 
     /// A stable reference to one `ChatGPT` conversation.
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -492,184 +484,27 @@ mod remote {
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone)]
     struct Credentials {
         access_token: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        refresh_token: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        account_id: Option<String>,
+        account_id: String,
     }
 
     #[derive(Debug, Deserialize)]
-    #[allow(clippy::struct_field_names)]
-    struct TokenResponse {
+    struct CodexAuth {
+        #[serde(default)]
+        auth_mode: Option<String>,
+        #[serde(default)]
+        tokens: Option<CodexTokens>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CodexTokens {
         access_token: String,
         #[serde(default)]
-        refresh_token: Option<String>,
+        account_id: Option<String>,
         #[serde(default)]
         id_token: Option<String>,
-    }
-
-    /// Human-readable status of txcript's dedicated `ChatGPT` credentials.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct AuthStatus {
-        pub logged_in: bool,
-        pub account_id: Option<String>,
-        pub expires_at: Option<DateTime<Utc>>,
-        pub path: PathBuf,
-    }
-
-    /// Pending localhost PKCE login. The CLI prints `auth_url` before waiting.
-    pub struct Login {
-        auth_url: String,
-        redirect_uri: String,
-        state: String,
-        verifier: String,
-        listener: TcpListener,
-    }
-
-    impl Login {
-        #[must_use]
-        pub fn auth_url(&self) -> &str {
-            &self.auth_url
-        }
-
-        /// Wait for the OAuth redirect, exchange the code, and persist only
-        /// txcript's own credentials.
-        ///
-        /// # Errors
-        /// When the callback times out, state validation fails, token exchange
-        /// fails, or the credential file cannot be written safely.
-        pub fn wait(self) -> Result<AuthStatus> {
-            let deadline = Instant::now() + LOGIN_TIMEOUT;
-            loop {
-                match self.listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-                        let mut input = [0_u8; 16 * 1024];
-                        let count = stream.read(&mut input)?;
-                        let request = std::str::from_utf8(&input[..count])
-                            .map_err(|_| protocol_error("OAuth callback was not valid UTF-8"))?;
-                        let target = request
-                            .lines()
-                            .next()
-                            .and_then(|line| line.split_whitespace().nth(1))
-                            .ok_or_else(|| {
-                                protocol_error("OAuth callback request was malformed")
-                            })?;
-                        let params = query_params(target);
-                        let callback_state = params
-                            .get("state")
-                            .ok_or_else(|| protocol_error("OAuth callback omitted `state`"))?;
-                        if callback_state != &self.state {
-                            write_callback(&mut stream, false);
-                            return Err(protocol_error("OAuth callback state did not match"));
-                        }
-                        if let Some(error) = params.get("error") {
-                            write_callback(&mut stream, false);
-                            return Err(protocol_error(&format!(
-                                "OAuth login was refused: {error}"
-                            )));
-                        }
-                        let code = params
-                            .get("code")
-                            .ok_or_else(|| protocol_error("OAuth callback omitted `code`"))?;
-                        let credentials = exchange_code(code, &self.redirect_uri, &self.verifier)?;
-                        save_credentials(&credentials)?;
-                        write_callback(&mut stream, true);
-                        return auth_status();
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            return Err(protocol_error("OAuth login timed out after five minutes"));
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-    }
-
-    /// Start a dedicated `ChatGPT` PKCE login on a localhost callback.
-    ///
-    /// # Errors
-    /// When neither supported localhost port can be bound.
-    pub fn begin_login() -> Result<Login> {
-        let listener = TcpListener::bind(("127.0.0.1", 1455))
-            .or_else(|_| TcpListener::bind(("127.0.0.1", 1457)))?;
-        listener.set_nonblocking(true)?;
-        let port = listener.local_addr()?.port();
-        let redirect_uri = format!("http://localhost:{port}/auth/callback");
-        let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(verifier.as_bytes()));
-        let state = Uuid::new_v4().to_string();
-        let params = [
-            ("response_type", "code"),
-            ("client_id", OAUTH_CLIENT_ID),
-            ("redirect_uri", redirect_uri.as_str()),
-            (
-                "scope",
-                "openid profile email offline_access api.connectors.read api.connectors.invoke",
-            ),
-            ("code_challenge", challenge.as_str()),
-            ("code_challenge_method", "S256"),
-            ("id_token_add_organizations", "true"),
-            ("codex_cli_simplified_flow", "true"),
-            ("state", state.as_str()),
-            ("originator", "txcript"),
-        ];
-        let query = params
-            .into_iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-            .collect::<Vec<_>>()
-            .join("&");
-        Ok(Login {
-            auth_url: format!("{AUTH_BASE_URL}/oauth/authorize?{query}"),
-            redirect_uri,
-            state,
-            verifier,
-            listener,
-        })
-    }
-
-    /// Remove txcript's dedicated `ChatGPT` credentials.
-    ///
-    /// # Errors
-    /// When an existing credential file cannot be removed.
-    pub fn logout() -> Result<bool> {
-        let path = auth_path()?;
-        match fs::remove_file(path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Inspect txcript's `ChatGPT` login without contacting `ChatGPT`.
-    ///
-    /// # Errors
-    /// When the credential path cannot be resolved or the file is malformed.
-    pub fn auth_status() -> Result<AuthStatus> {
-        let path = auth_path()?;
-        let credentials = match fs::read(&path) {
-            Ok(bytes) => Some(parse_credentials(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        Ok(AuthStatus {
-            logged_in: credentials.is_some(),
-            account_id: credentials
-                .as_ref()
-                .and_then(|value| value.account_id.clone()),
-            expires_at: credentials
-                .as_ref()
-                .and_then(|value| token_expiry(&value.access_token)),
-            path,
-        })
     }
 
     /// Read-only client for `ChatGPT`'s live web conversation store.
@@ -700,19 +535,17 @@ mod remote {
             <Self as Store>::discover(self)
         }
 
-        /// Load txcript's dedicated `ChatGPT` login, refreshing it when needed.
+        /// Reuse the `ChatGPT` login already managed by Codex.
+        ///
+        /// `txcript` only reads `CODEX_HOME/auth.json` (or
+        /// `~/.codex/auth.json`). It never refreshes or rewrites Codex's
+        /// credentials.
         ///
         /// # Errors
-        /// When login is absent, malformed, expired without a refresh token,
-        /// or the HTTP client cannot start.
-        pub fn from_auth_file() -> Result<Self> {
-            let mut credentials = load_credentials()?;
-            if token_expiry(&credentials.access_token)
-                .is_some_and(|expiry| expiry <= Utc::now() + chrono::Duration::seconds(60))
-            {
-                credentials = refresh_credentials(&credentials)?;
-                save_credentials(&credentials)?;
-            }
+        /// When Codex is not signed in with `ChatGPT`, its auth file is
+        /// malformed or expired, or the HTTP client cannot start.
+        pub fn from_codex() -> Result<Self> {
+            let credentials = load_codex_credentials(&codex_home()?)?;
             Self::build(credentials, CHATGPT_BASE_URL.to_string())
         }
 
@@ -730,9 +563,7 @@ mod remote {
 
         fn build(credentials: Credentials, base_url: String) -> Result<Self> {
             validate_header("access token", &credentials.access_token)?;
-            if let Some(account_id) = &credentials.account_id {
-                validate_header("account id", account_id)?;
-            }
+            validate_header("account id", &credentials.account_id)?;
             Ok(Self {
                 credentials,
                 agent: BrowserTransport::start()?,
@@ -745,18 +576,14 @@ mod remote {
                 "authorization",
                 format!("Bearer {}", self.credentials.access_token),
             )];
-            if let Some(account_id) = &self.credentials.account_id {
-                headers.push(("chatgpt-account-id", account_id.clone()));
-            }
+            headers.push(("chatgpt-account-id", self.credentials.account_id.clone()));
             headers.push(("originator", "txcript".to_string()));
             headers
         }
 
         fn get_json(&self, path: &str) -> Result<Value> {
             let response = self.agent.request(BrowserRequestSpec {
-                method: Method::Get,
                 url: format!("{}{path}", self.base_url),
-                body: None,
                 headers: self.headers(),
                 max_bytes: MAX_RESPONSE_BYTES,
             })?;
@@ -768,8 +595,7 @@ mod remote {
             Self::build(
                 Credentials {
                     access_token: access_token.to_string(),
-                    refresh_token: None,
-                    account_id: Some("account-test".to_string()),
+                    account_id: "account-test".to_string(),
                 },
                 base_url,
             )
@@ -890,12 +716,6 @@ mod remote {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum Method {
-        Get,
-        Post,
-    }
-
     struct BrowserTransport {
         sender: mpsc::Sender<BrowserRequest>,
     }
@@ -906,9 +726,7 @@ mod remote {
     }
 
     struct BrowserRequestSpec {
-        method: Method,
         url: String,
-        body: Option<String>,
         headers: Vec<(&'static str, String)>,
         max_bytes: u64,
     }
@@ -980,24 +798,12 @@ mod remote {
         client: &wreq::Client,
         spec: &BrowserRequestSpec,
     ) -> std::result::Result<BrowserResponse, String> {
-        let mut builder = match spec.method {
-            Method::Get => client.get(&spec.url),
-            Method::Post => client.post(&spec.url),
-        }
-        .header(wreq::header::ACCEPT, "application/json")
-        .header("originator", "txcript")
-        .header("sec-fetch-mode", "cors");
-        if matches!(spec.method, Method::Get) {
-            builder = builder.header("referer", "https://chatgpt.com/");
-        }
-        if let Some(body) = &spec.body {
-            builder = builder
-                .header(
-                    wreq::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
-                .body(body.clone());
-        }
+        let mut builder = client
+            .get(&spec.url)
+            .header(wreq::header::ACCEPT, "application/json")
+            .header("originator", "txcript")
+            .header("sec-fetch-mode", "cors")
+            .header("referer", "https://chatgpt.com/");
         for (name, value) in &spec.headers {
             let mut header = wreq::header::HeaderValue::from_str(value)
                 .map_err(|_| format!("could not construct safe `{name}` header"))?;
@@ -1035,68 +841,6 @@ mod remote {
         Ok(BrowserResponse { status, body })
     }
 
-    fn exchange_code(code: &str, redirect_uri: &str, verifier: &str) -> Result<Credentials> {
-        let body = form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", OAUTH_CLIENT_ID),
-            ("code_verifier", verifier),
-        ]);
-        let response = BrowserTransport::start()?.request(BrowserRequestSpec {
-            method: Method::Post,
-            url: format!("{AUTH_BASE_URL}/oauth/token"),
-            body: Some(body),
-            headers: Vec::new(),
-            max_bytes: MAX_AUTH_BYTES,
-        })?;
-        let tokens: TokenResponse = serde_json::from_value(response_json(&response)?)
-            .map_err(|error| protocol_error(&format!("token response shape changed: {error}")))?;
-        credentials_from_tokens(tokens, None)
-    }
-
-    fn refresh_credentials(old: &Credentials) -> Result<Credentials> {
-        let refresh = old.refresh_token.as_deref().ok_or_else(|| Error::Remote {
-            harness: ChatGpt::NAME,
-            detail: "txcript's ChatGPT login expired and has no refresh token; run `txcript chatgpt login` again"
-                .to_string(),
-        })?;
-        let response = BrowserTransport::start()?.request(BrowserRequestSpec {
-            method: Method::Post,
-            url: format!("{AUTH_BASE_URL}/oauth/token"),
-            body: Some(form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh),
-                ("client_id", OAUTH_CLIENT_ID),
-            ])),
-            headers: Vec::new(),
-            max_bytes: MAX_AUTH_BYTES,
-        })?;
-        let tokens: TokenResponse = serde_json::from_value(response_json(&response)?)
-            .map_err(|error| protocol_error(&format!("token response shape changed: {error}")))?;
-        credentials_from_tokens(tokens, Some(old))
-    }
-
-    fn credentials_from_tokens(
-        tokens: TokenResponse,
-        old: Option<&Credentials>,
-    ) -> Result<Credentials> {
-        validate_header("access token", &tokens.access_token)?;
-        let account_id = tokens
-            .id_token
-            .as_deref()
-            .and_then(account_id_from_token)
-            .or_else(|| account_id_from_token(&tokens.access_token))
-            .or_else(|| old.and_then(|value| value.account_id.clone()));
-        Ok(Credentials {
-            access_token: tokens.access_token,
-            refresh_token: tokens
-                .refresh_token
-                .or_else(|| old.and_then(|value| value.refresh_token.clone())),
-            account_id,
-        })
-    }
-
     fn response_json(response: &BrowserResponse) -> Result<Value> {
         if !(200..300).contains(&response.status) {
             let message = serde_json::from_slice::<Value>(&response.body)
@@ -1111,7 +855,9 @@ mod remote {
                 })
                 .filter(|value| !value.is_empty());
             let guidance = match response.status {
-                401 => "authentication expired; run `txcript chatgpt login` again",
+                401 => {
+                    "Codex's ChatGPT login was rejected or expired; open Codex to refresh it or run `codex login`"
+                }
                 403 => {
                     "ChatGPT refused the authenticated read; the account may not allow this private endpoint"
                 }
@@ -1132,70 +878,69 @@ mod remote {
         })
     }
 
-    fn auth_path() -> Result<PathBuf> {
+    fn codex_home() -> Result<PathBuf> {
+        if let Some(path) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(path));
+        }
         home_dir()
-            .map(|home| home.join(".txcript").join("chatgpt-auth.json"))
-            .ok_or_else(|| Error::Remote {
-                harness: ChatGpt::NAME,
-                detail: "could not resolve the home directory for ChatGPT login".to_string(),
-            })
+            .map(|home| home.join(".codex"))
+            .ok_or_else(|| protocol_error("could not resolve Codex's home directory"))
     }
 
-    fn load_credentials() -> Result<Credentials> {
-        let path = auth_path()?;
+    fn load_codex_credentials(codex_home: &Path) -> Result<Credentials> {
+        let path = codex_home.join("auth.json");
         let bytes = fs::read(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Error::Remote {
                     harness: ChatGpt::NAME,
-                    detail: "not logged in; run `txcript chatgpt login` first".to_string(),
+                    detail: format!(
+                        "Codex ChatGPT login not found at {}; sign in to Codex with ChatGPT first",
+                        path.display()
+                    ),
                 }
             } else {
                 error.into()
             }
         })?;
-        parse_credentials(&bytes)
-    }
-
-    fn parse_credentials(bytes: &[u8]) -> Result<Credentials> {
-        let credentials: Credentials = serde_json::from_slice(bytes).map_err(|_| Error::Remote {
-            harness: ChatGpt::NAME,
-            detail: "txcript's ChatGPT credential file is malformed; run `txcript chatgpt login` again"
-                .to_string(),
-        })?;
-        validate_header("access token", &credentials.access_token)?;
-        Ok(credentials)
-    }
-
-    fn save_credentials(credentials: &Credentials) -> Result<()> {
-        let path = auth_path()?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| protocol_error("credential path has no parent"))?;
-        fs::create_dir_all(parent)?;
-        if fs::symlink_metadata(parent)?.file_type().is_symlink() {
+        if bytes.len() > MAX_CODEX_AUTH_BYTES {
             return Err(protocol_error(
-                "refusing to store ChatGPT credentials through a symlinked ~/.txcript directory",
+                "Codex auth file exceeded the 1 MiB safety limit",
             ));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        parse_codex_auth(&bytes)
+    }
+
+    fn parse_codex_auth(bytes: &[u8]) -> Result<Credentials> {
+        let auth: CodexAuth = serde_json::from_slice(bytes).map_err(|_| Error::Remote {
+            harness: ChatGpt::NAME,
+            detail: "Codex auth file is malformed; sign in to Codex with ChatGPT again".to_string(),
+        })?;
+        if auth.auth_mode.as_deref() != Some("chatgpt") {
+            return Err(protocol_error(
+                "Codex is not signed in with ChatGPT; sign in to Codex with ChatGPT first",
+            ));
         }
-        let temp = parent.join(format!(".chatgpt-auth-{}.tmp", Uuid::new_v4()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
+        let tokens = auth.tokens.ok_or_else(|| {
+            protocol_error("Codex auth has no ChatGPT tokens; sign in to Codex again")
+        })?;
+        validate_header("access token", &tokens.access_token)?;
+        if token_expiry(&tokens.access_token)
+            .is_some_and(|expiry| expiry <= Utc::now() + chrono::Duration::seconds(60))
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            return Err(protocol_error(
+                "Codex's ChatGPT access token is expired; open Codex to refresh it or run `codex login`",
+            ));
         }
-        let mut file = options.open(&temp)?;
-        let data = serde_json::to_vec_pretty(credentials)?;
-        file.write_all(&data)?;
-        file.sync_all()?;
-        fs::rename(temp, path)?;
-        Ok(())
+        let account_id = tokens
+            .account_id
+            .or_else(|| tokens.id_token.as_deref().and_then(account_id_from_token))
+            .or_else(|| account_id_from_token(&tokens.access_token))
+            .ok_or_else(|| protocol_error("Codex auth has no ChatGPT account id"))?;
+        validate_header("account id", &account_id)?;
+        Ok(Credentials {
+            access_token: tokens.access_token,
+            account_id,
+        })
     }
 
     fn token_payload(token: &str) -> Option<Value> {
@@ -1240,87 +985,13 @@ mod remote {
             Err(Error::Remote {
                 harness: ChatGpt::NAME,
                 detail: format!(
-                    "stored {name} is empty or contains unsafe characters; run `txcript chatgpt login` again"
+                    "Codex's stored {name} is empty or contains unsafe characters; sign in to Codex again"
                 ),
             })
         } else {
             Ok(())
         }
     }
-
-    fn query_params(target: &str) -> HashMap<String, String> {
-        target
-            .split_once('?')
-            .map(|(_, query)| query)
-            .unwrap_or_default()
-            .split('&')
-            .filter_map(|pair| {
-                let (key, value) = pair.split_once('=')?;
-                Some((decode(key), decode(value)))
-            })
-            .collect()
-    }
-
-    fn encode(input: &str) -> String {
-        input
-            .bytes()
-            .map(|byte| {
-                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-                    char::from(byte).to_string()
-                } else {
-                    format!("%{byte:02X}")
-                }
-            })
-            .collect()
-    }
-
-    fn decode(input: &str) -> String {
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%' && index + 2 < bytes.len() {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
-                if let Some(value) = hex.and_then(|value| u8::from_str_radix(value, 16).ok()) {
-                    out.push(value);
-                    index += 3;
-                    continue;
-                }
-            }
-            out.push(if bytes[index] == b'+' {
-                b' '
-            } else {
-                bytes[index]
-            });
-            index += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    fn form(values: &[(&str, &str)]) -> String {
-        values
-            .iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-            .collect::<Vec<_>>()
-            .join("&")
-    }
-
-    fn write_callback(stream: &mut impl Write, success: bool) {
-        let (status, body) = if success {
-            ("200 OK", "ChatGPT login complete. You can close this tab.")
-        } else {
-            (
-                "400 Bad Request",
-                "ChatGPT login failed. Return to txcript for details.",
-            )
-        };
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes());
-    }
-
     fn safe_server_message(message: &str) -> String {
         message
             .chars()
@@ -1346,6 +1017,30 @@ mod remote {
 
         use super::*;
         use crate::Codec as _;
+
+        #[test]
+        fn reads_codex_chatgpt_auth_without_owning_it() {
+            let auth = br#"{
+                "auth_mode":"chatgpt",
+                "tokens":{
+                    "access_token":"test-token",
+                    "account_id":"account-test",
+                    "id_token":"unused",
+                    "refresh_token":"ignored"
+                }
+            }"#;
+            let credentials = parse_codex_auth(auth).unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(credentials.access_token, "test-token");
+            assert_eq!(credentials.account_id, "account-test");
+        }
+
+        #[test]
+        fn rejects_non_chatgpt_codex_auth() {
+            let error = parse_codex_auth(br#"{"auth_mode":"apikey"}"#)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not signed in with ChatGPT"));
+        }
 
         #[test]
         fn live_store_uses_get_only_and_preserves_auth_headers() {
@@ -1408,7 +1103,7 @@ mod remote {
 }
 
 #[cfg(feature = "chatgpt")]
-pub use remote::{AuthStatus, ChatGptRef, ChatGptStore, Login, auth_status, begin_login, logout};
+pub use remote::{ChatGptRef, ChatGptStore};
 
 #[cfg(test)]
 mod tests {

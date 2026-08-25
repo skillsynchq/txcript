@@ -3,42 +3,34 @@
 ChatGPT conversations live on `chatgpt.com`, not in a txcript-managed local
 directory. ChatGPT has no supported conversation API, and its web API is
 private and undocumented. This integration is therefore reverse-engineered
-from OpenAI's current OAuth client, a real signed-in account, live list/detail
-responses, and independent readers. It is deliberately **pull-only**:
-txcript lists and loads conversations but never creates, updates, deletes, or
-resumes one in ChatGPT.
+from Codex's current auth contract, a real signed-in account, live list/detail
+responses, and independent readers. It is deliberately **pull-only**: txcript
+lists and loads conversations but never creates, updates, deletes, or resumes
+one in ChatGPT.
 
 This is separate from ChatGPT's account data export. txcript accepts one live
 conversation detail object, not an export archive or `conversations.json`.
 
 ## Access
 
-Create a login owned by txcript:
+Like the Claude Chat harness reuses Claude Desktop, the ChatGPT harness reuses
+the ChatGPT login already managed by Codex:
 
 ```sh
-txcript chatgpt login
-txcript chatgpt status
 txcript list --from chatgpt
 ```
 
-The login uses OAuth authorization-code flow with PKCE and a localhost
-callback. The browser receives the verifier challenge; only the returned code
-is exchanged for tokens. Credentials live at
-`~/.txcript/chatgpt-auth.json`; on Unix the directory and file are restricted
-to modes `0700` and `0600`. txcript never reads browser cookies,
-`~/.codex/auth.json`, or another application's credentials. `logout` removes
-only txcript's file.
+It reads the access token and account id from `CODEX_HOME/auth.json`, falling
+back to `~/.codex/auth.json`. The Codex login must use `auth_mode: "chatgpt"`;
+an API-key login cannot read a ChatGPT account. txcript does not add login
+commands, read browser cookies, use the browser's account, refresh Codex's
+token, or modify Codex's auth file. If the token has expired, opening Codex or
+running `codex login` lets Codex refresh or replace it.
 
-OpenAI currently presents this public installed-app OAuth client as “Codex” on
-the consent screen. That is an auth implementation detail, not credential
-sharing with an installed Codex client: txcript runs its own PKCE transaction,
-can use a different ChatGPT account, and owns its token lifecycle. OpenAI does
-not publish third-party client registration for the ChatGPT conversation API,
-so this flow can change or be withdrawn.
-
-OAuth code exchange and refresh use `POST https://auth.openai.com/oauth/token`.
-Those are the only POST requests in this harness. The conversation API itself
-is GET-only.
+The ChatGPT account visible to txcript is therefore the one signed in to
+Codex, which may differ from the account signed in at `chatgpt.com` in a
+browser. Secrets are used only in sensitive request headers and are never
+included in errors or debug output.
 
 ## Remote store
 
@@ -56,8 +48,8 @@ txcript view 6a8d3401-2098-83ea-8ddd-3d034e6f0a28 --from chatgpt
 
 The production conversation origin is fixed to `https://chatgpt.com`; tokens
 cannot be redirected to a configured host. Redirects are disabled. Requests
-use a browser-compatible transport profile, a bearer token, the selected
-`ChatGPT-Account-ID` when present, and an `originator` header. Credential
+use a browser-compatible transport profile, Codex's bearer token and
+`ChatGPT-Account-ID`, and an `originator` header. Credential
 headers are marked sensitive and server errors are length-limited and scrubbed
 before display.
 
@@ -117,13 +109,14 @@ user or assistant turns.
 - Side branches, system/developer records, citations, feedback/UI state,
   object-valued multimodal parts, attachments, unknown content kinds, and
   fields without a Common slot remain only in the native response.
-- OAuth and the private conversation endpoints can drift or be restricted.
+- Codex's auth-file shape and the private conversation endpoints can drift or
+  be restricted.
   Unsupported status codes and response shapes fail with guidance rather than
   being reported as an empty account.
 
 ## References
 
-- [OpenAI Codex OAuth server source](https://github.com/openai/codex/blob/main/codex-rs/login/src/server.rs), the current public installed-app PKCE parameters and token exchange.
+- [OpenAI Codex auth manager source](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/manager.rs), the current `auth.json` ownership and token contract.
 - ChatGPT live list and detail responses, verified with a separate signed-in
   personal account on 2026-08-25.
 - [Soluna-Angelito ChatGPT Conversation Exporter](https://github.com/Soluna-Angelito/chatgpt-conversation-exporter), an independent reader of the same live mapping and active-node contract.

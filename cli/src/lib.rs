@@ -24,7 +24,6 @@
 //!     [--with <harness>]                    #   continue the pick in <harness>
 //!     [--cwd <dir>]                         #   only sessions recorded in <dir>
 //! txcript mcp                           # serve MCP over stdio
-//! txcript chatgpt login                 # authenticate the live ChatGPT source
 //! txcript completion <shell>            # print a completion script
 //! ```
 //!
@@ -94,31 +93,11 @@ pub enum Command {
     /// Serve the Model Context Protocol over stdin/stdout
     #[cfg(feature = "mcp")]
     Mcp,
-    /// Manage txcript's dedicated `ChatGPT` login
-    Chatgpt {
-        #[command(subcommand)]
-        command: ChatGptCommand,
-    },
     /// Print a completion script for a shell (add it to your shell config)
     Completion {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-}
-
-/// Authentication commands for the live, pull-only `ChatGPT` source.
-#[derive(Subcommand)]
-pub enum ChatGptCommand {
-    /// Sign in through `OpenAI` OAuth and save credentials under ~/.txcript
-    Login {
-        /// Print the login URL without opening the system browser
-        #[arg(long)]
-        no_open: bool,
-    },
-    /// Remove txcript's dedicated `ChatGPT` credentials
-    Logout,
-    /// Show whether txcript has a `ChatGPT` login
-    Status,
 }
 
 /// The session commands — `list`, `continue`, `view`, `export`, `query` — as one clap
@@ -319,7 +298,6 @@ pub fn run(cli: Cli) -> ExitCode {
             .build()
             .map_err(|e| format!("starting the async runtime: {e}"))
             .and_then(|runtime| runtime.block_on(mcp::serve(options.cache))),
-        Command::Chatgpt { command } => run_chatgpt(&command),
         Command::Completion { shell } => {
             // Render to a buffer first: a failed stdout write means the
             // reader is gone (`… | head`), which should end quietly, not
@@ -334,64 +312,6 @@ pub fn run(cli: Cli) -> ExitCode {
         eprintln!("error: {e}");
         ExitCode::FAILURE
     })
-}
-
-fn run_chatgpt(command: &ChatGptCommand) -> Result<ExitCode, String> {
-    match command {
-        ChatGptCommand::Login { no_open } => {
-            let login = chatgpt::begin_login().map_err(|error| error.to_string())?;
-            println!("Open this URL to sign in:\n{}", login.auth_url());
-            if !*no_open {
-                open_url(login.auth_url());
-            }
-            let status = login.wait().map_err(|error| error.to_string())?;
-            println!("ChatGPT login saved to {}", status.path.display());
-            Ok(ExitCode::SUCCESS)
-        }
-        ChatGptCommand::Logout => {
-            if chatgpt::logout().map_err(|error| error.to_string())? {
-                println!("removed txcript's ChatGPT login");
-            } else {
-                println!("txcript was not logged in to ChatGPT");
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        ChatGptCommand::Status => {
-            let status = chatgpt::auth_status().map_err(|error| error.to_string())?;
-            if status.logged_in {
-                let account = status
-                    .account_id
-                    .as_deref()
-                    .map_or(String::new(), |id| format!(" (account {id})"));
-                let expiry = status.expires_at.map_or(String::new(), |time| {
-                    format!(", access token expires {time}")
-                });
-                println!("logged in{account}{expiry}");
-            } else {
-                println!("not logged in (run `txcript chatgpt login`)");
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-    }
-}
-
-fn open_url(url: &str) {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).status();
-    #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(url).status();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .status();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let result: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "no browser launcher for this platform",
-    ));
-    if !result.is_ok_and(|status| status.success()) {
-        eprintln!("warning: could not open a browser; use the URL printed above");
-    }
 }
 
 /// Run one session command. `continue` and the `query` picker hand the
@@ -557,7 +477,7 @@ pub(crate) fn load_direct_chatgpt(source: &str, from: Option<HarnessId>) -> Opti
     let (id, request) = fragment::parse_ref(source);
     let conversation_id = uuid::Uuid::parse_str(id).ok()?.to_string();
     Some((|| {
-        let store = chatgpt::ChatGptStore::from_auth_file().map_err(|error| error.to_string())?;
+        let store = chatgpt::ChatGptStore::from_codex().map_err(|error| error.to_string())?;
         let reference = store
             .conversation_ref(conversation_id)
             .map_err(|error| error.to_string())?;
