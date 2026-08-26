@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router, transport::stdio,
@@ -170,10 +171,72 @@ impl SessionServer {
     /// global `--cache`: `None` rebuilds the search index on each call.
     #[must_use]
     pub fn new(cache: Option<PathBuf>) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            cache,
+        let mut tool_router = Self::tool_router();
+        for route in tool_router.map.values_mut() {
+            strip_nonstandard_formats(Arc::make_mut(&mut route.attr.input_schema));
+            if let Some(output) = route.attr.output_schema.as_mut() {
+                strip_nonstandard_formats(Arc::make_mut(output));
+            }
         }
+        Self { tool_router, cache }
+    }
+}
+
+/// The `format` values JSON Schema 2020-12 defines.
+const STANDARD_FORMATS: &[&str] = &[
+    "date",
+    "date-time",
+    "duration",
+    "email",
+    "hostname",
+    "idn-email",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "iri",
+    "iri-reference",
+    "json-pointer",
+    "regex",
+    "relative-json-pointer",
+    "time",
+    "uri",
+    "uri-reference",
+    "uri-template",
+    "uuid",
+];
+
+/// Drop `format` annotations JSON Schema does not define, in place.
+///
+/// `schemars` labels Rust integer widths with OpenAPI-style formats — `uint`
+/// for `usize`, `uint32` for `u32` — which are not JSON Schema formats, so a
+/// strict client logs a warning for every occurrence. Removing them leaves
+/// `type` and `minimum`, which state the same constraint in a form every
+/// validator understands.
+///
+/// This runs over the whole generated document rather than through a
+/// `JsonSchema` derive attribute, because the widths also appear under
+/// `$defs` — `Range_of_uint` for a `std::ops::Range<usize>` field — which a
+/// per-type transform never sees.
+fn strip_nonstandard_formats(schema: &mut JsonObject) {
+    if schema
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|format| !STANDARD_FORMATS.contains(&format))
+    {
+        schema.remove("format");
+    }
+    for value in schema.values_mut() {
+        strip_nested_formats(value);
+    }
+}
+
+fn strip_nested_formats(value: &mut serde_json::Value) {
+    match value {
+        // A property literally named `format` holds a schema, not a string,
+        // so the `as_str` guard above leaves it alone.
+        serde_json::Value::Object(object) => strip_nonstandard_formats(object),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nested_formats),
+        _ => {}
     }
 }
 
@@ -461,6 +524,82 @@ mod tests {
 
         let read = SessionServer::read_session_tool_attr();
         assert_eq!(read.input_schema["required"], serde_json::json!(["id"]));
+    }
+
+    #[test]
+    fn published_schemas_carry_no_unknown_format() {
+        // Strict MCP clients warn on every `format` they do not recognize.
+        // `usize` and `u32` fields, and the `$defs/Range_of_uint` a
+        // `Range<usize>` generates, are where schemars introduces them.
+        fn formats(schema: &serde_json::Value, found: &mut Vec<String>) {
+            match schema {
+                serde_json::Value::Object(object) => {
+                    if let Some(format) = object.get("format").and_then(|f| f.as_str()) {
+                        found.push(format.to_string());
+                    }
+                    for value in object.values() {
+                        formats(value, found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        formats(item, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        for tool in SessionServer::new(None).tool_router.list_all() {
+            formats(&serde_json::json!(tool.input_schema), &mut found);
+            if let Some(output) = tool.output_schema.as_ref() {
+                formats(&serde_json::json!(output), &mut found);
+            }
+        }
+        let unknown: Vec<_> = found
+            .iter()
+            .filter(|format| !STANDARD_FORMATS.contains(&format.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "non-standard formats published: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn stripping_a_format_keeps_the_constraint() {
+        // `format` goes; `type` and `minimum` — the parts a validator acts
+        // on — stay. A standard format is left in place.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "offset": {"type": "integer", "format": "uint", "minimum": 0},
+                "seen": {"type": "string", "format": "date-time"},
+                "format": {"type": "string"}
+            },
+            "$defs": {
+                "Range_of_uint": {
+                    "properties": {"end": {"type": "integer", "format": "uint", "minimum": 0}}
+                }
+            }
+        });
+        let serde_json::Value::Object(ref mut object) = schema else {
+            return;
+        };
+        strip_nonstandard_formats(object);
+
+        let offset = &schema["properties"]["offset"];
+        assert!(offset.get("format").is_none());
+        assert_eq!(offset["type"], "integer");
+        assert_eq!(offset["minimum"], 0);
+        assert_eq!(schema["properties"]["seen"]["format"], "date-time");
+        assert_eq!(schema["properties"]["format"]["type"], "string");
+        assert!(
+            schema["$defs"]["Range_of_uint"]["properties"]["end"]
+                .get("format")
+                .is_none()
+        );
     }
 
     #[test]
