@@ -63,6 +63,12 @@ wasm-bindgen = { version = "0.2.126", optional = true }
 # Decoding the rollouts Codex compresses; the library Codex writes them with.
 zstd = { version = "0.13.3", default-features = false, optional = true }
 
+# DeepSeek Harness stores session logs as concatenated Zstandard frames by
+# default. The codec's text form is uncompressed JSON; only the native store
+# decoder needs this, and wasm builds never open those files.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = "0.13.3"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 aes = { version = "0.8.4", optional = true }
 cbc = { version = "0.1.2", features = ["alloc", "block-padding"], optional = true }
