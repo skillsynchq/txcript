@@ -47,7 +47,7 @@ txcript maps each harness's native transcript format through a typed common mode
 
 ## Highlights
 
-- **16 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
+- **17 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
 - **A format for everyone else**: agents txcript has never heard of emit the documented [Simple](docs/formats/simple.md) interchange JSON — a file or a stream, handed to txcript directly — and their transcripts continue in any supported harness.
 - **Byte-lossless round-trips**: loading and saving a session in its own format reproduces it exactly.
 - **Continue anywhere**: `txcript continue <id> --with <harness>` rewrites a session into another harness's native format and launches it. The original is never modified.
@@ -70,6 +70,7 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
+    common <--> dsh["DeepSeek Harness"]
     common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
     simple["Simple (any agent)"] --> common
@@ -92,6 +93,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | — |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | JSON session dir | ⇄ | ✓ | [spec](docs/formats/grok.md) |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `dsh` | `~/.dsh/sessions/` | zstd JSONL event log | → | — | [spec](docs/formats/dsh.md) |
 | [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | event-log session dir | ⇄ | ✓ | [spec](docs/formats/fx.md) |
 | Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](docs/formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | thread JSON | → | — <sup>1</sup> | [spec](docs/formats/amp.md) |
@@ -105,6 +107,15 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 <sup>3</sup> Hermes's `state.db` is read-only in txcript and Hermes has no session-import command: sessions convert *from* Hermes, but can't be continued into it.
 
 <sup>4</sup> Claude Chat is a live, pull-only source. On macOS, explicitly selecting `--from claude_chat` reuses the signed-in Claude Desktop session automatically; aggregate discovery does not contact Claude Chat. Environment-supplied session and Cloudflare credentials are rejected in V1. An optional `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restricts discovery, while Desktop auth otherwise uses the app's active organization. Direct Rust calls to `ClaudeChatStore::discover()` produce a compile-time warning that discovery uses an undocumented private endpoint Anthropic can observe or restrict. txcript performs GET requests only and refuses save, delete, same-harness continue, and `--with claude_chat`. Generated files presented on the active branch become Common artifact blocks; Claude Code conversions materialize them beside the generated session and use Claude Code's native `Artifact` tool. Claude's data-export ZIP and `conversations.json` are not supported.
+
+### DeepSeek Harness
+
+DeepSeek Harness (`dsh`) is supported as a read-only source. Sessions are
+discovered from `$DSH_HOME/sessions` (default `~/.dsh/sessions`) and can be
+searched, exported, or continued into another harness. dsh has no documented
+session import command and its persistence seam does not delete logs, so
+txcript never writes into the session store. See
+[`docs/formats/dsh.md`](docs/formats/dsh.md).
 
 <sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. Conversation traffic is GET-only, and txcript refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT exposes no supported conversation API, so the private endpoint and Codex auth contract may change or be restricted. ChatGPT data-export archives are not supported.
 

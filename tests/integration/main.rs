@@ -16,6 +16,7 @@ mod cowork;
 mod cross_harness;
 mod cursor;
 mod cursor_desktop;
+mod dsh;
 mod fx;
 mod grok;
 mod hermes;

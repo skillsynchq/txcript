@@ -48,6 +48,7 @@ than none.
 | [cursor.md](cursor.md) | Cursor | `src/harness/cursor.rs` |
 | [amp.md](amp.md) | Amp (Sourcegraph) | `src/harness/amp.rs` |
 | [grok.md](grok.md) | Grok CLI (xAI) | `src/harness/grok.rs` |
+| [dsh.md](dsh.md) | DeepSeek Harness (`dsh`) | `src/harness/dsh.rs` |
 | [fx.md](fx.md) | fx (Vercel) | `src/harness/fx.rs` |
 | [hermes.md](hermes.md) | Hermes Agent | `src/harness/hermes.rs` |
 | [antigravity.md](antigravity.md) | Antigravity (Google) | `src/harness/antigravity.rs` |
