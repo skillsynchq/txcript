@@ -2846,6 +2846,7 @@ dependencies = [
  "wasm-bindgen",
  "wreq",
  "wreq-util",
+ "zstd",
 ]
 
 [[package]]
