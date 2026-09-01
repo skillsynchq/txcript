@@ -46,6 +46,7 @@ than none.
 | [codex.md](codex.md) | Codex CLI (OpenAI) | `src/harness/codex.rs` |
 | [opencode.md](opencode.md) | OpenCode (SST) | `src/harness/opencode.rs` |
 | [cursor.md](cursor.md) | Cursor | `src/harness/cursor.rs` |
+| [cursor-desktop.md](cursor-desktop.md) | Cursor desktop (IDE app) | `src/harness/cursor_desktop.rs` |
 | [amp.md](amp.md) | Amp (Sourcegraph) | `src/harness/amp.rs` |
 | [grok.md](grok.md) | Grok CLI (xAI) | `src/harness/grok.rs` |
 | [fx.md](fx.md) | fx (Vercel) | `src/harness/fx.rs` |
