@@ -38,7 +38,8 @@ Plus cross-cutting modules: `cross_harness` (a conversation survives a hop
 through every harness), `path_safety` (adversarial ids, symlinks, and
 references cannot escape a store root), `store_delete`, `search`, and
 `properties` — proptest sweeps asserting the codec fixpoint over generated
-conversations for all nine harnesses at once. The generator in `properties`
+conversations for every harness that writes (all but the pull-only Claude
+Chat and ChatGPT) at once. The generator in `properties`
 is deliberately constrained to what every harness models; widen it
 deliberately (see its module docs), and commit any
 `tests/proptest-regressions/` file proptest writes — that is its record of

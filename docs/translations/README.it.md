@@ -47,10 +47,12 @@ txcript mappa il formato di trascrizione nativo di ogni harness attraverso un mo
 
 ## In evidenza
 
-- **10 harness, un solo modello**: ogni formato converte attraverso `Transcript<Common>`, quindi aggiungere un harness lo collega a tutti gli altri.
+- **16 harness, un solo modello**: ogni formato converte attraverso `Transcript<Common>`, quindi aggiungere un harness lo collega a tutti gli altri.
+- **Un formato per tutti gli altri**: gli agenti che txcript non conosce emettono il JSON di interscambio [Simple](../formats/simple.md) documentato — un file o uno stream, passato direttamente a txcript — e le loro trascrizioni continuano in qualsiasi harness supportato.
 - **Round-trip lossless al byte**: caricare e salvare una sessione nel suo stesso formato la riproduce esattamente.
 - **Continua ovunque**: `txcript continue <id> --with <harness>` riscrive una sessione nel formato nativo di un altro harness e lo lancia. L'originale non viene mai modificato.
-- **Cerca in tutto**: ricerca fuzzy/per sottostringa su ogni sessione della macchina (sintassi in stile fzf, basata su [nucleo](https://github.com/helix-editor/nucleo)), come API di libreria, query CLI one-shot o picker interattivo.
+- **Leggi e trasporta le sessioni**: `txcript view` apre qualsiasi sessione in un pager integrato, immagini incluse sui terminali che le disegnano; `txcript export` la scrive come documento Simple che `continue` riprende su un'altra macchina.
+- **Cerca in tutto**: ricerca letterale e senza distinzione tra maiuscole e minuscole su ogni sessione della macchina, come API di libreria, query CLI one-shot o picker interattivo.
 - **Server MCP**: `txcript mcp` espone gli strumenti in sola lettura `list_sessions`, `search_sessions` e `read_session`, così gli agenti possono attingere alle sessioni passate come contesto.
 - **Formati documentati**: il formato su disco di ogni harness è descritto in [`docs/formats/`](../formats), con la provenienza di ogni affermazione (documentazione ufficiale, permalink ai sorgenti o note di reverse engineering).
 
@@ -59,6 +61,9 @@ txcript mappa il formato di trascrizione nativo di ogni harness attraverso un mo
 ```mermaid
 flowchart LR
     claude["Claude Code"] <--> common(("Transcript&lt;Common&gt;"))
+    claudechat["Claude Chat"] --> common
+    chatgpt["ChatGPT"] --> common
+    cowork["Cowork"] <--> common
     codex["Codex"] <--> common
     opencode["OpenCode"] <--> common
     pi["pi"] <--> common
@@ -66,15 +71,21 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
+    common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
+    simple["Simple (any agent)"] --> common
+    hermes["Hermes Agent"] --> common
     amp["Amp"] --> common
 ```
 
-Discovery, elenco, ricerca, `view` e round-trip nativi funzionano per ogni harness. Le stringhe `id` sono quelle richieste dalla CLI e dalle API WASM.
+Discovery, elenco, ricerca e `view` funzionano per ogni harness dotato di uno store di supporto. Le stringhe `id` sono quelle richieste dalla CLI e dalle API WASM.
 
 | Harness | id | Sessioni su disco | Formato nativo | Conversione | Continua in | Doc |
 |---|---|---|---|:---:|:---:|---|
 | [Claude Code](https://claude.com/claude-code) | `claude_code` | `~/.claude/projects/` | JSONL | ⇄ | ✓ | [spec](../formats/claude-code.md) |
+| [Claude Chat](https://claude.ai) | `claude_chat` | account `claude.ai` live <sup>4</sup> | API web privata | → | — <sup>4</sup> | [spec](../formats/claude-chat.md) |
+| [ChatGPT](https://chatgpt.com) | `chatgpt` | account `chatgpt.com` live <sup>5</sup> | API web privata | → | — <sup>5</sup> | [spec](../formats/chatgpt.md) |
+| [Cowork](https://claude.com/product/cowork) | `cowork` | `<Claude app data>/local-agent-mode-sessions/` | record di sessione + JSONL di Claude Code | ⇄ | ✓ | [spec](../formats/cowork.md) |
 | [Codex](https://github.com/openai/codex) | `codex` | `~/.codex/sessions/` | JSONL di rollout | ⇄ | ✓ | [spec](../formats/codex.md) |
 | [OpenCode](https://opencode.ai) | `opencode` | `~/.local/share/opencode/opencode.db` | SQLite | ⇄ | ✓ | [spec](../formats/opencode.md) |
 | [pi](https://pi.dev) | `pi` | `~/.pi/agent/sessions/` | JSONL | ⇄ | ✓ | [spec](../formats/pi.md) |
@@ -82,10 +93,21 @@ Discovery, elenco, ricerca, `view` e round-trip nativi funzionano per ogni harne
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](../formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [spec](../formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | directory di sessione (JSON) | ⇄ | ✓ | [spec](../formats/grok.md) |
+| [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | directory di sessione (event log) | ⇄ | ✓ | [spec](../formats/fx.md) |
+| Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](../formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | JSON del thread | → | — <sup>1</sup> | [spec](../formats/amp.md) |
 | [Antigravity](https://antigravity.google) | `antigravity` | `~/.gemini/antigravity-cli/` | SQLite | ⇄ | ✓ | [spec](../formats/antigravity.md) |
+| Simple | `simple` | — <sup>2</sup> | JSON di interscambio | → | — <sup>2</sup> | [spec](../formats/simple.md) |
 
 <sup>1</sup> I thread di Amp risiedono lato server e la CLI non ha importazione: le sessioni convertono *da* Amp, ma non possono essere continuate verso di esso.
+
+<sup>2</sup> Simple è il formato di interscambio proprio di txcript — la rampa d'accesso per qualsiasi agente non elencato sopra. Non c'è alcuna app né alcuna directory gestita: una sessione Simple è un documento (un file, o stdin) passato direttamente a `txcript continue`, e da quel momento la conversazione continuata vive nell'harness di destinazione.
+
+<sup>3</sup> Lo `state.db` di Hermes è in sola lettura in txcript e Hermes non ha un comando di importazione delle sessioni: le sessioni convertono *da* Hermes, ma non possono essere continuate verso di esso.
+
+<sup>4</sup> Claude Chat è una sorgente live, di solo prelievo. Su macOS, selezionare esplicitamente `--from claude_chat` riutilizza automaticamente la sessione di Claude Desktop con cui si è connessi; la discovery aggregata non contatta Claude Chat. Le credenziali passate tramite variabili d'ambiente non vengono accettate. Una variabile opzionale `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restringe la discovery a una sola organizzazione; altrimenti viene usata l'organizzazione attiva dell'app. Claude Chat non ha un'API di conversazione supportata: txcript legge un endpoint privato che Anthropic può osservare o limitare, e il crate Rust avvisa in fase di build ovunque la discovery venga chiamata direttamente. txcript si limita a leggere: rifiuta salvataggio, eliminazione, continue nello stesso harness e `--with claude_chat`. I file generati da Claude nella conversazione vengono portati con sé; continuati in Claude Code, vengono scritti accanto alla nuova sessione e appaiono come artifact di Claude Code. Lo ZIP di esportazione dati di Claude e `conversations.json` non sono supportati.
+
+<sup>5</sup> ChatGPT è una sorgente live, di solo prelievo. Come Claude Chat riutilizza Claude Desktop, selezionare esplicitamente `--from chatgpt` riutilizza automaticamente il login ChatGPT gestito da Codex in `CODEX_HOME/auth.json` o `~/.codex/auth.json`; l'account può differire da quello con cui si è connessi tramite browser. txcript si limita a leggere quel file di credenziali e non lo aggiorna né lo riscrive mai. La discovery aggregata non contatta ChatGPT, mentre un UUID di conversazione esatto può essere letto direttamente senza enumerare l'account. txcript si limita a leggere: rifiuta salvataggio, eliminazione, continue nello stesso harness e `--with chatgpt`. ChatGPT non ha un'API di conversazione supportata, quindi questo accesso può cambiare o essere limitato. Gli archivi di esportazione dati di ChatGPT non sono supportati.
 
 ## Installazione
 
@@ -114,25 +136,35 @@ Scopri le sessioni locali e continuane una in qualsiasi harness:
 
 ```sh
 txcript list                             # local sessions across every harness
+    [--from <harness>]                    #   only this harness's sessions
+    [--cwd <dir>]                         #   only sessions recorded under <dir>
+    [-n <N>]                              #   at most N sessions
+    [--since <when>] [--until <when>]     #   bound the session start time
 txcript continue <id>[#range]            # continue <id>, then launch its harness
     [--with <harness>]                    #   ...continuing in <harness> instead
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <dir>]                         #   write under <dir>; implies --no-resume
     [--no-resume]                         #   write the session but don't launch
-txcript view <id>[#range]                # print a session as compact text
+txcript continue <file|->[#range]        # continue a Simple document instead:
+    --with <harness> [...]                #   a file, or stdin (`-`), from any agent
+txcript view <id>[#range]                # view a session; compact text when piped
     [--from <harness>]                    #   scope the id lookup to one harness
+    [--no-pager]                          #   print the terminal view directly
 txcript export <id>[#range]              # write a session as a Simple document
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <file>]                        #   write to <file> instead of stdout
 ```
 
+Un id di sessione è un qualsiasi prefisso non ambiguo dell'id completo, oppure il titolo esatto della sessione. `txcript resume` è un alias di `continue`. `--since` e `--until` accettano timestamp RFC 3339 o semplici date `YYYY-MM-DD`.
+
 `continue` scrive la sessione dove l'harness di destinazione conserva le proprie sessioni, poi lo lancia su di essa, cedendogli il terminale:
 
 - Stesso harness: riprende l'originale sul posto.
-- Cross-harness (`--with`): risintetizza la sessione nel formato nativo di destinazione. Ciò che viene scritto è sempre una copia; la sessione sorgente non viene mai modificata né rimossa.
+- Cross-harness (`--with`): riscrive la sessione nel formato nativo di destinazione. Ciò che viene scritto è sempre una copia; la sessione sorgente non viene mai modificata né rimossa.
+- Un documento [Simple](../formats/simple.md) al posto di un id — `txcript continue ./run.json --with claude_code`, o `my-agent | txcript continue - --with claude_code` — porta la trascrizione di qualsiasi agente nello stesso modo; `--with` è obbligatorio perché un documento non ha un harness proprio.
 - Il comando di lancio è specifico per harness e sovrascrivibile: imposta `TRANSCRIPT_<HARNESS>_RESUME_CMD` con un template `{id}`, ad es. `TRANSCRIPT_CODEX_RESUME_CMD="codex resume {id}"`.
 
-`view` stampa la sessione come testo compatto, con ogni messaggio numerato da una riga `── #N ──`. `#range` seleziona i messaggi in base a quegli ordinali stampati, 1-based e inclusivi:
+`view` in un terminale apre un pager integrato: `u`, `a`, `t` e `r` nascondono o mostrano messaggi utente, messaggi assistente, chiamate agli strumenti e reasoning; `]` e `[` saltano tra i messaggi; `/` cerca in ciò che è mostrato. Le immagini vengono disegnate inline sui terminali in grado di mostrarle (Ghostty, kitty, WezTerm, Konsole). Imposta `TXCRIPT_PAGER` per usare invece un pager esterno, o passa `--no-pager` per stampare direttamente la vista. In pipe o rediretto, `view` stampa lo stesso testo compatto che serve il server MCP. In entrambi i casi ogni messaggio è numerato da una riga `── #N ──`, e `#range` seleziona i messaggi in base a quegli ordinali stampati, 1-based e inclusivi:
 
 - `abc#7`: solo il messaggio 7
 - `abc#5-12`: messaggi da 5 a 12
@@ -154,12 +186,17 @@ La working directory registrata viene mantenuta quando esiste sulla macchina di 
 
 ```sh
 txcript query 'relay bug'                # one-shot: ranked hits, highlighted
-txcript query                            # fzf-style picker; Enter continues
+txcript query                            # interactive picker; Enter continues
     [--from <harness>]                   #   search only <harness> (default: all)
     [--with <harness>]                   #   continue the pick in <harness>
+    [--cwd <dir>]                        #   only sessions recorded under <dir>
 ```
 
-Il picker è privo di dipendenze (ANSI in raw mode): digita per filtrare con la sintassi fuzzy in stile fzf, frecce / ctrl-p/n per spostarti, Invio per continuare la selezione nel suo harness (o con `--with`), Esc per annullare. Ogni riga mostra quale tipo di contenuto ha prodotto la corrispondenza: testo utente, testo assistente, thinking, uso di strumenti, output di strumenti o metadati di sessione.
+Un pattern corrisponde in modo letterale e senza distinzione tra maiuscole e minuscole: `relay bug` trova le righe che contengono esattamente quel testo, spazi inclusi.
+
+Nel picker, digita per filtrare, frecce / ctrl-p/n per spostarti, Invio per continuare la selezione nel suo harness (o con `--with`), Esc per annullare. Ogni riga mostra quale tipo di contenuto ha prodotto la corrispondenza: testo utente, testo assistente, thinking, uso di strumenti, output di strumenti o metadati di sessione.
+
+Senza una cache, ogni esecuzione rilegge ogni sessione. Passa `--cache <path>` (o imposta `TXCRIPT_CACHE`) per mantenere una cache di ricerca persistente in quel percorso, così `query` e lo strumento di ricerca MCP rileggono solo le sessioni cambiate dall'ultima esecuzione. Il flag è accettato da ogni sottocomando.
 
 ### Server MCP
 
@@ -169,13 +206,21 @@ txcript mcp                              # stdio transport
 
 Espone tre strumenti in sola lettura; i loro filtri opzionali corrispondono a quelli della CLI:
 
-- `list_sessions(from?, cwd?)`
+- `list_sessions(from?, cwd?, limit?, offset?)`
 - `search_sessions(pattern, from?, cwd?)`
 - `read_session(id, from?)`
 
 <sub>\* Omettendo `from` si includono tutti gli harness; omettendo `cwd` non si applica alcun filtro di directory. Le sessioni senza una working directory registrata corrispondono solo quando `cwd` viene omesso.</sub>
 
-### Completamenti shell
+`list_sessions` pagina con `limit` e `offset` e riporta il totale prima della paginazione; le sorgenti live Claude Chat e ChatGPT non vengono mai elencate. `read_session` accetta lo stesso suffisso `#range` di `view` e restituisce lo stesso testo compatto; una lettura troppo grande per essere restituita per intero viene rifiutata con sotto-intervalli suggeriti. `--cache` si applica anche al server.
+
+### Integrazione con la shell
+
+```sh
+eval "$(txcript init zsh)"                      # in ~/.zshrc; or: txcript init bash
+```
+
+`init` stampa i completamenti più un binding ctrl+shift+r che apre il picker limitato alle sessioni registrate nella cartella corrente. Per i soli completamenti, `completion` copre bash, elvish, fish, powershell e zsh:
 
 ```sh
 txcript completion zsh > ~/.zfunc/_txcript      # or wherever your fpath looks
@@ -187,16 +232,19 @@ txcript completion fish > ~/.config/fish/completions/txcript.fish
 
 ```toml
 [dependencies]
-txcript = "0.6"
-# Drops the OpenCode SQLite store (rusqlite); the OpenCode codec stays available.
-# txcript = { version = "0.6", default-features = false }
+txcript = "0.12"
+# Codecs only: drops the SQLite-backed stores, the live Claude Chat and
+# ChatGPT sources, and search. Every codec stays available.
+# txcript = { version = "0.12", default-features = false }
 ```
+
+Feature di default: `opencode` (gli store SQLite: OpenCode, entrambi i Cursor, Antigravity), `hermes`, `claude_chat`, `chatgpt` e `search`.
 
 Tre livelli, dal più piccolo al più grande:
 
 - `Codec`: `to_common` / `from_common` per harness; `convert::<A, B>` li concatena attraverso il modello canonico.
 - `TextCodec`: `from_text` / `to_text` per analizzare e renderizzare il testo di sessione nativo di un harness, senza I/O.
-- `Store`: discovery/caricamento/salvataggio su un backend reale (directory di sessione, o DB SQLite per OpenCode ed entrambi i Cursor).
+- `Store`: discovery/caricamento/salvataggio su un backend reale (directory di sessione, o DB SQLite per OpenCode, Hermes, entrambi i Cursor e Antigravity).
 
 Converti in memoria (senza filesystem):
 
@@ -229,12 +277,12 @@ Anche i comandi slash eseguiti dall'utente nell'harness (`/release patch`) sono 
 
 ### Ricerca (feature `search`, attiva di default)
 
-`txcript::search` supporta la ricerca fuzzy e per sottostringa sulle trascrizioni tramite [nucleo](https://github.com/helix-editor/nucleo). Ricerca one-shot:
+`txcript::search` supporta la ricerca fuzzy (sintassi in stile fzf) e per sottostringa sulle trascrizioni. Ricerca one-shot:
 
 ```rust
 use txcript::search::{Query, search};
 
-let hits = search(&common, &Query::fuzzy("relay bug"));   // fzf syntax: 'exact ^prefix !not
+let hits = search(&common, &Query::substring("relay bug"));  // or Query::fuzzy for fzf syntax
 for hit in hits {
     // hit.origin: User | Assistant | Thinking | ToolUse | ToolResult | Meta
     // hit.span addresses the message; hit.highlights are char ranges into hit.line
@@ -260,7 +308,7 @@ Un pattern vuoto restituisce i documenti dal più recente al più vecchio. Gli o
 
 ## Pacchetto npm
 
-Il pacchetto npm distribuisce il codec come WASM precompilato per Bun, Node e browser. L'host JS possiede tutto l'I/O e invoca il modulo per la trasformazione; il livello `Store` (filesystem, SQLite, sottoprocessi) resta nativo ed è escluso dalla build WASM.
+Il pacchetto npm distribuisce il codec come WASM precompilato per Bun e Node. Converte il testo di sessione in memoria; scoprire, leggere e scrivere le sessioni su disco spetta al chiamante, quindi il pacchetto non ha alcuno `Store`.
 
 ```ts
 import { convert, toCommon, fromCommon, harnesses } from "txcript";
@@ -275,20 +323,40 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","amp","antigravity"]
+harnesses(); // ["claude_code","claude_chat","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","fx","hermes","amp","antigravity","simple","cowork"]
 ```
 
 Testo in ingresso / testo in uscita: `input` è il testo di sessione nativo dell'harness sorgente e il risultato è quello di destinazione. Nomi di harness non validi o input non analizzabile sollevano un `Error` JS.
 
+Anche la ricerca è inclusa. Una query è la forma JSON della `Query` del crate: solo `pattern` è obbligatorio, e `mode` è `"fuzzy"` a meno che non sia impostato su `"substring"`:
+
+```ts
+import { searchTranscript, Searcher } from "txcript";
+
+// one session, one shot: a JSON array of hits
+const hits = JSON.parse(searchTranscript(input, "codex", JSON.stringify({ pattern: "relay bug", mode: "substring" })));
+
+// picker-style: index once, query per keystroke
+const index = new Searcher();
+index.insert("codex", "0dc114bf", input);          // re-insert replaces
+const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" })));
+```
+
 | Harness | Testo di sessione |
 |---|---|
 | `claude_code`, `codex`, `pi`, `campfire` | JSONL di sessione |
+| `claude_chat` | una risposta live di dettaglio della conversazione (solo come sorgente; nessun array di esportazione dell'account) |
+| `chatgpt` | una risposta live di dettaglio della conversazione (solo come sorgente; nessun array di esportazione dell'account) |
 | `opencode` | JSON di `opencode export` |
 | `cursor` | export JSON dello `store.db` della sessione |
 | `cursor_desktop` | dump JSON delle righe `state.vscdb` della sessione |
 | `grok` | bundle JSON dei file della directory di sessione |
+| `fx` | bundle JSON dei file della directory di sessione |
+| `hermes` | oggetto JSON di `hermes sessions export` |
 | `amp` | JSON di `amp threads export` |
 | `antigravity` | dump JSON del database delle conversazioni, blob protobuf codificati in esadecimale |
+| `simple` | il documento JSON di interscambio [Simple](../formats/simple.md) |
+| `cowork` | bundle JSON del record di sessione, della trascrizione Claude Code e del log di audit |
 
 Per compilare invece il wasm dai sorgenti:
 
@@ -306,12 +374,13 @@ Non tutti questi formati di trascrizione sono documentati dai rispettivi vendor.
 ## Sviluppo
 
 ```sh
-cargo test                                          # native suite
-cargo test --no-default-features                    # without the SQLite store
+cargo test --workspace --all-features               # what CI runs
+cargo test -p txcript --no-default-features         # codecs only: no SQLite or live stores
 bun run build && bun examples/convert.ts <file> <from> <to>
+git config core.hooksPath .githooks                 # pre-push runs the CI checks
 ```
 
-Il binario vive in un proprio crate workspace (`cli/`, pacchetto `txcript-cli`), così le sue dipendenze (clap) non toccano mai i consumatori della libreria.
+Il binario vive in un proprio crate workspace (`cli/`, pacchetto `txcript-cli`); la libreria alla radice non porta con sé nessuna delle sue dipendenze.
 
 ## Licenza
 

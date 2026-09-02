@@ -47,10 +47,12 @@ txcript は各ハーネスのネイティブなトランスクリプト形式を
 
 ## ハイライト
 
-- **10 のハーネス、1 つのモデル** — すべての形式は `Transcript<Common>` を介して変換されるため、ハーネスを 1 つ追加すれば他のすべてとつながります。
+- **16 のハーネス、1 つのモデル** — すべての形式は `Transcript<Common>` を介して変換されるため、ハーネスを 1 つ追加すれば他のすべてとつながります。
+- **それ以外のすべてのエージェントのための形式** — txcript が知らないエージェントでも、文書化された [Simple](../formats/simple.md) 交換用 JSON をファイルまたはストリームとして出力し、txcript に直接渡せば、そのトランスクリプトを対応ハーネスのいずれでも続行できます。
 - **バイト無損失のラウンドトリップ** — セッションを自身の形式でロードして保存すると、元と完全に一致するものが再現されます。
 - **どこでも続行** — `txcript continue <id> --with <harness>` はセッションを別のハーネスのネイティブ形式に書き直して起動します。元のセッションが変更されることはありません。
-- **すべてを検索** — マシン上のすべてのセッションを対象にしたファジー/部分文字列検索（fzf 流の構文、[nucleo](https://github.com/helix-editor/nucleo) を採用）。ライブラリ API、ワンショットの CLI クエリ、対話型ピッカーのいずれでも利用できます。
+- **セッションを読む・持ち運ぶ** — `txcript view` は任意のセッションを内蔵ページャで開き、画像を描画できるターミナルでは画像も表示します。`txcript export` はセッションを Simple ドキュメントとして書き出し、別のマシンで `continue` がそれを取り込みます。
+- **すべてを検索** — マシン上のすべてのセッションを対象にした、リテラルかつ大文字小文字を区別しない検索。ライブラリ API、ワンショットの CLI クエリ、対話型ピッカーのいずれでも利用できます。
 - **MCP サーバー** — `txcript mcp` は読み取り専用の `list_sessions`、`search_sessions`、`read_session` ツールを公開し、エージェントが過去のセッションをコンテキストとして掘り起こせるようにします。
 - **文書化されたフォーマット** — 各ハーネスのオンディスク形式は [`docs/formats/`](../formats) にまとめられており、各記述には出典（公式ドキュメント、ソースへのパーマリンク、またはリバースエンジニアリングのメモ）が付記されています。
 
@@ -59,6 +61,9 @@ txcript は各ハーネスのネイティブなトランスクリプト形式を
 ```mermaid
 flowchart LR
     claude["Claude Code"] <--> common(("Transcript&lt;Common&gt;"))
+    claudechat["Claude Chat"] --> common
+    chatgpt["ChatGPT"] --> common
+    cowork["Cowork"] <--> common
     codex["Codex"] <--> common
     opencode["OpenCode"] <--> common
     pi["pi"] <--> common
@@ -66,15 +71,21 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
+    common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
+    simple["Simple (any agent)"] --> common
+    hermes["Hermes Agent"] --> common
     amp["Amp"] --> common
 ```
 
-ディスカバリ、一覧表示、検索、`view`、そしてネイティブなラウンドトリップは、すべてのハーネスで動作します。`id` の文字列が、CLI と WASM API に渡す値です。
+ディスカバリ、一覧表示、検索、`view` は、バックエンドのストアを持つすべてのハーネスで動作します。`id` の文字列が、CLI と WASM API に渡す値です。
 
 | ハーネス | id | ディスク上のセッション | ネイティブ形式 | 変換 | 続行先 | ドキュメント |
 |---|---|---|---|:---:|:---:|---|
 | [Claude Code](https://claude.com/claude-code) | `claude_code` | `~/.claude/projects/` | JSONL | ⇄ | ✓ | [仕様](../formats/claude-code.md) |
+| [Claude Chat](https://claude.ai) | `claude_chat` | ライブの `claude.ai` アカウント <sup>4</sup> | 非公開 Web API | → | — <sup>4</sup> | [仕様](../formats/claude-chat.md) |
+| [ChatGPT](https://chatgpt.com) | `chatgpt` | ライブの `chatgpt.com` アカウント <sup>5</sup> | 非公開 Web API | → | — <sup>5</sup> | [仕様](../formats/chatgpt.md) |
+| [Cowork](https://claude.com/product/cowork) | `cowork` | `<Claude app data>/local-agent-mode-sessions/` | セッションレコード + Claude Code JSONL | ⇄ | ✓ | [仕様](../formats/cowork.md) |
 | [Codex](https://github.com/openai/codex) | `codex` | `~/.codex/sessions/` | ロールアウト JSONL | ⇄ | ✓ | [仕様](../formats/codex.md) |
 | [OpenCode](https://opencode.ai) | `opencode` | `~/.local/share/opencode/opencode.db` | SQLite | ⇄ | ✓ | [仕様](../formats/opencode.md) |
 | [pi](https://pi.dev) | `pi` | `~/.pi/agent/sessions/` | JSONL | ⇄ | ✓ | [仕様](../formats/pi.md) |
@@ -82,10 +93,21 @@ flowchart LR
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [仕様](../formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [仕様](../formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | セッションディレクトリ（JSON） | ⇄ | ✓ | [仕様](../formats/grok.md) |
+| [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | セッションディレクトリ（イベントログ） | ⇄ | ✓ | [仕様](../formats/fx.md) |
+| Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [仕様](../formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | スレッド JSON | → | — <sup>1</sup> | [仕様](../formats/amp.md) |
 | [Antigravity](https://antigravity.google) | `antigravity` | `~/.gemini/antigravity-cli/` | SQLite | ⇄ | ✓ | [仕様](../formats/antigravity.md) |
+| Simple | `simple` | — <sup>2</sup> | 交換用 JSON | → | — <sup>2</sup> | [仕様](../formats/simple.md) |
 
 <sup>1</sup> Amp のスレッドはサーバー側にあり、CLI にはインポート機能がありません: セッションは Amp *から*変換できますが、Amp へ続行することはできません。
+
+<sup>2</sup> Simple は txcript 自身の交換形式であり、上記に載っていないあらゆるエージェントのための入り口です。アプリも管理されたディレクトリもありません: Simple セッションはドキュメント（ファイル、または stdin）であり、`txcript continue` に直接渡します。続行された会話は、それ以降ターゲットハーネスの中に置かれます。
+
+<sup>3</sup> Hermes の `state.db` は txcript では読み取り専用であり、Hermes にはセッションのインポートコマンドがありません: セッションは Hermes *から*変換できますが、Hermes へ続行することはできません。
+
+<sup>4</sup> Claude Chat はライブのプル専用ソースです。macOS では、`--from claude_chat` を明示的に選択すると、サインイン済みの Claude Desktop セッションが自動的に再利用されます。集約ディスカバリは Claude Chat に接続しません。環境変数で渡された資格情報は受け付けられません。任意の `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` を設定するとディスカバリが 1 つの組織に絞り込まれ、設定しなければアプリのアクティブな組織が使われます。Claude Chat にはサポートされた会話 API がありません: txcript は Anthropic が監視または制限しうるプライベートエンドポイントを読み取っており、Rust クレートはディスカバリが直接呼び出される箇所でビルド時に警告します。txcript は読み取りのみを行い、保存、削除、同一ハーネスでの続行、`--with claude_chat` を拒否します。会話の中で Claude が生成したファイルも一緒に運ばれます。Claude Code へ続行すると、それらは新しいセッションの隣に書き出され、Claude Code のアーティファクトとして表示されます。Claude のデータエクスポート ZIP と `conversations.json` はサポートされません。
+
+<sup>5</sup> ChatGPT はライブのプル専用ソースです。Claude Chat が Claude Desktop を再利用するのと同様に、`--from chatgpt` を明示的に選択すると、Codex が `CODEX_HOME/auth.json` または `~/.codex/auth.json` で管理する ChatGPT ログインが自動的に再利用されます。このアカウントは、ブラウザでサインインしているものと異なる場合があります。txcript はその資格情報ファイルを読むだけで、リフレッシュや書き換えは決して行いません。集約ディスカバリは ChatGPT に接続しませんが、正確な会話 UUID であればアカウントを列挙せずに直接読み取れます。txcript は読み取りのみを行い、保存、削除、同一ハーネスでの続行、`--with chatgpt` を拒否します。ChatGPT にはサポートされた会話 API がないため、このアクセス方法は変更または制限される可能性があります。ChatGPT のデータエクスポートアーカイブはサポートされません。
 
 ## インストール
 
@@ -114,25 +136,35 @@ bun add txcript     # or: npm install txcript
 
 ```sh
 txcript list                             # local sessions across every harness
+    [--from <harness>]                    #   only this harness's sessions
+    [--cwd <dir>]                         #   only sessions recorded under <dir>
+    [-n <N>]                              #   at most N sessions
+    [--since <when>] [--until <when>]     #   bound the session start time
 txcript continue <id>[#range]            # continue <id>, then launch its harness
     [--with <harness>]                    #   ...continuing in <harness> instead
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <dir>]                         #   write under <dir>; implies --no-resume
     [--no-resume]                         #   write the session but don't launch
-txcript view <id>[#range]                # print a session as compact text
+txcript continue <file|->[#range]        # continue a Simple document instead:
+    --with <harness> [...]                #   a file, or stdin (`-`), from any agent
+txcript view <id>[#range]                # view a session; compact text when piped
     [--from <harness>]                    #   scope the id lookup to one harness
+    [--no-pager]                          #   print the terminal view directly
 txcript export <id>[#range]              # write a session as a Simple document
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <file>]                        #   write to <file> instead of stdout
 ```
 
+セッション id は、完全な id の一意に定まる任意のプレフィックス、またはセッションの正確なタイトルです。`txcript resume` は `continue` のエイリアスです。`--since` と `--until` は RFC 3339 のタイムスタンプ、または `YYYY-MM-DD` だけの日付を受け付けます。
+
 `continue` はセッションをターゲットハーネスがセッションを保存している場所に書き出し、続けてそのハーネスを起動してターミナルを引き渡します:
 
 - 同一ハーネス: 元のセッションをその場で再開します。
-- ハーネスをまたぐ場合（`--with`）: セッションをターゲットのネイティブ形式に再合成します。書き出されるのは常にコピーであり、ソースのセッションが変更・削除されることはありません。
+- ハーネスをまたぐ場合（`--with`）: セッションをターゲットのネイティブ形式に書き直します。書き出されるのは常にコピーであり、ソースのセッションが変更・削除されることはありません。
+- id の代わりに [Simple](../formats/simple.md) ドキュメントを渡す — `txcript continue ./run.json --with claude_code`、または `my-agent | txcript continue - --with claude_code` — と、任意のエージェントのトランスクリプトを同じ方法で取り込めます。ドキュメントにはそれ自身のハーネスがないため、`--with` は必須です。
 - 起動コマンドはハーネスごとに上書きできます。`TRANSCRIPT_<HARNESS>_RESUME_CMD` を `{id}` テンプレートとして設定します。例: `TRANSCRIPT_CODEX_RESUME_CMD="codex resume {id}"`。
 
-`view` はセッションをコンパクトなテキストとして出力し、各メッセージには `── #N ──` の区切り線で番号が振られます。`#range` は、その出力に表示される序数（1 始まり・両端含み）でメッセージを選択します:
+`view` をターミナルで実行すると内蔵ページャが開きます: `u`、`a`、`t`、`r` でユーザーメッセージ、アシスタントメッセージ、ツール呼び出し、推論の表示/非表示を切り替え、`]` と `[` でメッセージ間を移動し、`/` で表示中の内容を検索します。画像を表示できるターミナル（Ghostty、kitty、WezTerm、Konsole）では画像がインラインで描画されます。外部ページャを使うには `TXCRIPT_PAGER` を設定し、ビューを直接出力するには `--no-pager` を渡します。パイプまたはリダイレクトされた場合、`view` は MCP サーバーが提供するのと同じコンパクトなテキストを出力します。いずれの場合も各メッセージには `── #N ──` の区切り線で番号が振られ、`#range` は、その出力に表示される序数（1 始まり・両端含み）でメッセージを選択します:
 
 - `abc#7`: メッセージ 7 のみ
 - `abc#5-12`: メッセージ 5 から 12 まで
@@ -154,12 +186,17 @@ txcript continue ./session.json --with claude_code   # on the other one
 
 ```sh
 txcript query 'relay bug'                # one-shot: ranked hits, highlighted
-txcript query                            # fzf-style picker; Enter continues
+txcript query                            # interactive picker; Enter continues
     [--from <harness>]                   #   search only <harness> (default: all)
     [--with <harness>]                   #   continue the pick in <harness>
+    [--cwd <dir>]                        #   only sessions recorded under <dir>
 ```
 
-ピッカーは依存関係なし（raw モードの ANSI）で動作します。文字を入力すると fzf 流のファジー構文でフィルタされ、矢印キーまたは ctrl-p/n で移動、Enter で選択したセッションを元のハーネス（または `--with` で指定したハーネス）で続行、Esc でキャンセルします。各行には、どの種類のコンテンツがマッチしたか — ユーザーテキスト、アシスタントテキスト、思考、ツール使用、ツール出力、セッションメタデータ — が表示されます。
+パターンはリテラルかつ大文字小文字を区別せずにマッチします: `relay bug` は、スペースも含めてその正確なテキストを含む行を見つけます。
+
+ピッカーでは、文字を入力してフィルタし、矢印キーまたは ctrl-p/n で移動、Enter で選択したセッションを元のハーネス（または `--with` で指定したハーネス）で続行、Esc でキャンセルします。各行には、どの種類のコンテンツがマッチしたか — ユーザーテキスト、アシスタントテキスト、思考、ツール使用、ツール出力、セッションメタデータ — が表示されます。
+
+キャッシュがなければ、実行のたびにすべてのセッションが読み直されます。`--cache <path>` を渡す（または `TXCRIPT_CACHE` を設定する）と、そのパスに永続的な検索キャッシュが保持され、`query` と MCP の検索ツールは前回の実行以降に変更されたセッションだけを読み直します。このフラグはすべてのサブコマンドで受け付けられます。
 
 ### MCP サーバー
 
@@ -169,13 +206,21 @@ txcript mcp                              # stdio transport
 
 読み取り専用のツールを 3 つ公開します。オプションのフィルタは CLI と同じです:
 
-- `list_sessions(from?, cwd?)`
+- `list_sessions(from?, cwd?, limit?, offset?)`
 - `search_sessions(pattern, from?, cwd?)`
 - `read_session(id, from?)`
 
 <sub>\* `from` を省略するとすべてのハーネスが対象になります。`cwd` を省略するとディレクトリによるフィルタは行われません。作業ディレクトリが記録されていないセッションは、`cwd` を省略した場合にのみマッチします。</sub>
 
-### シェル補完
+`list_sessions` は `limit` と `offset` でページングし、ページング前の総数を報告します。ライブの Claude Chat と ChatGPT ソースが一覧に載ることはありません。`read_session` は `view` と同じ `#range` サフィックスを受け付け、同じコンパクトなテキストを返します。一度に返すには大きすぎる読み取りは拒否され、サブ範囲が提案されます。`--cache` はサーバーにも適用されます。
+
+### シェル統合
+
+```sh
+eval "$(txcript init zsh)"                      # in ~/.zshrc; or: txcript init bash
+```
+
+`init` は補完に加えて、現在のフォルダで記録されたセッションに絞ったピッカーを開く ctrl+shift+r のキーバインドを出力します。補完だけが必要な場合は、`completion` が bash、elvish、fish、powershell、zsh に対応しています:
 
 ```sh
 txcript completion zsh > ~/.zfunc/_txcript      # or wherever your fpath looks
@@ -187,16 +232,19 @@ txcript completion fish > ~/.config/fish/completions/txcript.fish
 
 ```toml
 [dependencies]
-txcript = "0.6"
-# Drops the OpenCode SQLite store (rusqlite); the OpenCode codec stays available.
-# txcript = { version = "0.6", default-features = false }
+txcript = "0.12"
+# Codecs only: drops the SQLite-backed stores, the live Claude Chat and
+# ChatGPT sources, and search. Every codec stays available.
+# txcript = { version = "0.12", default-features = false }
 ```
+
+デフォルトフィーチャー: `opencode`（SQLite ストア: OpenCode、両方の Cursor、Antigravity）、`hermes`、`claude_chat`、`chatgpt`、`search`。
 
 小さい順に 3 つのレイヤーがあります:
 
 - `Codec` — ハーネスごとの `to_common` / `from_common`。`convert::<A, B>` はそれらを正準モデル経由で連結します。
 - `TextCodec` — `from_text` / `to_text` でハーネスのネイティブなセッションテキストをパース/レンダリングします。I/O は発生しません。
-- `Store` — 実際のバックエンド（セッションディレクトリ、または OpenCode と両方の Cursor 用の SQLite DB）に対して発見/ロード/保存を行います。
+- `Store` — 実際のバックエンド（セッションディレクトリ、または OpenCode、Hermes、両方の Cursor、Antigravity 用の SQLite DB）に対して発見/ロード/保存を行います。
 
 メモリ内で変換する場合（ファイルシステム不要）:
 
@@ -229,12 +277,12 @@ codex::CodexStore::default_root().expect("home dir").save(&codex)?;  // resumabl
 
 ### 検索（`search` フィーチャー、デフォルトで有効）
 
-`txcript::search` は [nucleo](https://github.com/helix-editor/nucleo) を用いた、トランスクリプトに対するファジー検索と部分文字列検索をサポートします。ワンショット検索:
+`txcript::search` は、トランスクリプトに対するファジー検索（fzf 流の構文）と部分文字列検索をサポートします。ワンショット検索:
 
 ```rust
 use txcript::search::{Query, search};
 
-let hits = search(&common, &Query::fuzzy("relay bug"));   // fzf syntax: 'exact ^prefix !not
+let hits = search(&common, &Query::substring("relay bug"));  // or Query::fuzzy for fzf syntax
 for hit in hits {
     // hit.origin: User | Assistant | Thinking | ToolUse | ToolResult | Meta
     // hit.span addresses the message; hit.highlights are char ranges into hit.line
@@ -260,7 +308,7 @@ let matches = index.query(&Query::fuzzy("srch")); // ranked docs, best lines as 
 
 ## npm package
 
-npm パッケージは、Bun・Node・ブラウザ向けにビルド済みの WASM としてコーデックを提供します。I/O はすべて JS ホスト側が担い、変換処理だけを呼び出します。`Store` レイヤー（ファイルシステム、SQLite、サブプロセス）はネイティブのままで、WASM ビルドには含まれません。
+npm パッケージは、Bun と Node 向けにビルド済みの WASM としてコーデックを提供します。セッションテキストをメモリ内で変換します。ディスク上のセッションの発見・読み取り・書き込みは呼び出し側の仕事であり、このパッケージに `Store` はありません。
 
 ```ts
 import { convert, toCommon, fromCommon, harnesses } from "txcript";
@@ -275,20 +323,40 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","amp","antigravity"]
+harnesses(); // ["claude_code","claude_chat","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","fx","hermes","amp","antigravity","simple","cowork"]
 ```
 
 テキスト入力・テキスト出力: `input` はソースハーネスのネイティブなセッションテキストで、結果はターゲットのものになります。不正なハーネス名やパースできない入力は JS の `Error` を投げます。
 
+検索も同梱されています。クエリはクレートの `Query` の JSON 形式です: 必須なのは `pattern` だけで、`mode` は `"substring"` に設定しない限り `"fuzzy"` になります:
+
+```ts
+import { searchTranscript, Searcher } from "txcript";
+
+// one session, one shot: a JSON array of hits
+const hits = JSON.parse(searchTranscript(input, "codex", JSON.stringify({ pattern: "relay bug", mode: "substring" })));
+
+// picker-style: index once, query per keystroke
+const index = new Searcher();
+index.insert("codex", "0dc114bf", input);          // re-insert replaces
+const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" })));
+```
+
 | ハーネス | セッションテキスト |
 |---|---|
 | `claude_code`、`codex`、`pi`、`campfire` | セッション JSONL |
+| `claude_chat` | ライブの会話詳細レスポンス 1 件（ソース専用。アカウントエクスポートの配列は不可） |
+| `chatgpt` | ライブの会話詳細レスポンス 1 件（ソース専用。アカウントエクスポートの配列は不可） |
 | `opencode` | `opencode export` の JSON |
 | `cursor` | セッションの `store.db` の JSON エクスポート |
 | `cursor_desktop` | セッションの `state.vscdb` 行の JSON ダンプ |
 | `grok` | セッションディレクトリ内ファイルの JSON バンドル |
+| `fx` | セッションディレクトリ内ファイルの JSON バンドル |
+| `hermes` | `hermes sessions export` の JSON オブジェクト |
 | `amp` | `amp threads export` の JSON |
 | `antigravity` | 会話データベースの JSON ダンプ（protobuf blob は 16 進エンコード） |
+| `simple` | [Simple](../formats/simple.md) 交換用 JSON ドキュメント |
+| `cowork` | セッションレコード、Claude Code トランスクリプト、監査ログの JSON バンドル |
 
 代わりにソースから wasm をビルドする場合:
 
@@ -306,12 +374,13 @@ bun run build        # produces ./pkg
 ## 開発
 
 ```sh
-cargo test                                          # native suite
-cargo test --no-default-features                    # without the SQLite store
+cargo test --workspace --all-features               # what CI runs
+cargo test -p txcript --no-default-features         # codecs only: no SQLite or live stores
 bun run build && bun examples/convert.ts <file> <from> <to>
+git config core.hooksPath .githooks                 # pre-push runs the CI checks
 ```
 
-バイナリは独立したワークスペースクレート（`cli/`、パッケージ `txcript-cli`）に置かれているため、その依存関係（clap）がライブラリ利用者に影響することはありません。
+バイナリは独立したワークスペースクレート（`cli/`、パッケージ `txcript-cli`）に置かれています。ルートのライブラリはその依存関係を一切持ちません。
 
 ## ライセンス
 

@@ -51,7 +51,8 @@ txcript maps each harness's native transcript format through a typed common mode
 - **A format for everyone else**: agents txcript has never heard of emit the documented [Simple](docs/formats/simple.md) interchange JSON — a file or a stream, handed to txcript directly — and their transcripts continue in any supported harness.
 - **Byte-lossless round-trips**: loading and saving a session in its own format reproduces it exactly.
 - **Continue anywhere**: `txcript continue <id> --with <harness>` rewrites a session into another harness's native format and launches it. The original is never modified.
-- **Search everything**: literal, case-insensitive search across every session on the machine (powered by [nucleo](https://github.com/helix-editor/nucleo)), as a library API, a one-shot CLI query, or an interactive picker.
+- **Read and carry sessions**: `txcript view` opens any session in a built-in pager, images included on terminals that draw them; `txcript export` writes it as a Simple document that `continue` picks up on another machine.
+- **Search everything**: literal, case-insensitive search across every session on the machine, as a library API, a one-shot CLI query, or an interactive picker.
 - **MCP server**: `txcript mcp` exposes read-only `list_sessions`, `search_sessions`, and `read_session` tools, so agents can mine past sessions as context.
 - **Documented formats**: every harness's on-disk format is written up in [`docs/formats/`](docs/formats), with provenance for each claim (official docs, source permalinks, or reverse-engineering notes).
 
@@ -104,9 +105,9 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 
 <sup>3</sup> Hermes's `state.db` is read-only in txcript and Hermes has no session-import command: sessions convert *from* Hermes, but can't be continued into it.
 
-<sup>4</sup> Claude Chat is a live, pull-only source. On macOS, explicitly selecting `--from claude_chat` reuses the signed-in Claude Desktop session automatically; aggregate discovery does not contact Claude Chat. Environment-supplied session and Cloudflare credentials are rejected in V1. An optional `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restricts discovery, while Desktop auth otherwise uses the app's active organization. Direct Rust calls to `ClaudeChatStore::discover()` produce a compile-time warning that discovery uses an undocumented private endpoint Anthropic can observe or restrict. txcript performs GET requests only and refuses save, delete, same-harness continue, and `--with claude_chat`. Generated files presented on the active branch become Common artifact blocks; Claude Code conversions materialize them beside the generated session and use Claude Code's native `Artifact` tool. Claude's data-export ZIP and `conversations.json` are not supported.
+<sup>4</sup> Claude Chat is a live, pull-only source. On macOS, explicitly selecting `--from claude_chat` reuses the signed-in Claude Desktop session automatically; aggregate discovery does not contact Claude Chat. Credentials passed through environment variables are not accepted. An optional `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restricts discovery to one organization; otherwise the app's active organization is used. Claude Chat has no supported conversation API: txcript reads a private endpoint that Anthropic can observe or restrict, and the Rust crate warns at build time wherever discovery is called directly. txcript only reads: it refuses save, delete, same-harness continue, and `--with claude_chat`. Files Claude generated in the conversation come along; continued into Claude Code, they are written beside the new session and appear as Claude Code artifacts. Claude's data-export ZIP and `conversations.json` are not supported.
 
-<sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. Conversation traffic is GET-only, and txcript refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT exposes no supported conversation API, so the private endpoint and Codex auth contract may change or be restricted. ChatGPT data-export archives are not supported.
+<sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. txcript only reads: it refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT has no supported conversation API, so this access may change or be restricted. ChatGPT data-export archives are not supported.
 
 ## Install
 
@@ -135,6 +136,10 @@ Discover local sessions and continue one in any harness:
 
 ```sh
 txcript list                             # local sessions across every harness
+    [--from <harness>]                    #   only this harness's sessions
+    [--cwd <dir>]                         #   only sessions recorded under <dir>
+    [-n <N>]                              #   at most N sessions
+    [--since <when>] [--until <when>]     #   bound the session start time
 txcript continue <id>[#range]            # continue <id>, then launch its harness
     [--with <harness>]                    #   ...continuing in <harness> instead
     [--from <harness>]                    #   scope the id lookup to one harness
@@ -145,21 +150,24 @@ txcript continue <file|->[#range]        # continue a Simple document instead:
 txcript crop <id>[#range]                # interactively select and save a range
     [--with <harness>]                    #   optionally convert the cropped copy
     [--from <harness>]                    #   scope the source lookup
-txcript view <id>[#range]                # print a session as compact text
+txcript view <id>[#range]                # view a session; compact text when piped
     [--from <harness>]                    #   scope the id lookup to one harness
+    [--no-pager]                          #   print the terminal view directly
 txcript export <id>[#range]              # write a session as a Simple document
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <file>]                        #   write to <file> instead of stdout
 ```
 
+A session id is any unambiguous prefix of the full id, or the session's exact title. `txcript resume` is an alias for `continue`. `--since` and `--until` take RFC 3339 timestamps or bare `YYYY-MM-DD` dates.
+
 `continue` writes the session where the target harness keeps its sessions, then launches that harness on it, handing over the terminal:
 
 - Same-harness: resumes the original in place.
-- Cross-harness (`--with`): re-synthesizes the session into the target's native format. What is written is always a copy; the source session is never modified or removed.
+- Cross-harness (`--with`): rewrites the session into the target's native format. What is written is always a copy; the source session is never modified or removed.
 - A [Simple](docs/formats/simple.md) document instead of an id — `txcript continue ./run.json --with claude_code`, or `my-agent | txcript continue - --with claude_code` — brings any agent's transcript in the same way; `--with` is required since a document has no harness of its own.
 - The launch command is per-harness and overridable: set `TRANSCRIPT_<HARNESS>_RESUME_CMD` to a `{id}` template, e.g. `TRANSCRIPT_CODEX_RESUME_CMD="codex resume {id}"`.
 
-`view` prints the session as compact text, each message numbered by a `── #N ──` rule. `#range` selects messages by those printed ordinals, 1-based and inclusive:
+`view` in a terminal opens a built-in pager: `u`, `a`, `t`, and `r` hide or show user messages, assistant messages, tool calls, and reasoning; `]` and `[` jump between messages; `/` searches what is shown. Images are drawn inline on terminals that can show them (Ghostty, kitty, WezTerm, Konsole). Set `TXCRIPT_PAGER` to use an external pager instead, or pass `--no-pager` to print the view directly. Piped or redirected, `view` prints the same compact text the MCP server serves. Either way each message is numbered by a `── #N ──` rule, and `#range` selects messages by those printed ordinals, 1-based and inclusive:
 
 - `abc#7`: message 7 only
 - `abc#5-12`: messages 5 through 12
@@ -184,11 +192,14 @@ txcript query 'relay bug'                # one-shot: ranked hits, highlighted
 txcript query                            # interactive picker; Enter continues
     [--from <harness>]                   #   search only <harness> (default: all)
     [--with <harness>]                   #   continue the pick in <harness>
+    [--cwd <dir>]                        #   only sessions recorded under <dir>
 ```
 
 A pattern matches literally and case-insensitively: `relay bug` finds lines containing that exact text, spaces and all.
 
-The picker is dependency-free (raw-mode ANSI): type to filter, arrows / ctrl-p/n to move, Enter to continue the selection in its own harness (or `--with`), Esc to cancel. Every row shows which kind of content matched: user text, assistant text, thinking, tool use, tool output, or session metadata.
+In the picker, type to filter, arrows / ctrl-p/n to move, Enter to continue the selection in its own harness (or `--with`), Esc to cancel. Every row shows which kind of content matched: user text, assistant text, thinking, tool use, tool output, or session metadata.
+
+Without a cache, every run re-reads every session. Pass `--cache <path>` (or set `TXCRIPT_CACHE`) to keep a persistent search cache at that path, so `query` and the MCP search tool re-read only the sessions that changed since the last run. The flag is accepted by every subcommand.
 
 ### MCP server
 
@@ -198,13 +209,21 @@ txcript mcp                              # stdio transport
 
 Exposes three read-only tools; their optional filters match the CLI:
 
-- `list_sessions(from?, cwd?)`
+- `list_sessions(from?, cwd?, limit?, offset?)`
 - `search_sessions(pattern, from?, cwd?)`
 - `read_session(id, from?)`
 
 <sub>\* Omitting `from` includes every harness; omitting `cwd` applies no directory filter. Sessions without a recorded working directory match only when `cwd` is omitted.</sub>
 
-### Shell completions
+`list_sessions` pages with `limit` and `offset` and reports the total before paging; the live Claude Chat and ChatGPT sources are never listed. `read_session` takes the same `#range` suffix as `view` and returns the same compact text; a read too large to return whole is refused with suggested sub-ranges. `--cache` applies to the server too.
+
+### Shell integration
+
+```sh
+eval "$(txcript init zsh)"                      # in ~/.zshrc; or: txcript init bash
+```
+
+`init` prints completions plus a ctrl+shift+r binding that opens the picker scoped to sessions recorded in the current folder. For completions alone, `completion` covers bash, elvish, fish, powershell, and zsh:
 
 ```sh
 txcript completion zsh > ~/.zfunc/_txcript      # or wherever your fpath looks
@@ -212,22 +231,23 @@ source <(txcript completion bash)               # bash, ad hoc
 txcript completion fish > ~/.config/fish/completions/txcript.fish
 ```
 
-From a checkout, `cli/prep.sh` installs the binary and wires the completions into `~/.zshrc` and `~/.bashrc`; it also offers to bind ctrl+shift+r to `txcript query --cwd .`, a session picker scoped to the current folder (`--picker` / `--no-picker` skip the prompt).
-
 ## Rust crate
 
 ```toml
 [dependencies]
-txcript = "0.6"
-# Drops the OpenCode SQLite store (rusqlite); the OpenCode codec stays available.
-# txcript = { version = "0.6", default-features = false }
+txcript = "0.12"
+# Codecs only: drops the SQLite-backed stores, the live Claude Chat and
+# ChatGPT sources, and search. Every codec stays available.
+# txcript = { version = "0.12", default-features = false }
 ```
+
+Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `chatgpt`, and `search`.
 
 Three layers, smallest to largest:
 
 - `Codec`: `to_common` / `from_common` per harness; `convert::<A, B>` chains them through the canonical model.
 - `TextCodec`: `from_text` / `to_text` to parse and render a harness's native session text, no I/O.
-- `Store`: discover/load/save against a real backend (session directories, or SQLite DBs for OpenCode and both Cursors).
+- `Store`: discover/load/save against a real backend (session directories, or SQLite DBs for OpenCode, Hermes, both Cursors, and Antigravity).
 
 Convert in memory (no filesystem):
 
@@ -273,7 +293,7 @@ Slash commands the user ran at the harness (`/release patch`) are canonical too:
 
 ### Search (feature `search`, on by default)
 
-`txcript::search` supports fuzzy and substring search over transcripts via [nucleo](https://github.com/helix-editor/nucleo). One-shot search:
+`txcript::search` supports fuzzy (fzf-style syntax) and substring search over transcripts. One-shot search:
 
 ```rust
 use txcript::search::{Query, search};
@@ -304,7 +324,7 @@ An empty pattern returns documents newest-first. Tool outputs are excluded by de
 
 ## npm package
 
-The npm package ships the codec as prebuilt WASM for Bun, Node, and browsers. The JS host owns all I/O and calls in for the transformation; the `Store` layer (filesystem, SQLite, subprocess) stays native and is excluded from the WASM build.
+The npm package ships the codec as prebuilt WASM for Bun and Node. It converts session text in memory; discovering, reading, and writing sessions on disk is the caller's job, so the package has no `Store`.
 
 ```ts
 import { convert, toCommon, fromCommon, harnesses } from "txcript";
@@ -323,6 +343,20 @@ harnesses(); // ["claude_code","claude_chat","chatgpt","codex","opencode","pi","
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
+
+Search ships too. A query is the JSON form of the crate's `Query`: only `pattern` is required, and `mode` is `"fuzzy"` unless set to `"substring"`:
+
+```ts
+import { searchTranscript, Searcher } from "txcript";
+
+// one session, one shot: a JSON array of hits
+const hits = JSON.parse(searchTranscript(input, "codex", JSON.stringify({ pattern: "relay bug", mode: "substring" })));
+
+// picker-style: index once, query per keystroke
+const index = new Searcher();
+index.insert("codex", "0dc114bf", input);          // re-insert replaces
+const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" })));
+```
 
 | Harness | Session text |
 |---|---|
@@ -356,13 +390,13 @@ Not all of these transcript formats are documented by their vendors. [`docs/form
 ## Development
 
 ```sh
-cargo test                                          # native suite
-cargo test --no-default-features                    # without the SQLite store
+cargo test --workspace --all-features               # what CI runs
+cargo test -p txcript --no-default-features         # codecs only: no SQLite or live stores
 bun run build && bun examples/convert.ts <file> <from> <to>
 git config core.hooksPath .githooks                 # pre-push runs the CI checks
 ```
 
-The binary lives in its own workspace crate (`cli/`, package `txcript-cli`) so its dependencies (clap) never touch library consumers.
+The binary lives in its own workspace crate (`cli/`, package `txcript-cli`); the library at the root carries none of its dependencies.
 
 ## License
 
