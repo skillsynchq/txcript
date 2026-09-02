@@ -159,6 +159,7 @@ pub(crate) struct Filters {
     pub(crate) assistant: bool,
     pub(crate) tools: bool,
     pub(crate) reasoning: bool,
+    preserve_empty: bool,
 }
 
 impl Default for Filters {
@@ -168,11 +169,19 @@ impl Default for Filters {
             assistant: true,
             tools: true,
             reasoning: true,
+            preserve_empty: false,
         }
     }
 }
 
 impl Filters {
+    pub(crate) fn crop() -> Self {
+        Self {
+            preserve_empty: true,
+            ..Self::default()
+        }
+    }
+
     fn shows_role(self, role: Role) -> bool {
         match role {
             Role::User => self.user,
@@ -224,6 +233,18 @@ impl Document {
             filters,
             &mut self.images,
         )
+    }
+
+    pub(crate) fn message_count(&self) -> usize {
+        self.common.body.len()
+    }
+
+    pub(crate) const fn color_enabled(&self) -> bool {
+        self.color
+    }
+
+    pub(crate) fn validate_crop(&self, span: &Span) -> Result<(), txcript::CropError> {
+        self.common.crop(span).map(|_| ())
     }
 
     /// The pager's prompt line: the range shown and the controls, with
@@ -458,12 +479,11 @@ fn human_messages(
     let mut lines = 0usize;
     let mut counted = 0usize;
     for (offset, message) in messages.iter().enumerate() {
-        if !filters.shows_role(message.role)
-            || !message
-                .content
-                .iter()
-                .any(|block| filters.shows_block(block))
-        {
+        let has_visible_block = message
+            .content
+            .iter()
+            .any(|block| filters.shows_block(block));
+        if !filters.shows_role(message.role) || (!filters.preserve_empty && !has_visible_block) {
             continue;
         }
         let ordinal = start + offset + 1;
@@ -989,6 +1009,25 @@ mod tests {
             ..Filters::default()
         });
         assert!(status.starts_with("#1–3/3  u user off  a assistant  t tools  r reasoning"));
+    }
+
+    #[test]
+    fn crop_filter_renders_empty_messages_so_indices_stay_canonical() {
+        let mut common = transcript();
+        let normal = common.body[0].clone();
+        let empty = Message {
+            content: Vec::new(),
+            ..normal.clone()
+        };
+        common.body = vec![normal.clone(), empty, normal];
+        let mut document = Document::new(common, Span(0..3), false, None);
+
+        let rendered = document.render(60, Filters::crop()).unwrap();
+
+        assert_eq!(rendered.message_starts.len(), 3);
+        assert!(rendered.text.contains("Message #1"));
+        assert!(rendered.text.contains("Message #2"));
+        assert!(rendered.text.contains("Message #3"));
     }
 
     struct FailingWriter(io::ErrorKind);

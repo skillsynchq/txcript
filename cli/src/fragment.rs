@@ -9,9 +9,6 @@
 //! `view`'s printed `── #N ──` ordinals are minted against, so a ref seen in
 //! one command's output resolves to the same messages everywhere.
 
-use std::collections::{HashMap, HashSet};
-
-use txcript::common::{Block, Message};
 use txcript::{Common, Span, Transcript};
 
 /// A parsed `#range` suffix: 1-based inclusive bounds, either end open.
@@ -133,91 +130,22 @@ pub fn format_span(span: &Span) -> String {
 /// harness it's continued in; the message suggests the nearest valid range.
 pub fn sliced(common: &Transcript<Common>, req: &SpanReq) -> Result<Transcript<Common>, String> {
     let span = req.resolve(common.body.len())?;
-    validate_tool_pairing(&common.body, &span)?;
-    let messages = common
-        .fragment(&span)
-        .ok_or_else(|| format!("range `#{req}` is out of bounds"))?;
-    Ok(Transcript::new(common.meta.clone(), messages.to_vec()))
-}
-
-/// Strict pairing check for `continue`: the slice must not cut a tool call
-/// away from its result. A pair only counts when *both* sides exist in the
-/// full session — a session that already ends on a dangling `tool_use`
-/// (aborted run) is not the slice's fault and stays continuable.
-///
-/// On violation the error names the nearest enclosing valid range.
-fn validate_tool_pairing(body: &[Message], span: &Span) -> Result<(), String> {
-    let pairs = tool_pairs(body);
-    if pairing_ok(&pairs, span) {
-        Ok(())
-    } else {
-        let suggestion = nearest_valid(&pairs, span, body.len())
-            .map(|s| format!(" — nearest valid range is {}", format_span(&s)))
-            .unwrap_or_default();
-        Err(format!(
-            "range {} cuts a tool call away from its result{suggestion}",
-            format_span(span)
-        ))
-    }
-}
-
-/// For every tool id whose `tool_use` *and* `tool_result` both exist,
-/// the message indices of both sides.
-fn tool_pairs(body: &[Message]) -> Vec<(usize, usize)> {
-    let mut uses: HashMap<&str, usize> = HashMap::new();
-    let mut pairs = Vec::new();
-    for (idx, message) in body.iter().enumerate() {
-        for block in &message.content {
-            match block {
-                Block::ToolUse { id, .. } => {
-                    uses.insert(id, idx);
-                }
-                Block::ToolResult { tool_use_id, .. } => {
-                    if let Some(&use_idx) = uses.get(tool_use_id.as_str()) {
-                        pairs.push((use_idx, idx));
-                    }
-                }
-                // Text, thinking, image, and artifact blocks carry no tool pairing.
-                Block::Text { .. }
-                | Block::Thinking { .. }
-                | Block::Image { .. }
-                | Block::Artifact { .. } => {}
-            }
+    common.crop(&span).map_err(|error| match error {
+        txcript::CropError::SplitToolPair { nearest, .. } => format!(
+            "range {} cuts a tool call away from its result — nearest valid range is {}",
+            format_span(&span),
+            format_span(&nearest)
+        ),
+        txcript::CropError::InvalidRange { .. } | txcript::CropError::AmbiguousToolId { .. } => {
+            error.to_string()
         }
-    }
-    pairs
-}
-
-/// A span is valid when every pair is entirely inside or entirely outside.
-fn pairing_ok(pairs: &[(usize, usize)], span: &Span) -> bool {
-    let range = &span.0;
-    pairs
-        .iter()
-        .all(|(u, r)| range.contains(u) == range.contains(r))
-}
-
-/// Smallest outward expansion of `span` that no longer cuts any pair, found
-/// by growing the edges by total distance 1, 2, … The full session is always
-/// valid, so this finds `Some` — `None` only on the degenerate empty-body
-/// case.
-fn nearest_valid(pairs: &[(usize, usize)], span: &Span, len: usize) -> Option<Span> {
-    let (start, end) = (span.0.start, span.0.end);
-    let mut seen = HashSet::new();
-    (1..=len)
-        .flat_map(|distance| (0..=distance).map(move |down| (down, distance - down)))
-        .filter_map(|(down, up)| {
-            let candidate = Span(start.saturating_sub(down)..(end + up).min(len));
-            // A clamped duplicate of a smaller expansion adds nothing new.
-            seen.insert((candidate.0.start, candidate.0.end))
-                .then_some(candidate)
-        })
-        .find(|candidate| pairing_ok(pairs, candidate))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
-    use txcript::common::{Role, Tool, ToolOutput};
+    use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
 
     use super::*;
 
@@ -312,27 +240,50 @@ mod tests {
         ]
     }
 
+    fn crop(body: &[Message], span: &Span) -> Result<Transcript<Common>, String> {
+        Transcript::new(
+            Meta {
+                id: "test".into(),
+                timestamp: DateTime::<Utc>::UNIX_EPOCH,
+                cwd: None,
+                git_branch: None,
+                title: None,
+                cli_version: None,
+                model: None,
+            },
+            body.to_vec(),
+        )
+        .crop(span)
+        .map_err(|error| {
+            let suggestion = error
+                .nearest_valid_span()
+                .map(format_span)
+                .unwrap_or_default();
+            format!("{error} {suggestion}")
+        })
+    }
+
     #[test]
     fn pairing_accepts_clean_and_rejects_cut_ranges() {
         let body = body();
-        assert!(validate_tool_pairing(&body, &Span(0..5)).is_ok());
-        assert!(validate_tool_pairing(&body, &Span(3..5)).is_ok());
-        assert!(validate_tool_pairing(&body, &Span(1..3)).is_ok());
+        assert!(crop(&body, &Span(0..5)).is_ok());
+        assert!(crop(&body, &Span(3..5)).is_ok());
+        assert!(crop(&body, &Span(1..3)).is_ok());
 
         // Cuts the result off the call (messages 1..2) → suggest #1-3.
-        let err = validate_tool_pairing(&body, &Span(0..2)).unwrap_err();
+        let err = crop(&body, &Span(0..2)).unwrap_err();
         assert!(err.contains("#1-3"), "got: {err}");
         // Starts on an orphaned result → expand backwards.
-        let err = validate_tool_pairing(&body, &Span(2..5)).unwrap_err();
+        let err = crop(&body, &Span(2..5)).unwrap_err();
         assert!(err.contains("#2-5"), "got: {err}");
     }
 
     #[test]
     fn pairing_ignores_dangling_calls_in_the_source_session() {
-        // Session ends on an unanswered tool_use — not the slice's fault.
+        // Session ends on an unanswered tool_use — not the crop's fault.
         let mut body = body();
         body.push(message(Role::Assistant, vec![tool_use("b")]));
-        assert!(validate_tool_pairing(&body, &Span(3..6)).is_ok());
-        assert!(validate_tool_pairing(&body, &Span(0..6)).is_ok());
+        assert!(crop(&body, &Span(3..6)).is_ok());
+        assert!(crop(&body, &Span(0..6)).is_ok());
     }
 }

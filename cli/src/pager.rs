@@ -31,6 +31,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
+use txcript::Span as MessageSpan;
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::view::{Document, Filters, Rendered, render_width};
@@ -38,11 +39,126 @@ use crate::view::{Document, Filters, Rendered, render_width};
 /// Page `first`, the document rendered at `width` under the default
 /// filters, until the user quits.
 pub fn run(document: Document, first: Rendered, width: usize) -> Result<(), String> {
-    let mut terminal =
-        ratatui::try_init().map_err(|error| format!("starting the pager: {error}"))?;
+    let (mut terminal, cleanup) = init_terminal("pager")?;
     let result = Pager::new(document, first, width).run(&mut terminal);
-    ratatui::restore();
+    finish_after_restore(result, cleanup.try_restore())
+}
+
+/// Interactively choose a message range from `document`. Enter confirms the
+/// current selection; q, escape, and ctrl-c cancel without writing anything.
+pub fn crop(
+    document: Document,
+    first: Rendered,
+    width: usize,
+    initial: Option<MessageSpan>,
+) -> Result<Option<MessageSpan>, String> {
+    let (mut terminal, cleanup) = init_terminal("crop editor")?;
+    let result = Cropper::new(document, first, width, initial)
+        .and_then(|mut cropper| cropper.run(&mut terminal));
+    finish_after_restore(result, cleanup.try_restore())
+}
+
+struct TerminalCleanup {
+    armed: bool,
+}
+
+impl TerminalCleanup {
+    const fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn try_restore(mut self) -> std::io::Result<()> {
+        let result = ratatui::try_restore();
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            ratatui::restore();
+        }
+    }
+}
+
+fn init_terminal(label: &str) -> Result<(DefaultTerminal, TerminalCleanup), String> {
+    match ratatui::try_init() {
+        Ok(terminal) => Ok((terminal, TerminalCleanup::new())),
+        Err(error) => {
+            let cleanup = ratatui::try_restore();
+            let detail = cleanup.err().map_or_else(String::new, |cleanup| {
+                format!("; cleanup also failed: {cleanup}")
+            });
+            Err(format!("starting the {label}: {error}{detail}"))
+        }
+    }
+}
+
+fn finish_after_restore<T>(
+    result: Result<T, String>,
+    restore: std::io::Result<()>,
+) -> Result<T, String> {
+    restore.map_err(|error| format!("restoring the terminal: {error}"))?;
     result
+}
+
+/// The message-level crop selection, independent of terminal rendering so its
+/// boundary behavior can be tested without a TTY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CropSelection {
+    cursor: usize,
+    start: usize,
+    end: usize,
+    total: usize,
+}
+
+impl CropSelection {
+    fn new(total: usize, initial: Option<MessageSpan>) -> Result<Self, String> {
+        if total == 0 {
+            return Err("cannot crop an empty session".to_string());
+        }
+        let span = initial.unwrap_or(MessageSpan(0..total));
+        if span.0.start >= span.0.end || span.0.end > total {
+            return Err(format!(
+                "invalid initial crop range {}..{} for a session with {total} messages",
+                span.0.start, span.0.end
+            ));
+        }
+        Ok(Self {
+            cursor: span.0.start,
+            start: span.0.start,
+            end: span.0.end,
+            total,
+        })
+    }
+
+    fn span(&self) -> MessageSpan {
+        MessageSpan(self.start..self.end)
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        self.cursor = self
+            .cursor
+            .saturating_add_signed(delta)
+            .min(self.total.saturating_sub(1));
+    }
+
+    fn mark_start(&mut self) {
+        self.start = self.cursor;
+        if self.start >= self.end {
+            self.end = self.cursor + 1;
+        }
+    }
+
+    fn mark_end(&mut self) {
+        self.end = self.cursor + 1;
+        if self.end <= self.start {
+            self.start = self.cursor;
+        }
+    }
 }
 
 /// The full state of the pager between key presses.
@@ -417,6 +533,282 @@ impl Pager {
                 status_area.y,
             ));
         }
+    }
+}
+
+/// Interactive crop editor over the same rendered document as `view`.
+struct Cropper {
+    document: Document,
+    color: bool,
+    width: usize,
+    lines: Vec<Styled>,
+    message_starts: Vec<usize>,
+    visual: Vec<Row>,
+    line_first_row: Vec<usize>,
+    cols: usize,
+    top: usize,
+    rows: usize,
+    selection: CropSelection,
+    pending_images: Vec<Vec<u8>>,
+    notice: Option<String>,
+    result: Option<MessageSpan>,
+    done: bool,
+}
+
+impl Cropper {
+    fn new(
+        document: Document,
+        first: Rendered,
+        width: usize,
+        initial: Option<MessageSpan>,
+    ) -> Result<Self, String> {
+        let selection = CropSelection::new(document.message_count(), initial)?;
+        let color = document.color_enabled();
+        let mut cropper = Self {
+            document,
+            color,
+            width,
+            lines: Vec::new(),
+            message_starts: Vec::new(),
+            visual: Vec::new(),
+            line_first_row: Vec::new(),
+            cols: width,
+            top: 0,
+            rows: content_rows(24),
+            selection,
+            pending_images: Vec::new(),
+            notice: None,
+            result: None,
+            done: false,
+        };
+        cropper.accept(first);
+        cropper.focus_cursor();
+        Ok(cropper)
+    }
+
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<MessageSpan>, String> {
+        while !self.done {
+            if !self.pending_images.is_empty() {
+                let mut stdout = std::io::stdout().lock();
+                for transmission in self.pending_images.drain(..) {
+                    stdout
+                        .write_all(&transmission)
+                        .map_err(|error| format!("sending images to the terminal: {error}"))?;
+                }
+                stdout
+                    .flush()
+                    .map_err(|error| format!("sending images to the terminal: {error}"))?;
+            }
+            terminal
+                .draw(|frame| self.draw(frame))
+                .map_err(|error| format!("drawing the crop editor: {error}"))?;
+            match event::read().map_err(|error| format!("reading input: {error}"))? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
+                Event::Resize(columns, _) => self.resize(usize::from(columns)),
+                _ => {}
+            }
+        }
+        Ok(self.result.clone())
+    }
+
+    fn accept(&mut self, rendered: Rendered) {
+        self.lines = rendered.text.lines().map(parse_ansi).collect();
+        self.message_starts = rendered.message_starts;
+        self.pending_images.extend(rendered.transmissions);
+        self.relayout();
+    }
+
+    fn relayout(&mut self) {
+        self.visual.clear();
+        self.line_first_row.clear();
+        for (index, line) in self.lines.iter().enumerate() {
+            self.line_first_row.push(self.visual.len());
+            self.visual
+                .extend(wrap(&line.plain, self.cols).map(|range| Row { line: index, range }));
+        }
+        self.top = self.top.min(self.visual.len().saturating_sub(1));
+    }
+
+    fn resize(&mut self, columns: usize) {
+        let width = render_width(columns);
+        if width != self.width {
+            self.width = width;
+            if let Some(rendered) = self.document.render(self.width, Filters::crop()) {
+                self.accept(rendered);
+                self.focus_cursor();
+            }
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.done = true,
+            KeyCode::Char('c') if control => self.done = true,
+            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.page_cursor(true),
+            KeyCode::PageUp | KeyCode::Char('b') => self.page_cursor(false),
+            KeyCode::Char('g') | KeyCode::Home => self.move_cursor(isize::MIN),
+            KeyCode::Char('G') | KeyCode::End => self.move_cursor(isize::MAX),
+            KeyCode::Char('[' | 's') => {
+                self.selection.mark_start();
+                self.notice = None;
+            }
+            KeyCode::Char(']' | 'e') => {
+                self.selection.mark_end();
+                self.notice = None;
+            }
+            KeyCode::Enter => self.confirm(),
+            _ => {}
+        }
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        self.selection.move_cursor(delta);
+        self.notice = None;
+        self.focus_cursor();
+    }
+
+    fn page_cursor(&mut self, forward: bool) {
+        let rows = self
+            .message_starts
+            .iter()
+            .filter_map(|line| self.line_first_row.get(*line).copied())
+            .collect::<Vec<_>>();
+        let current = self.selection.cursor;
+        let Some(&current_row) = rows.get(current) else {
+            return;
+        };
+        let next = if forward {
+            let target = current_row.saturating_add(self.rows);
+            rows.partition_point(|row| *row <= target)
+                .saturating_sub(1)
+                .max(current.saturating_add(1))
+                .min(self.selection.total - 1)
+        } else {
+            let target = current_row.saturating_sub(self.rows);
+            rows.partition_point(|row| *row < target)
+                .min(current.saturating_sub(1))
+        };
+        self.selection.cursor = next;
+        self.notice = None;
+        self.focus_cursor();
+    }
+
+    fn focus_cursor(&mut self) {
+        let Some(&line) = self.message_starts.get(self.selection.cursor) else {
+            return;
+        };
+        let Some(&row) = self.line_first_row.get(line) else {
+            return;
+        };
+        if row < self.top {
+            self.top = row;
+        } else if row >= self.top + self.rows {
+            self.top = row.saturating_sub(self.rows.saturating_sub(1));
+        }
+        let max_top = self.visual.len().saturating_sub(self.rows);
+        self.top = self.top.min(max_top);
+    }
+
+    fn confirm(&mut self) {
+        let span = self.selection.span();
+        match self.document.validate_crop(&span) {
+            Ok(()) => {
+                self.result = Some(span);
+                self.done = true;
+            }
+            Err(txcript::CropError::SplitToolPair { nearest, .. }) => {
+                self.notice = Some(format!(
+                    "nearest valid: #{}–{}; selection splits a tool call/result",
+                    nearest.0.start + 1,
+                    nearest.0.end
+                ));
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    fn message_for_line(&self, line: usize) -> Option<usize> {
+        let count = self.message_starts.partition_point(|start| *start <= line);
+        count.checked_sub(1)
+    }
+
+    fn update_viewport(&mut self, columns: usize, rows: usize) {
+        self.rows = content_rows(rows);
+        if columns != self.cols {
+            self.cols = columns;
+            self.relayout();
+        }
+        self.focus_cursor();
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        self.update_viewport(usize::from(area.width), usize::from(area.height));
+        let selected = self.selection.span();
+        let text = self
+            .visual
+            .iter()
+            .skip(self.top)
+            .take(self.rows)
+            .map(|row| {
+                let line = &self.lines[row.line];
+                let mut rendered = Line::from(row_spans(line, &row.range, &[]));
+                if let Some(message) = self.message_for_line(row.line) {
+                    if message == self.selection.cursor {
+                        rendered = rendered.style(crop_cursor_style(self.color));
+                    } else if selected.0.contains(&message) {
+                        rendered = rendered.style(crop_selection_style(self.color));
+                    }
+                }
+                rendered
+            })
+            .collect::<Vec<_>>();
+        let content = Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        frame.render_widget(Paragraph::new(Text::from(text)), content);
+
+        let status_area = Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        let status = self.notice.clone().unwrap_or_else(|| {
+            format!(
+                "keep #{}–{}  cursor #{}  [ / s start  ] / e end  Enter crop  q cancel",
+                selected.0.start + 1,
+                selected.0.end,
+                self.selection.cursor + 1
+            )
+        });
+        let style = Style::new().add_modifier(Modifier::REVERSED);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(status, style))).style(style),
+            status_area,
+        );
+    }
+}
+
+fn crop_cursor_style(color: bool) -> Style {
+    if color {
+        Style::new()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    }
+}
+
+fn crop_selection_style(color: bool) -> Style {
+    if color {
+        Style::new().bg(Color::DarkGray)
+    } else {
+        Style::new().add_modifier(Modifier::UNDERLINED)
     }
 }
 
@@ -844,5 +1236,138 @@ mod tests {
         assert!(!pager.quit);
         press(&mut pager, KeyCode::Esc, 3);
         assert!(pager.quit);
+    }
+
+    #[test]
+    fn crop_selection_defaults_to_the_full_session_and_clamps_navigation() {
+        let mut selection = CropSelection::new(4, None).unwrap();
+        assert_eq!(selection.span(), txcript::Span(0..4));
+        assert_eq!(selection.cursor, 0);
+
+        selection.move_cursor(-1);
+        assert_eq!(selection.cursor, 0);
+        selection.move_cursor(99);
+        assert_eq!(selection.cursor, 3);
+    }
+
+    #[test]
+    fn crop_selection_marks_and_normalizes_both_edges() {
+        let mut selection = CropSelection::new(5, Some(txcript::Span(1..4))).unwrap();
+        assert_eq!(selection.span(), txcript::Span(1..4));
+
+        selection.cursor = 3;
+        selection.mark_start();
+        assert_eq!(selection.span(), txcript::Span(3..4));
+
+        selection.cursor = 1;
+        selection.mark_end();
+        assert_eq!(selection.span(), txcript::Span(1..2));
+    }
+
+    #[test]
+    fn crop_selection_rejects_empty_sessions_and_invalid_initial_ranges() {
+        assert!(CropSelection::new(0, None).is_err());
+        assert!(CropSelection::new(3, Some(txcript::Span(2..2))).is_err());
+        assert!(CropSelection::new(3, Some(txcript::Span(1..4))).is_err());
+    }
+
+    #[test]
+    fn cropper_marks_a_range_confirms_it_and_can_cancel() {
+        let mut editor = cropper(4);
+        editor.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        editor.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        editor.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        editor.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        editor.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(editor.done);
+        assert_eq!(editor.result, Some(txcript::Span(1..3)));
+
+        let mut cancelled = cropper(2);
+        cancelled.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(cancelled.done);
+        assert_eq!(cancelled.result, None);
+    }
+
+    #[test]
+    fn cropper_keeps_the_cursor_visible_when_the_terminal_height_changes() {
+        let mut editor = cropper(4);
+        editor.selection.cursor = 3;
+        editor.update_viewport(80, 2);
+
+        let line = editor.message_starts[editor.selection.cursor];
+        let row = editor.line_first_row[line];
+        assert!(row >= editor.top);
+        assert!(row < editor.top + editor.rows);
+    }
+
+    #[test]
+    fn cropper_pages_by_rendered_rows_instead_of_message_count() {
+        let mut editor = cropper(20);
+        editor.update_viewport(80, 5);
+
+        editor.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert!(editor.selection.cursor > 0);
+        assert!(editor.selection.cursor <= 2);
+        editor.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(editor.selection.cursor, 0);
+    }
+
+    #[test]
+    fn crop_highlights_respect_the_no_color_policy() {
+        let cursor = crop_cursor_style(false);
+        let selected = crop_selection_style(false);
+
+        assert_eq!(cursor.fg, None);
+        assert_eq!(cursor.bg, None);
+        assert_eq!(selected.fg, None);
+        assert_eq!(selected.bg, None);
+        assert!(cursor.add_modifier.contains(Modifier::REVERSED));
+        assert!(selected.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn terminal_restoration_failure_blocks_the_crop_result() {
+        let result = Ok(Some(txcript::Span(1..2)));
+        let restore = Err(std::io::Error::other("restore failed"));
+
+        let error = finish_after_restore(result, restore).unwrap_err();
+
+        assert!(error.contains("restoring the terminal"));
+        assert!(error.contains("restore failed"));
+    }
+
+    fn cropper(message_count: usize) -> Cropper {
+        let body = (0..message_count)
+            .map(|index| txcript::common::Message {
+                role: if index % 2 == 0 {
+                    txcript::common::Role::User
+                } else {
+                    txcript::common::Role::Assistant
+                },
+                content: vec![txcript::common::Block::Text {
+                    text: format!("message {index}"),
+                }],
+                timestamp: chrono::DateTime::UNIX_EPOCH,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            })
+            .collect::<Vec<_>>();
+        let common = txcript::Transcript::new(
+            txcript::common::Meta {
+                id: "crop-test".into(),
+                timestamp: chrono::DateTime::UNIX_EPOCH,
+                cwd: None,
+                git_branch: None,
+                title: None,
+                cli_version: None,
+                model: None,
+            },
+            body,
+        );
+        let mut document = Document::new(common, txcript::Span(0..message_count), false, None);
+        let rendered = document.render(80, Filters::default()).unwrap();
+        Cropper::new(document, rendered, 80, None).unwrap()
     }
 }

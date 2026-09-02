@@ -142,6 +142,9 @@ txcript continue <id>[#range]            # continue <id>, then launch its harnes
     [--no-resume]                         #   write the session but don't launch
 txcript continue <file|->[#range]        # continue a Simple document instead:
     --with <harness> [...]                #   a file, or stdin (`-`), from any agent
+txcript crop <id>[#range]                # interactively select and save a range
+    [--with <harness>]                    #   optionally convert the cropped copy
+    [--from <harness>]                    #   scope the source lookup
 txcript view <id>[#range]                # print a session as compact text
     [--from <harness>]                    #   scope the id lookup to one harness
 txcript export <id>[#range]              # write a session as a Simple document
@@ -163,7 +166,7 @@ txcript export <id>[#range]              # write a session as a Simple document
 - `abc#5-`: message 5 to the end
 - `abc#-10`: start through message 10
 
-`continue` accepts the same suffix and continues just those messages as a new session. A range that would cut a tool call away from its result is refused, and the error suggests the nearest valid range.
+`continue` accepts the same suffix and continues just those messages as a new session. `crop` opens an interactive transcript editor: move with `j`/`k` or the arrow keys, mark the first retained message with `[` or `s`, mark the last with `]` or `e`, and press Enter to create the cropped session (`q`/Esc cancels). A `#range` is optional and preselects the editor. The cropped copy defaults to the source harness unless `--with` selects another one, and the source is never modified. A range that would cut a tool call away from its result is refused, and the editor shows the nearest valid range.
 
 `export` writes the session as a [Simple](docs/formats/simple.md) document, to stdout or `--out <file>`. The document is the full rendering of the canonical model — everything `continue` carries between harnesses — detached from any harness's store, so it moves between machines as a file:
 
@@ -252,6 +255,19 @@ codex::CodexStore::default_root().expect("home dir").save(&codex)?;  // resumabl
 ```
 
 The canonical model is `Transcript<Common>`: `Meta` + `Vec<Message>`, where a `Message` holds typed `Block`s (`Text`, `Thinking`, `ToolUse`, `ToolResult`, `Image`) and a typed `Tool` enum.
+
+Crop a canonical transcript in memory without changing the source:
+
+```rust
+use txcript::{Span, Transcript, Common};
+
+let cropped: Transcript<Common> = common.crop(&Span(4..12))?;
+```
+
+`Span` is zero-based and half-open in the Rust API. `crop` preserves metadata,
+copies only the selected messages, rejects empty or out-of-bounds ranges, and
+refuses to separate a complete tool call from its result. `CropError` exposes
+the nearest valid span when expanding the selection can preserve that pair.
 
 Slash commands the user ran at the harness (`/release patch`) are canonical too: a `Tool::Command` call on the user turn, paired with what the command printed back as its `ToolResult`.
 

@@ -15,6 +15,9 @@
 //! txcript continue <file|->[#range]     # continue a Simple document (file, or stdin
 //!     --with <harness> [...]                #   for `-`) into <harness>; see
 //!                                           #   docs/formats/simple.md
+//! txcript crop <id>[#range]             # interactively select and save a range
+//!     [--with <harness>]                    #   optionally convert the cropped copy
+//!     [--from <harness>]                    #   scope the source lookup
 //! txcript view <id>[#range]             # view a session; compact text when piped
 //!     [--from <harness>]                    #   scope the id lookup to one harness
 //!     [--no-pager]                          #   print the terminal view directly
@@ -42,6 +45,7 @@
 //! Session discovery/conversion lives in [`txcript::local`]; ranking lives in
 //! [`txcript::search`].
 
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -163,6 +167,24 @@ pub enum SessionCommand {
         /// Write the session but don't launch the harness
         #[arg(long)]
         no_resume: bool,
+    },
+    /// Interactively crop a session into a new, resumable session
+    ///
+    /// The optional `#range` uses the same 1-based message numbers as `view`
+    /// and becomes the editor's initial selection.
+    /// The source is never modified. By default the cropped copy is written
+    /// to the source harness; --with converts it to another harness instead.
+    Crop {
+        /// Session id (any unambiguous prefix) or exact title, optionally with
+        /// an initial message range (`abc#5-12`, `abc#7`, `abc#5-`, `abc#-10`)
+        #[arg(value_hint = clap::ValueHint::Other)]
+        source: String,
+        /// Write the cropped copy in this harness instead of the source harness
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        with: Option<HarnessId>,
+        /// Only look for the source session in this harness
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        from: Option<HarnessId>,
     },
     /// View a session in the terminal or print compact text to a pipe
     ///
@@ -346,6 +368,7 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             out,
             no_resume,
         } => cmd_continue(&id, with, from, out.as_ref(), no_resume),
+        SessionCommand::Crop { source, with, from } => cmd_crop(&source, with, from),
         SessionCommand::View {
             source,
             from,
@@ -775,6 +798,62 @@ mod scrub_tests {
 }
 
 #[cfg(test)]
+mod crop_command_tests {
+    use clap::Parser as _;
+
+    use super::*;
+
+    #[test]
+    fn crop_parses_a_required_range_and_optional_harnesses() {
+        let cli = Cli::try_parse_from([
+            "txcript",
+            "crop",
+            "session-123#2-4",
+            "--from",
+            "claude_code",
+            "--with",
+            "codex",
+        ])
+        .unwrap();
+
+        let Command::Session(SessionCommand::Crop { source, from, with }) = cli.command else {
+            panic!("expected crop command");
+        };
+        assert_eq!(source, "session-123#2-4");
+        assert_eq!(from, Some(HarnessId::ClaudeCode));
+        assert_eq!(with, Some(HarnessId::Codex));
+    }
+
+    #[test]
+    fn crop_accepts_a_plain_session_and_uses_a_range_as_initial_selection() {
+        let (plain, request) = crop_ref("session-123");
+        assert_eq!(plain, "session-123");
+        assert!(request.is_none());
+
+        let (ranged, request) = crop_ref("session-123#2-4");
+        assert_eq!(ranged, "session-123");
+        assert!(request.is_some());
+    }
+
+    #[test]
+    fn crop_rejects_read_only_destinations_before_opening_the_editor() {
+        for target in [
+            HarnessId::ClaudeChat,
+            HarnessId::ChatGpt,
+            HarnessId::Hermes,
+            HarnessId::Amp,
+            HarnessId::Simple,
+        ] {
+            let error = ensure_crop_target(target).unwrap_err();
+            assert!(error.contains("cannot store cropped sessions"));
+            assert!(error.contains("--with"));
+        }
+        assert!(ensure_crop_target(HarnessId::ClaudeCode).is_ok());
+        assert!(ensure_crop_target(HarnessId::Codex).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod identity_tests {
     use super::{Common, HarnessId, Transcript, ensure_resumable_source, fresh_identity};
     use txcript::common::Meta;
@@ -985,6 +1064,94 @@ mod style {
             HarnessId::Cowork => "\x1b[38;5;208m",     // orange
         }
     }
+}
+
+fn crop_ref(source: &str) -> (&str, Option<fragment::SpanReq>) {
+    fragment::parse_ref(source)
+}
+
+fn cmd_crop(
+    source: &str,
+    with: Option<HarnessId>,
+    from: Option<HarnessId>,
+) -> Result<ExitCode, String> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err("crop is interactive and requires a terminal".to_string());
+    }
+    if let Some(known_target) = with.or(from) {
+        ensure_crop_target(known_target)?;
+    }
+
+    if let Some(loaded) = load_direct_claude_chat(source, from) {
+        let target = with.unwrap_or(HarnessId::ClaudeChat);
+        let (common, request) = loaded?;
+        return crop_loaded(&common, HarnessId::ClaudeChat, target, request.as_ref());
+    }
+    if let Some(loaded) = load_direct_chatgpt(source, from) {
+        let target = with.unwrap_or(HarnessId::ChatGpt);
+        let (common, request) = loaded?;
+        return crop_loaded(&common, HarnessId::ChatGpt, target, request.as_ref());
+    }
+
+    let sessions = discover_with_spinner(from)?;
+    let (id, request) = match crop_ref(source) {
+        (_, Some(_)) if find_exact(&sessions, from, source).is_some() => (source, None),
+        parsed => parsed,
+    };
+    match find_session(&sessions, from, id)? {
+        Some(found) => {
+            let target = with.unwrap_or(found.harness);
+            ensure_crop_target(target)?;
+            let common = found.read().map_err(|error| error.to_string())?;
+            crop_loaded(&common, found.harness, target, request.as_ref())
+        }
+        None if matches!(from, None | Some(HarnessId::Amp)) && is_amp_thread_id(id) => {
+            let target = with.unwrap_or(HarnessId::Amp);
+            ensure_crop_target(target)?;
+            let common = load_amp_server_thread(id)?;
+            crop_loaded(&common, HarnessId::Amp, target, request.as_ref())
+        }
+        None => Err(match from {
+            Some(harness) => format!(
+                "no {harness} session matches `{id}` (try `{} list`)",
+                program()
+            ),
+            None => format!("no local session matches `{id}` (try `{} list`)", program()),
+        }),
+    }
+}
+
+fn crop_loaded(
+    common: &Transcript<Common>,
+    source: HarnessId,
+    target: HarnessId,
+    request: Option<&fragment::SpanReq>,
+) -> Result<ExitCode, String> {
+    ensure_crop_target(target)?;
+    let total = common.body.len();
+    let initial = request.map(|req| req.resolve(total)).transpose()?;
+    let (columns, _) = terminal_size::terminal_size().map_or((80, 24), |(width, height)| {
+        (usize::from(width.0), usize::from(height.0))
+    });
+    let editor_width = view::render_width(columns);
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let mut document = view::Document::new(common.clone(), txcript::Span(0..total), color, None);
+    let rendered = document
+        .render(editor_width, view::Filters::crop())
+        .ok_or_else(|| format!("cannot render a session with {total} messages"))?;
+    let Some(span) = pager::crop(document, rendered, editor_width, initial)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let mut cropped = common.crop(&span).map_err(|error| error.to_string())?;
+    fresh_identity(&mut cropped, target, None);
+    stamp_live_cwd(&mut cropped, None);
+    let cropped_id = write_and_report(source, target, &cropped, None)?;
+    println!(
+        "  cropped {} as {}",
+        fragment::format_span(&span),
+        style::scrub(&cropped_id)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_continue(
@@ -1285,16 +1452,7 @@ fn is_amp_thread_id(id: &str) -> bool {
     })
 }
 
-/// Fetch a server-side Amp thread via `amp threads export` and continue it:
-/// same-harness resumes by id (the thread already lives where Amp reads it);
-/// any other target gets the usual convert-and-write.
-fn continue_amp_server_thread(
-    id: &str,
-    with: Option<HarnessId>,
-    span_req: Option<&fragment::SpanReq>,
-    out: Option<&std::path::Path>,
-    resume: bool,
-) -> Result<ExitCode, String> {
+fn load_amp_server_thread(id: &str) -> Result<Transcript<Common>, String> {
     eprintln!(
         "not on disk; fetching: {}",
         style::dim(&format!("amp threads export {id}"), style::enabled_err())
@@ -1311,7 +1469,20 @@ fn continue_amp_server_thread(
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let native = amp::Amp::from_text(&text).map_err(|e| e.to_string())?;
-    let common: Transcript<Common> = amp::Amp::to_common(&native).map_err(|e| e.to_string())?;
+    amp::Amp::to_common(&native).map_err(|e| e.to_string())
+}
+
+/// Fetch a server-side Amp thread via `amp threads export` and continue it:
+/// same-harness resumes by id (the thread already lives where Amp reads it);
+/// any other target gets the usual convert-and-write.
+fn continue_amp_server_thread(
+    id: &str,
+    with: Option<HarnessId>,
+    span_req: Option<&fragment::SpanReq>,
+    out: Option<&std::path::Path>,
+    resume: bool,
+) -> Result<ExitCode, String> {
+    let common = load_amp_server_thread(id)?;
 
     let target = with.unwrap_or(HarnessId::Amp);
     let resume_id = match (span_req, target == HarnessId::Amp && out.is_none()) {
@@ -1388,6 +1559,23 @@ fn continue_loaded_remote(
     stamp_live_cwd(&mut copy, out);
     let resume_id = write_and_report(source, target, &copy, out)?;
     launch(target, &resume_id, cwd.as_deref(), resume)
+}
+
+fn ensure_crop_target(target: HarnessId) -> Result<(), String> {
+    if matches!(
+        target,
+        HarnessId::ClaudeChat
+            | HarnessId::ChatGpt
+            | HarnessId::Hermes
+            | HarnessId::Amp
+            | HarnessId::Simple
+    ) {
+        Err(format!(
+            "{target} cannot store cropped sessions; pass --with <writable harness>"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), String> {
