@@ -799,8 +799,6 @@ mod scrub_tests {
 
 #[cfg(test)]
 mod crop_command_tests {
-    use clap::Parser as _;
-
     use super::*;
 
     #[test]
