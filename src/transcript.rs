@@ -150,27 +150,83 @@ impl Transcript<Common> {
     /// # Errors
     /// When the span is invalid or splits a complete tool call/result pair.
     pub fn crop(&self, span: &Span) -> std::result::Result<Self, CropError> {
+        self.crop_to(std::slice::from_ref(span))
+    }
+
+    /// Create a non-destructive copy containing only the messages in
+    /// `spans`, in their original order: the cut between one span and the
+    /// next is closed, so `[0..3, 8..10]` keeps five messages and drops
+    /// the five between them.
+    ///
+    /// Spans may be given in any order and may overlap; together they must
+    /// name at least one message. Metadata is preserved. As with
+    /// [`crop`](Self::crop), a tool call and its result are kept or
+    /// dropped together: the error names the span that holds one half and
+    /// the smallest expansion of it that holds both.
+    ///
+    /// # Errors
+    /// When a span is invalid, the spans keep nothing, or a tool call is
+    /// separated from its result.
+    pub fn crop_to(&self, spans: &[Span]) -> std::result::Result<Self, CropError> {
         let len = self.body.len();
-        if span.0.start >= span.0.end || span.0.end > len {
+        let mut kept = vec![false; len];
+        for span in spans {
+            if span.0.start >= span.0.end || span.0.end > len {
+                return Err(CropError::InvalidRange {
+                    span: span.clone(),
+                    message_count: len,
+                });
+            }
+            for flag in &mut kept[span.0.clone()] {
+                *flag = true;
+            }
+        }
+        if !kept.iter().any(|flag| *flag) {
             return Err(CropError::InvalidRange {
-                span: span.clone(),
+                span: Span(0..0),
                 message_count: len,
             });
         }
 
         let pairs = tool_pairs(&self.body)?;
-        if !pairing_ok(&pairs, span) {
-            let nearest = nearest_valid_span(&pairs, span, len);
-            return Err(CropError::SplitToolPair {
-                span: span.clone(),
-                nearest,
-            });
+        if let Some(&(tool_use, tool_result)) = pairs
+            .iter()
+            .find(|(tool_use, tool_result)| kept[*tool_use] != kept[*tool_result])
+        {
+            let kept_half = if kept[tool_use] {
+                tool_use
+            } else {
+                tool_result
+            };
+            let span = spans
+                .iter()
+                .find(|span| span.0.contains(&kept_half))
+                .cloned()
+                .unwrap_or(Span(kept_half..kept_half + 1));
+            let nearest = nearest_valid_span(&pairs, &span, len);
+            return Err(CropError::SplitToolPair { span, nearest });
         }
 
-        Ok(Self::new(
-            self.meta.clone(),
-            self.body[span.0.clone()].to_vec(),
-        ))
+        let body = self
+            .body
+            .iter()
+            .zip(&kept)
+            .filter(|(_, kept)| **kept)
+            .map(|(message, _)| message.clone())
+            .collect();
+        Ok(Self::new(self.meta.clone(), body))
+    }
+
+    /// The messages that must be kept or dropped together: each complete
+    /// tool call/result pair as `(call index, result index)`, in the order
+    /// the results arrive. A call the transcript never answers is not a
+    /// pair.
+    ///
+    /// # Errors
+    /// When a tool id is reused before its previous call resolves, or
+    /// resolves more than once.
+    pub fn tool_pairs(&self) -> std::result::Result<Vec<(usize, usize)>, CropError> {
+        tool_pairs(&self.body)
     }
 }
 
@@ -221,12 +277,6 @@ fn tool_pairs(body: &[Message]) -> std::result::Result<Vec<(usize, usize)>, Crop
         }
     }
     Ok(pairs)
-}
-
-fn pairing_ok(pairs: &[(usize, usize)], span: &Span) -> bool {
-    pairs
-        .iter()
-        .all(|(tool_use, tool_result)| span.0.contains(tool_use) == span.0.contains(tool_result))
 }
 
 fn nearest_valid_span(pairs: &[(usize, usize)], span: &Span, len: usize) -> Span {
@@ -596,6 +646,66 @@ mod tests {
         );
         assert_eq!(error.nearest_valid_span(), Some(&Span(0..3)));
         assert!(source.crop(&Span(0..2)).is_ok());
+    }
+
+    #[test]
+    fn crop_to_keeps_the_union_of_spans_in_order_and_closes_the_cuts() {
+        let source = transcript(vec![text("one"), text("two"), text("three")]);
+        let cropped = source.crop_to(&[Span(2..3), Span(0..1)]).unwrap();
+        assert_eq!(cropped.meta, source.meta);
+        assert_eq!(cropped.body.len(), 2);
+        assert_eq!(cropped.body[0], source.body[0]);
+        assert_eq!(cropped.body[1], source.body[2]);
+        // Overlap is fine; the message is kept once.
+        let overlapping = source.crop_to(&[Span(0..2), Span(1..3)]).unwrap();
+        assert_eq!(overlapping.body, source.body);
+        assert_eq!(source.body.len(), 3, "cropping must not mutate the source");
+    }
+
+    #[test]
+    fn crop_to_rejects_nothing_kept_and_bad_spans() {
+        let source = transcript(vec![text("one"), text("two"), text("three")]);
+        assert!(matches!(
+            source.crop_to(&[]).unwrap_err(),
+            CropError::InvalidRange { .. }
+        ));
+        assert!(matches!(
+            source.crop_to(&[Span(0..1), Span(2..2)]).unwrap_err(),
+            CropError::InvalidRange {
+                span: Span(std::ops::Range { start: 2, end: 2 }),
+                ..
+            }
+        ));
+        assert!(source.crop_to(&[Span(0..1), Span(1..9)]).is_err());
+    }
+
+    #[test]
+    fn crop_to_names_the_span_that_splits_a_tool_pair() {
+        let mut source = transcript(vec![text("one"), text("two"), text("three")]);
+        source.body[1].content.push(Block::ToolUse {
+            id: "call-1".into(),
+            tool: Tool::Raw {
+                tool_name: "x".into(),
+                input: serde_json::json!({}),
+            },
+        });
+        source.body[2].content.push(Block::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: ToolOutput::Text("ok".into()),
+            is_error: false,
+        });
+        assert_eq!(source.tool_pairs().unwrap(), vec![(1, 2)]);
+        // Keeps the call (#2) in one span and drops the result (#3).
+        let error = source.crop_to(&[Span(0..1), Span(1..2)]).unwrap_err();
+        assert_eq!(
+            error,
+            CropError::SplitToolPair {
+                span: Span(1..2),
+                nearest: Span(1..3),
+            }
+        );
+        assert!(source.crop_to(&[Span(0..1), Span(1..3)]).is_ok());
+        assert!(source.crop_to(&[Span(0..1)]).is_ok());
     }
 
     #[test]

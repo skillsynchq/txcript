@@ -46,7 +46,7 @@ pub fn parse_ref(input: &str) -> (&str, Option<SpanReq>) {
 }
 
 /// `N`, `N-M`, `N-`, or `-M` — digits only, at least one bound.
-fn parse_range(s: &str) -> Option<SpanReq> {
+pub(crate) fn parse_range(s: &str) -> Option<SpanReq> {
     #[allow(clippy::option_option)] // Some(None) is an open bound; None, not a range
     fn bound(t: &str) -> Option<Option<usize>> {
         match t {
@@ -120,6 +120,12 @@ pub fn format_span(span: &Span) -> String {
         1 => format!("#{}", span.0.start + 1),
         _ => format!("#{}-{}", span.0.start + 1, span.0.end),
     }
+}
+
+/// The kept runs of a crop, joined: `#1-2, #11-40`.
+#[must_use]
+pub fn format_spans(spans: &[Span]) -> String {
+    spans.iter().map(format_span).collect::<Vec<_>>().join(", ")
 }
 
 /// The transcript restricted to `req`: same meta, only the spanned messages.

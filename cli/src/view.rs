@@ -198,6 +198,16 @@ impl Filters {
     }
 }
 
+/// A message's place in the conversation's rhythm: what the user said,
+/// what the assistant answered, and the tool traffic in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
 /// A session range the pager re-renders on demand: the same text under
 /// different [`Filters`] or widths, with images placed once and reused.
 pub(crate) struct Document {
@@ -243,8 +253,40 @@ impl Document {
         self.color
     }
 
-    pub(crate) fn validate_crop(&self, span: &Span) -> Result<(), txcript::CropError> {
-        self.common.crop(span).map(|_| ())
+    pub(crate) fn validate_crop_to(&self, spans: &[Span]) -> Result<(), txcript::CropError> {
+        self.common.crop_to(spans).map(|_| ())
+    }
+
+    /// The complete tool call/result pairs, as message indices.
+    pub(crate) fn tool_pairs(&self) -> Result<Vec<(usize, usize)>, txcript::CropError> {
+        self.common.tool_pairs()
+    }
+
+    /// What each message mostly is, for a one-cell-per-message overview.
+    pub(crate) fn message_kinds(&self) -> Vec<MessageKind> {
+        self.common
+            .body
+            .iter()
+            .map(|message| {
+                let has = |probe: fn(&Block) -> bool| message.content.iter().any(probe);
+                match message.role {
+                    Role::Assistant if has(|block| matches!(block, Block::ToolUse { .. })) => {
+                        MessageKind::ToolCall
+                    }
+                    Role::Assistant => MessageKind::Assistant,
+                    Role::User
+                        if !message.content.is_empty()
+                            && message
+                                .content
+                                .iter()
+                                .all(|block| matches!(block, Block::ToolResult { .. })) =>
+                    {
+                        MessageKind::ToolResult
+                    }
+                    Role::User => MessageKind::User,
+                }
+            })
+            .collect()
     }
 
     /// The pager's prompt line: the range shown and the controls, with

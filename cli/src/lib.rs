@@ -15,7 +15,7 @@
 //! txcript continue <file|->[#range]     # continue a Simple document (file, or stdin
 //!     --with <harness> [...]                #   for `-`) into <harness>; see
 //!                                           #   docs/formats/simple.md
-//! txcript crop <id>[#range]             # interactively select and save a range
+//! txcript crop <id>[#range]             # interactively cut messages and save a copy
 //!     [--with <harness>]                    #   optionally convert the cropped copy
 //!     [--from <harness>]                    #   scope the source lookup
 //! txcript view <id>[#range]             # view a session; compact text when piped
@@ -171,8 +171,10 @@ pub enum SessionCommand {
     },
     /// Interactively crop a session into a new, resumable session
     ///
+    /// Every message starts out kept; remove the ones you don't want from
+    /// anywhere in the session and press Enter to save the rest as a copy.
     /// The optional `#range` uses the same 1-based message numbers as `view`
-    /// and becomes the editor's initial selection.
+    /// and opens the editor with only that range kept.
     /// The source is never modified. By default the cropped copy is written
     /// to the source harness; --with converts it to another harness instead.
     Crop {
@@ -1148,16 +1150,16 @@ fn crop_loaded(
     let rendered = document
         .render(editor_width, view::Filters::crop())
         .ok_or_else(|| format!("cannot render a session with {total} messages"))?;
-    let Some(span) = pager::crop(document, rendered, editor_width, initial)? else {
+    let Some(spans) = pager::crop(document, rendered, editor_width, initial)? else {
         return Ok(ExitCode::SUCCESS);
     };
-    let mut cropped = common.crop(&span).map_err(|error| error.to_string())?;
+    let mut cropped = common.crop_to(&spans).map_err(|error| error.to_string())?;
     fresh_identity(&mut cropped, target, None);
     stamp_live_cwd(&mut cropped, None);
     let cropped_id = write_and_report(source, target, &cropped, None)?;
     println!(
         "  cropped {} as {}",
-        fragment::format_span(&span),
+        fragment::format_spans(&spans),
         style::scrub(&cropped_id)
     );
     Ok(ExitCode::SUCCESS)
