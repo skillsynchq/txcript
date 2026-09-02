@@ -1131,7 +1131,7 @@ fn crop_loaded(
     let (columns, _) = terminal_size::terminal_size().map_or((80, 24), |(width, height)| {
         (usize::from(width.0), usize::from(height.0))
     });
-    let editor_width = view::render_width(columns);
+    let editor_width = pager::crop_render_width(columns);
     let color = std::env::var_os("NO_COLOR").is_none();
     let mut document = view::Document::new(common.clone(), txcript::Span(0..total), color, None);
     let rendered = document

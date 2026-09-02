@@ -630,7 +630,7 @@ impl Cropper {
     }
 
     fn resize(&mut self, columns: usize) {
-        let width = render_width(columns);
+        let width = crop_render_width(columns);
         if width != self.width {
             self.width = width;
             if let Some(rendered) = self.document.render(self.width, Filters::crop()) {
@@ -730,15 +730,11 @@ impl Cropper {
         }
     }
 
-    fn message_for_line(&self, line: usize) -> Option<usize> {
-        let count = self.message_starts.partition_point(|start| *start <= line);
-        count.checked_sub(1)
-    }
-
     fn update_viewport(&mut self, columns: usize, rows: usize) {
         self.rows = content_rows(rows);
-        if columns != self.cols {
-            self.cols = columns;
+        let content_columns = crop_render_width(columns);
+        if content_columns != self.cols {
+            self.cols = content_columns;
             self.relayout();
         }
         self.focus_cursor();
@@ -748,68 +744,161 @@ impl Cropper {
         let area = frame.area();
         self.update_viewport(usize::from(area.width), usize::from(area.height));
         let selected = self.selection.span();
-        let text = self
+        let selected_start_row = self
+            .message_starts
+            .get(selected.0.start)
+            .and_then(|line| self.line_first_row.get(*line))
+            .copied()
+            .unwrap_or(0);
+        let selected_end_row = self
+            .message_starts
+            .get(selected.0.end)
+            .and_then(|line| self.line_first_row.get(*line))
+            .copied()
+            .unwrap_or(self.visual.len());
+        let cursor_row = self
+            .message_starts
+            .get(self.selection.cursor)
+            .and_then(|line| self.line_first_row.get(*line))
+            .copied();
+        let visible = self
             .visual
             .iter()
+            .enumerate()
             .skip(self.top)
             .take(self.rows)
-            .map(|row| {
+            .map(|(row_index, row)| {
                 let line = &self.lines[row.line];
-                let mut rendered = Line::from(row_spans(line, &row.range, &[]));
-                if let Some(message) = self.message_for_line(row.line) {
-                    if message == self.selection.cursor {
-                        rendered = rendered.style(crop_cursor_style(self.color));
-                    } else if selected.0.contains(&message) {
-                        rendered = rendered.style(crop_selection_style(self.color));
-                    }
-                }
-                rendered
+                let edge = if row_index < selected_start_row || row_index >= selected_end_row {
+                    CropEdge::Outside
+                } else if selected_end_row == selected_start_row + 1 {
+                    CropEdge::Only
+                } else if row_index == selected_start_row {
+                    CropEdge::Start
+                } else if row_index + 1 == selected_end_row {
+                    CropEdge::End
+                } else {
+                    CropEdge::Middle
+                };
+                (
+                    Line::from(crop_gutter(cursor_row == Some(row_index), edge, self.color)),
+                    Line::from(row_spans(line, &row.range, &[])),
+                )
             })
             .collect::<Vec<_>>();
-        let content = Rect {
+        let gutter = Rect {
             height: area.height.saturating_sub(1),
+            width: 3.min(area.width),
             ..area
         };
-        frame.render_widget(Paragraph::new(Text::from(text)), content);
+        let content = Rect {
+            x: area.x.saturating_add(gutter.width),
+            width: area.width.saturating_sub(gutter.width),
+            ..gutter
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                visible
+                    .iter()
+                    .map(|(marker, _)| marker.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            gutter,
+        );
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                visible
+                    .into_iter()
+                    .map(|(_, line)| line)
+                    .collect::<Vec<_>>(),
+            )),
+            content,
+        );
 
         let status_area = Rect {
             y: area.y + area.height.saturating_sub(1),
             height: 1,
             ..area
         };
-        let status = self.notice.clone().unwrap_or_else(|| {
-            format!(
-                "keep #{}–{}  cursor #{}  [ / s start  ] / e end  Enter crop  q cancel",
-                selected.0.start + 1,
-                selected.0.end,
-                self.selection.cursor + 1
-            )
-        });
-        let style = Style::new().add_modifier(Modifier::REVERSED);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(status, style))).style(style),
-            status_area,
+        let status = self.notice.as_ref().map_or_else(
+            || crop_status(&selected, self.selection.cursor, self.color),
+            |notice| {
+                let style = if self.color {
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().add_modifier(Modifier::BOLD)
+                };
+                Line::from(Span::styled(format!(" {notice}"), style))
+            },
         );
+        frame.render_widget(Paragraph::new(status), status_area);
     }
 }
 
-fn crop_cursor_style(color: bool) -> Style {
-    if color {
+#[derive(Clone, Copy)]
+enum CropEdge {
+    Start,
+    Middle,
+    End,
+    Only,
+    Outside,
+}
+
+fn crop_gutter(cursor: bool, edge: CropEdge, color: bool) -> Span<'static> {
+    let pointer = if cursor { '›' } else { ' ' };
+    let rail = match edge {
+        CropEdge::Start => '┌',
+        CropEdge::Middle => '│',
+        CropEdge::End => '└',
+        CropEdge::Only => '─',
+        CropEdge::Outside => ' ',
+    };
+    let mut style = if cursor {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else if !matches!(edge, CropEdge::Outside) {
+        Style::new().add_modifier(Modifier::DIM)
+    } else {
         Style::new()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    };
+    if color && (cursor || !matches!(edge, CropEdge::Outside)) {
+        style = style.fg(Color::Cyan);
     }
+    Span::styled(format!("{pointer}{rail} "), style)
 }
 
-fn crop_selection_style(color: bool) -> Style {
-    if color {
-        Style::new().bg(Color::DarkGray)
+fn crop_status(selected: &MessageSpan, cursor: usize, color: bool) -> Line<'static> {
+    let accent = if color {
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
-        Style::new().add_modifier(Modifier::UNDERLINED)
-    }
+        Style::new().add_modifier(Modifier::BOLD)
+    };
+    let key = Style::new().add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(" CROP ", accent),
+        Span::raw("  KEEP "),
+        Span::styled(format!("#{}–{}", selected.0.start + 1, selected.0.end), key),
+        Span::raw(format!(" · {}", crop_message_count(selected.0.len()))),
+        Span::raw("   CURSOR "),
+        Span::styled(format!("#{}", cursor + 1), key),
+        Span::raw("   "),
+        Span::styled("[", key),
+        Span::raw(" start   "),
+        Span::styled("]", key),
+        Span::raw(" end   "),
+        Span::styled("ENTER", key),
+        Span::raw(" crop   "),
+        Span::styled("Q", key),
+        Span::raw(" cancel"),
+    ])
+}
+
+pub(crate) fn crop_render_width(columns: usize) -> usize {
+    columns.saturating_sub(3).clamp(1, 120)
+}
+
+fn crop_message_count(count: usize) -> String {
+    let noun = if count == 1 { "message" } else { "messages" };
+    format!("{count} {noun}")
 }
 
 /// How many screen rows `text` (the renderer's ANSI output) takes at
@@ -1314,16 +1403,37 @@ mod tests {
     }
 
     #[test]
-    fn crop_highlights_respect_the_no_color_policy() {
-        let cursor = crop_cursor_style(false);
-        let selected = crop_selection_style(false);
+    fn crop_selection_uses_a_gutter_without_restyling_transcript_text() {
+        let start = crop_gutter(true, CropEdge::Start, true);
+        let selected = crop_gutter(false, CropEdge::Middle, true);
+        let end = crop_gutter(false, CropEdge::End, true);
+        let outside = crop_gutter(true, CropEdge::Outside, true);
 
-        assert_eq!(cursor.fg, None);
-        assert_eq!(cursor.bg, None);
-        assert_eq!(selected.fg, None);
-        assert_eq!(selected.bg, None);
-        assert!(cursor.add_modifier.contains(Modifier::REVERSED));
-        assert!(selected.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(start.content.as_ref(), "›┌ ");
+        assert_eq!(selected.content.as_ref(), " │ ");
+        assert_eq!(end.content.as_ref(), " └ ");
+        assert_eq!(outside.content.as_ref(), "›  ");
+        for marker in [start, selected, end, outside] {
+            assert_eq!(marker.style.bg, None);
+        }
+    }
+
+    #[test]
+    fn crop_gutter_uses_the_actual_available_terminal_width() {
+        assert_eq!(crop_render_width(2), 1);
+        assert_eq!(crop_render_width(3), 1);
+        assert_eq!(crop_render_width(39), 36);
+        assert_eq!(crop_render_width(40), 37);
+        assert_eq!(crop_render_width(41), 38);
+        assert_eq!(crop_render_width(42), 39);
+        assert_eq!(crop_render_width(80), 77);
+        assert_eq!(crop_render_width(200), 120);
+    }
+
+    #[test]
+    fn crop_status_pluralizes_message_count() {
+        assert_eq!(crop_message_count(1), "1 message");
+        assert_eq!(crop_message_count(2), "2 messages");
     }
 
     #[test]
