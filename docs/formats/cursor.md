@@ -3,12 +3,12 @@
 Cursor is Anysphere's AI coding product. txcript reads the sessions of its
 **CLI agent** (`cursor-agent`, resumed with `agent --resume=<id>`), which keeps
 a resumable chat store per session under `~/.cursor/chats`. This is *not* the
-editor's chat storage — IDE chats live elsewhere (`state.vscdb`) and are not
-read by txcript. The format is closed source and undocumented; everything in
-this page is reverse-engineered from real local sessions and encoded in
-txcript's parser. Cursor's SDK docs describe a matching *abstract* store
-(content-addressed "checkpoint" blobs, a `rootBlobId` pointer) but publish no
-schema, table names, or file paths.
+editor's chat storage — IDE chats live in the app's `state.vscdb` and are
+covered by [cursor-desktop.md](cursor-desktop.md). The format is closed source
+and undocumented; everything in this page is reverse-engineered from real
+local sessions and encoded in txcript's parser. Cursor's SDK docs describe a
+matching *abstract* store (content-addressed "checkpoint" blobs, a
+`rootBlobId` pointer) but publish no schema, table names, or file paths.
 
 ```
 ~/.cursor/chats/

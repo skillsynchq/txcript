@@ -140,6 +140,7 @@ pub enum SessionCommand {
     /// Anything that writes a copy writes a *new* session, with its own id and
     /// today's timestamp — the source is never modified. The printed resume
     /// command carries the new id.
+    #[command(alias = "resume")]
     Continue {
         /// Session id (any unambiguous prefix) or its exact title; or a
         /// Simple document (a file path, `-` for stdin). Takes an optional
@@ -843,6 +844,16 @@ mod identity_tests {
     fn chatgpt_is_refused_even_for_an_in_place_continue() {
         let error = ensure_resumable_source(HarnessId::ChatGpt, HarnessId::ChatGpt).unwrap_err();
         assert!(error.contains("pull-only"));
+    }
+
+    #[test]
+    fn resume_alias_is_accepted_for_continue_command() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["txcript", "resume", "session-123"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Session(crate::SessionCommand::Continue { ref id, .. }) if id == "session-123"
+        ));
     }
 }
 

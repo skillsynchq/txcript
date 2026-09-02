@@ -1,6 +1,6 @@
 {
   "name": "txcript",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Convert coding-agent session transcripts between harness formats.",
   "license": "Apache-2.0",
   "repository": {
