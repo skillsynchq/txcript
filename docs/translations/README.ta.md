@@ -80,7 +80,7 @@ flowchart LR
 | [pi](https://pi.dev) | `pi` | `~/.pi/agent/sessions/` | JSONL | ⇄ | ✓ | [ஸ்பெக்](../formats/pi.md) |
 | [Campfire](../formats/campfire.md) | `campfire` | `~/.campfire/agent/sessions/` | JSONL | ⇄ | ✓ | [ஸ்பெக்](../formats/campfire.md) |
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [ஸ்பெக்](../formats/cursor.md) |
-| [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | — |
+| [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [ஸ்பெக்](../formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | செஷன் டைரக்டரி (JSON) | ⇄ | ✓ | [ஸ்பெக்](../formats/grok.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | த்ரெட் JSON | → | — <sup>1</sup> | [ஸ்பெக்](../formats/amp.md) |
 | [Antigravity](https://antigravity.google) | `antigravity` | `~/.gemini/antigravity-cli/` | SQLite | ⇄ | ✓ | [ஸ்பெக்](../formats/antigravity.md) |

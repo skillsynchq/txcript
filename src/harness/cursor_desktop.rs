@@ -118,6 +118,7 @@ impl TextCodec for CursorDesktop {
 // -- meta ----------------------------------------------------------------
 
 /// The composer id recorded in the header document, if any.
+#[cfg(feature = "opencode")]
 fn header_composer_id(body: &DesktopSession) -> Option<String> {
     let header: Value = serde_json::from_str(&body.header).ok()?;
     header
@@ -128,11 +129,24 @@ fn header_composer_id(body: &DesktopSession) -> Option<String> {
 }
 
 fn meta_from_session(body: &DesktopSession, id: Option<&str>) -> Meta {
-    let header: Value = serde_json::from_str(&body.header).unwrap_or(Value::Null);
-    let composer_data = body
-        .composer_data
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    meta_from_parts(
+        &body.header,
+        body.composer_data.as_deref(),
+        body.created_at,
+        id,
+    )
+}
+
+/// Session metadata from the head document and `composerData:` cell alone —
+/// everything discovery needs without touching the bubble rows.
+fn meta_from_parts(
+    header: &str,
+    composer_data: Option<&str>,
+    created_at: i64,
+    id: Option<&str>,
+) -> Meta {
+    let header: Value = serde_json::from_str(header).unwrap_or(Value::Null);
+    let composer_data = composer_data.and_then(|s| serde_json::from_str::<Value>(s).ok());
     let title = [header.get("name"), header.get("subtitle")]
         .into_iter()
         .flatten()
@@ -154,13 +168,19 @@ fn meta_from_session(body: &DesktopSession, id: Option<&str>) -> Meta {
         .and_then(Value::as_str)
         .filter(|m| !m.is_empty() && *m != "default")
         .map(str::to_string);
-    let timestamp = DateTime::from_timestamp_millis(body.created_at)
-        .filter(|_| body.created_at > 0)
+    let timestamp = DateTime::from_timestamp_millis(created_at)
+        .filter(|_| created_at > 0)
         .unwrap_or_else(Utc::now);
     Meta {
         id: id
             .map(str::to_string)
-            .or_else(|| header_composer_id(body))
+            .or_else(|| {
+                header
+                    .get("composerId")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
             .unwrap_or_default(),
         timestamp,
         cwd,
@@ -1059,6 +1079,10 @@ impl Store for CursorDesktopStore {
             return Ok(Vec::new());
         }
         let conn = open_ro(&db_path)?;
+        if has_table(&conn, "composerHeaders")? {
+            return discover_from_headers(&conn);
+        }
+        // Pre-table databases: walk composerData keys and read each session.
         Ok(list_headers(&conn)
             .unwrap_or_default()
             .into_iter()
@@ -1218,6 +1242,150 @@ fn list_headers(conn: &Connection) -> Result<Vec<String>> {
 }
 
 #[cfg(feature = "opencode")]
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .map_err(sqlite_err)
+}
+
+/// Discovery over `composerHeaders` alone: one pass over the header table,
+/// an indexed point lookup for each `composerData:` cell, and an indexed
+/// range probe for "has at least one bubble". Never reads bubble bodies and
+/// never scans the key-value table, so it stays flat as the store grows.
+#[cfg(feature = "opencode")]
+fn discover_from_headers(conn: &Connection) -> Result<Vec<Discovered<String>>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT h.composerId, h.value, h.createdAt,
+                    (SELECT CAST(value AS TEXT) FROM cursorDiskKV
+                      WHERE key = 'composerData:' || h.composerId)
+             FROM composerHeaders h
+             WHERE EXISTS (SELECT 1 FROM cursorDiskKV
+                            WHERE key >= 'bubbleId:' || h.composerId || ':'
+                              AND key <  'bubbleId:' || h.composerId || ';')
+             ORDER BY h.recency DESC",
+        )
+        .map_err(sqlite_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(sqlite_err)?;
+    Ok(rows
+        .filter_map(std::result::Result::ok)
+        .map(|(cid, header, created, data)| Discovered {
+            meta: meta_from_parts(
+                header.as_deref().unwrap_or_default(),
+                data.as_deref(),
+                created.unwrap_or_default(),
+                Some(&cid),
+            ),
+            reference: cid,
+        })
+        .collect())
+}
+
+/// Half-open key range covering every key that starts with `prefix`: the
+/// upper bound is the prefix with its last character stepped up by one
+/// code point, which sorts after every extension of the prefix under
+/// the default byte-wise `BINARY` collation. A range probe walks the key index;
+/// the equivalent `LIKE 'prefix%'` cannot, because `LIKE` is
+/// case-insensitive by default, and scans the whole table instead.
+#[cfg(feature = "opencode")]
+fn prefix_range(prefix: &str) -> (String, String) {
+    let mut hi = prefix.to_string();
+    if let Some(next) = hi.pop().and_then(|c| char::from_u32(c as u32 + 1)) {
+        hi.push(next);
+    } else {
+        hi = prefix.to_string();
+        hi.push('\u{10FFFF}');
+    }
+    (prefix.to_string(), hi)
+}
+
+/// Every bubble row of one session.
+#[cfg(feature = "opencode")]
+fn bubble_range(cid: &str) -> (String, String) {
+    prefix_range(&format!("bubbleId:{cid}:"))
+}
+
+/// The distinct `<kind>:` key prefixes in the key-value table, found by
+/// skipping through the key index one prefix at a time: each step seeks to
+/// the smallest key past the previous prefix's range, so the cost is a
+/// handful of index seeks regardless of table size. Keys without a colon
+/// name no session and are stepped over individually.
+#[cfg(feature = "opencode")]
+fn key_kinds(conn: &Connection) -> Result<Vec<String>> {
+    let mut from = conn
+        .prepare("SELECT min(key) FROM cursorDiskKV WHERE key >= ?1")
+        .map_err(sqlite_err)?;
+    let mut after = conn
+        .prepare("SELECT min(key) FROM cursorDiskKV WHERE key > ?1")
+        .map_err(sqlite_err)?;
+    let mut kinds = Vec::new();
+    let mut next = from
+        .query_row(params![""], |r| r.get::<_, Option<String>>(0))
+        .map_err(sqlite_err)?;
+    while let Some(key) = next {
+        next = match key.find(':') {
+            Some(i) => {
+                let kind = key[..=i].to_string();
+                let (_, hi) = prefix_range(&kind);
+                kinds.push(kind);
+                from.query_row(params![hi], |r| r.get(0))
+            }
+            None => after.query_row(params![key], |r| r.get(0)),
+        }
+        .map_err(sqlite_err)?;
+    }
+    Ok(kinds)
+}
+
+/// Rows of unmodeled kinds keyed by the session — `checkpointId:<cid>…`,
+/// `composerVirtualRowHeights:<cid>`, and whatever the app adds next — in
+/// database order. One indexed range probe per kind, so a session's cost
+/// does not grow with the size of the store.
+#[cfg(feature = "opencode")]
+fn read_aux(conn: &Connection, cid: &str) -> Result<Vec<DesktopRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT rowid, key, CAST(value AS TEXT) FROM cursorDiskKV
+             WHERE key >= ?1 AND key < ?2",
+        )
+        .map_err(sqlite_err)?;
+    let mut rows: Vec<(i64, DesktopRow)> = Vec::new();
+    for kind in key_kinds(conn)? {
+        if matches!(kind.as_str(), "bubbleId:" | "composerData:" | "agentKv:") {
+            continue;
+        }
+        let (lo, hi) = prefix_range(&format!("{kind}{cid}"));
+        let found = stmt
+            .query_map(params![lo, hi], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    DesktopRow {
+                        key: row.get(1)?,
+                        value: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(sqlite_err)?;
+        rows.extend(found.filter_map(std::result::Result::ok));
+    }
+    rows.sort_by_key(|(rowid, _)| *rowid);
+    Ok(rows.into_iter().map(|(_, row)| row).collect())
+}
+
+#[cfg(feature = "opencode")]
 fn read_session(conn: &Connection, cid: &str) -> Result<DesktopSession> {
     let header_row = conn
         .query_row(
@@ -1272,22 +1440,14 @@ fn read_session(conn: &Connection, cid: &str) -> Result<DesktopSession> {
             )
         };
 
+    let (lo, hi) = bubble_range(cid);
     let bubbles = keyed_rows(
         conn,
         "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV
-         WHERE key LIKE ?1 ORDER BY rowid",
-        &[&format!("bubbleId:{cid}:%")],
+         WHERE key >= ?1 AND key < ?2 ORDER BY rowid",
+        &[&lo, &hi],
     )?;
-    let aux = keyed_rows(
-        conn,
-        "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV
-         WHERE key LIKE ?1
-           AND key NOT LIKE ?2
-           AND key NOT LIKE 'composerData:%'
-           AND key NOT LIKE 'agentKv:%'
-         ORDER BY rowid",
-        &[&format!("%{cid}%"), &format!("bubbleId:{cid}:%")],
-    )?;
+    let aux = read_aux(conn, cid)?;
 
     Ok(DesktopSession {
         header,
