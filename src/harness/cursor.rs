@@ -1742,6 +1742,8 @@ fn denormalize_cursor_args(tool: &str, input: Value) -> Value {
                     let key = match (tool, k.as_str()) {
                         (_, "file_path") => "path",
                         ("Bash", "workdir") => "cwd",
+                        ("Edit", "old_string") => "oldString",
+                        ("Edit", "new_string") => "newString",
                         // Keys the formats agree on pass through unchanged.
                         _ => k.as_str(),
                     }
