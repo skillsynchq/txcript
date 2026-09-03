@@ -19,9 +19,11 @@
 //! which messages are kept. Space removes or restores the message at the
 //! cursor; `v` (or `[` and `]`) opens a selection that `x`, `r`, and `t`
 //! remove, restore, or keep alone; `:N` and `:A-B` go to and select by
-//! number; `u`/`U` undo and redo; `?` shows every key. Removed messages
-//! collapse to their header, a timeline strip shows the whole session one
-//! cell per message, and Enter saves the kept runs.
+//! number; `e` opens the message in the user's editor (in a pane, or with
+//! `E` in the whole terminal) and applies the file it saves; `u`/`U` undo
+//! and redo both cuts and edits; `?` shows every key. Removed messages
+//! collapse to their header, an overview shows the whole session one cell
+//! per message, and Enter saves the kept runs of the edited session.
 //!
 //! Lines wrap here, at the terminal's width: the renderer leaves body text
 //! unwrapped so the direct and external-pager paths keep it whole. The
@@ -34,15 +36,22 @@
 use std::io::Write as _;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use txcript::Span as MessageSpan;
+use tui_term::widget::{Cursor, PseudoTerminal};
+use txcript::common::Message;
+use txcript::{Common, Span as MessageSpan, Transcript};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::view::{Document, Filters, MessageKind, Rendered, render_width};
+use crate::{draft, editpane};
 
 /// Page `first`, the document rendered at `width` under the default
 /// filters, until the user quits.
@@ -52,15 +61,24 @@ pub fn run(document: Document, first: Rendered, width: usize) -> Result<(), Stri
     finish_after_restore(result, cleanup.try_restore())
 }
 
-/// Interactively edit which messages of `document` to keep; `initial`
-/// starts with only that range kept. Enter confirms and returns the kept
-/// runs in order; q, escape, and ctrl-c cancel without writing anything.
+/// What the crop editor produced: the session as edited, and the runs of
+/// it to keep.
+pub struct Cropped {
+    pub common: Transcript<Common>,
+    pub spans: Vec<MessageSpan>,
+    /// How many messages were edited in place.
+    pub edited: usize,
+}
+
+/// Interactively edit `document`: which messages to keep, and their text;
+/// `initial` starts with only that range kept. Enter confirms; q, escape,
+/// and ctrl-c cancel without writing anything.
 pub fn crop(
     document: Document,
     first: Rendered,
     width: usize,
     initial: Option<MessageSpan>,
-) -> Result<Option<Vec<MessageSpan>>, String> {
+) -> Result<Option<Cropped>, String> {
     let (mut terminal, cleanup) = init_terminal("crop editor")?;
     let result = Cropper::new(document, first, width, initial)
         .and_then(|mut cropper| cropper.run(&mut terminal));
@@ -120,7 +138,7 @@ fn finish_after_restore<T>(
 ///
 /// Edits snap to tool pairs: removing or restoring one half of a call and
 /// its result takes the other half along, so a save can never split them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct CropEdit {
     kept: Vec<bool>,
     cursor: usize,
@@ -130,8 +148,28 @@ struct CropEdit {
     /// For each message, the messages that stay with it: a tool call's
     /// result, a result's call.
     links: Vec<Vec<usize>>,
-    undo: Vec<Vec<bool>>,
-    redo: Vec<Vec<bool>>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+}
+
+/// One entry of the edit history.
+#[derive(Debug, Clone, PartialEq)]
+enum Step {
+    /// The kept set before (in the undo stack) or after (in the redo stack).
+    Kept(Vec<bool>),
+    /// A message's text changed.
+    Message {
+        index: usize,
+        before: Box<Message>,
+        after: Box<Message>,
+    },
+}
+
+/// What undoing or redoing a step asks of the document.
+#[derive(Debug, Clone, PartialEq)]
+enum Reverted {
+    Kept,
+    Message { index: usize, message: Message },
 }
 
 impl CropEdit {
@@ -257,12 +295,26 @@ impl CropEdit {
         if next == self.kept {
             return false;
         }
-        self.undo.push(std::mem::replace(&mut self.kept, next));
+        let before = std::mem::replace(&mut self.kept, next);
+        self.record(Step::Kept(before));
+        true
+    }
+
+    fn record(&mut self, step: Step) {
+        self.undo.push(step);
         if self.undo.len() > 500 {
             self.undo.remove(0);
         }
         self.redo.clear();
-        true
+    }
+
+    /// Remember that a message's text changed, so it can be undone.
+    fn record_message(&mut self, index: usize, before: Message, after: Message) {
+        self.record(Step::Message {
+            index,
+            before: Box::new(before),
+            after: Box::new(after),
+        });
     }
 
     /// Set the selection (and what is linked to it) to `keep`; the
@@ -319,22 +371,54 @@ impl CropEdit {
         extra
     }
 
-    fn undo(&mut self) -> bool {
-        let Some(previous) = self.undo.pop() else {
-            return false;
-        };
-        self.redo.push(std::mem::replace(&mut self.kept, previous));
+    fn undo(&mut self) -> Option<Reverted> {
+        let step = self.undo.pop()?;
         self.anchor = None;
-        true
+        Some(match step {
+            Step::Kept(before) => {
+                self.redo
+                    .push(Step::Kept(std::mem::replace(&mut self.kept, before)));
+                Reverted::Kept
+            }
+            Step::Message {
+                index,
+                before,
+                after,
+            } => {
+                let message = (*before).clone();
+                self.redo.push(Step::Message {
+                    index,
+                    before,
+                    after,
+                });
+                Reverted::Message { index, message }
+            }
+        })
     }
 
-    fn redo(&mut self) -> bool {
-        let Some(next) = self.redo.pop() else {
-            return false;
-        };
-        self.undo.push(std::mem::replace(&mut self.kept, next));
+    fn redo(&mut self) -> Option<Reverted> {
+        let step = self.redo.pop()?;
         self.anchor = None;
-        true
+        Some(match step {
+            Step::Kept(after) => {
+                self.undo
+                    .push(Step::Kept(std::mem::replace(&mut self.kept, after)));
+                Reverted::Kept
+            }
+            Step::Message {
+                index,
+                before,
+                after,
+            } => {
+                let message = (*after).clone();
+                self.undo.push(Step::Message {
+                    index,
+                    before,
+                    after,
+                });
+                Reverted::Message { index, message }
+            }
+        })
     }
 
     /// The kept messages as maximal runs, in order.
@@ -754,6 +838,17 @@ struct Cropper {
     /// than the text needs, under it otherwise.
     overview: Overview,
     edit: CropEdit,
+    /// The messages as the editor opened them, to tell edited ones apart.
+    original: Vec<Message>,
+    edited: Vec<bool>,
+    /// A message out in the user's editor.
+    editing: Option<Editing>,
+    /// The editor itself, while `editing`.
+    editor: Option<Editor>,
+    /// An editor to run in the terminal itself, once the screen is free.
+    takeover: Option<String>,
+    /// The screen as of the last draw, for sizing a pane before it opens.
+    area: (u16, u16),
     pending_images: Vec<Vec<u8>>,
     notice: Option<String>,
     /// The `:` prompt being typed, if open.
@@ -805,6 +900,12 @@ impl Cropper {
             rows: crop_content_rows(24),
             overview: Overview::Bottom,
             edit,
+            original: Vec::new(),
+            edited: Vec::new(),
+            editing: None,
+            editor: None,
+            takeover: None,
+            area: (80, 24),
             pending_images: Vec::new(),
             notice,
             prompt: None,
@@ -812,12 +913,14 @@ impl Cropper {
             result: None,
             done: false,
         };
+        cropper.original = cropper.document.messages().to_vec();
+        cropper.edited = vec![false; cropper.original.len()];
         cropper.accept(first);
         cropper.focus_cursor();
         Ok(cropper)
     }
 
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<Vec<MessageSpan>>, String> {
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<Cropped>, String> {
         while !self.done {
             if !self.pending_images.is_empty() {
                 let mut stdout = std::io::stdout().lock();
@@ -833,18 +936,232 @@ impl Cropper {
             terminal
                 .draw(|frame| self.draw(frame))
                 .map_err(|error| format!("drawing the crop editor: {error}"))?;
-            match event::read().map_err(|error| format!("reading input: {error}"))? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
-                Event::Resize(columns, _) => self.resize(usize::from(columns)),
-                Event::Paste(text) => {
-                    if let Some(prompt) = &mut self.prompt {
-                        prompt.push_str(&text);
-                    }
+            if self.editor.is_some() {
+                // The editor paints and exits on its own schedule: look in
+                // on it between keys.
+                let ready = event::poll(std::time::Duration::from_millis(16))
+                    .map_err(|error| format!("reading input: {error}"))?;
+                if !ready {
+                    self.poll_editor();
+                    continue;
                 }
+            }
+            match event::read().map_err(|error| format!("reading input: {error}"))? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match &mut self.editor {
+                    Some(Editor::Pane(pane)) => pane.key(&key),
+                    Some(Editor::Window(_)) => {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            self.stop_waiting();
+                        }
+                    }
+                    None => self.key(key),
+                },
+                Event::Paste(text) => match &mut self.editor {
+                    Some(Editor::Pane(pane)) => pane.paste(&text),
+                    Some(Editor::Window(_)) => {}
+                    None => {
+                        if let Some(prompt) = &mut self.prompt {
+                            prompt.push_str(&text);
+                        }
+                    }
+                },
                 _ => {}
             }
+            if let Some(command) = self.takeover.take() {
+                self.run_takeover(terminal, &command)?;
+            }
+            self.poll_editor();
         }
-        Ok(self.result.clone())
+        Ok(self.result.take().map(|spans| Cropped {
+            common: self.document.transcript().clone(),
+            spans,
+            edited: self.edited.iter().filter(|edited| **edited).count(),
+        }))
+    }
+
+    /// Open the message at the cursor in the user's editor.
+    fn begin_edit(&mut self, how: How) {
+        let index = self.edit.cursor;
+        if !self.edit.kept[index] {
+            self.notice = Some(format!("#{} is removed · restore it to edit it", index + 1));
+            return;
+        }
+        let Some(text) = self.document.message(index).and_then(draft::draft) else {
+            self.notice = Some(format!("nothing in #{} can be edited", index + 1));
+            return;
+        };
+        let path = std::env::temp_dir().join(format!(
+            "txcript-{}-message-{}.md",
+            std::process::id(),
+            index + 1
+        ));
+        if let Err(error) = std::fs::write(&path, &text) {
+            self.notice = Some(format!("cannot write the message to edit: {error}"));
+            return;
+        }
+        let command = editpane::editor_command();
+        let editing = Editing {
+            index,
+            path,
+            original: text,
+            name: editpane::editor_name(&command),
+        };
+        if how == How::Takeover {
+            self.editing = Some(editing);
+            self.takeover = Some(command);
+            self.notice = None;
+            return;
+        }
+        let editor = if editpane::opens_a_window(&command) {
+            editpane::Detached::open(&command, &editing.path).map(Editor::Window)
+        } else {
+            let (width, height) = self.area;
+            let (rows, cols) = Self::layout(usize::from(width), usize::from(height), true)
+                .pane
+                .map_or((height, width), |pane| pane_inner(pane, self.overview));
+            editpane::Pane::open(&command, &editing.path, rows, cols).map(Editor::Pane)
+        };
+        match editor {
+            Ok(editor) => {
+                self.editor = Some(editor);
+                self.editing = Some(editing);
+                self.notice = None;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&editing.path);
+                self.notice = Some(error);
+            }
+        }
+    }
+
+    /// Hand the terminal to the editor until it exits, then take it back
+    /// and apply the file.
+    fn run_takeover(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        command: &str,
+    ) -> Result<(), String> {
+        let Some(editing) = self.editing.take() else {
+            return Ok(());
+        };
+        let leave = disable_raw_mode()
+            .and_then(|()| execute!(std::io::stdout(), LeaveAlternateScreen))
+            .map_err(|error| format!("handing the terminal to the editor: {error}"));
+        let outcome = match leave {
+            Ok(()) => editpane::run_in_terminal(command, &editing.path),
+            Err(error) => Err(error),
+        };
+        enable_raw_mode()
+            .and_then(|()| execute!(std::io::stdout(), EnterAlternateScreen))
+            .map_err(|error| format!("taking the terminal back from the editor: {error}"))?;
+        terminal
+            .clear()
+            .map_err(|error| format!("redrawing after the editor: {error}"))?;
+        self.conclude_edit(&editing, outcome);
+        self.relayout();
+        self.focus_cursor();
+        Ok(())
+    }
+
+    /// Notice whether the editor has exited, and take its result.
+    fn poll_editor(&mut self) {
+        let finished = match &mut self.editor {
+            Some(Editor::Pane(pane)) => pane.finished(),
+            Some(Editor::Window(window)) => window.finished(),
+            None => None,
+        };
+        let Some(outcome) = finished else {
+            return;
+        };
+        self.editor = None;
+        if let Some(editing) = self.editing.take() {
+            self.conclude_edit(&editing, outcome);
+            self.relayout();
+            self.focus_cursor();
+        }
+    }
+
+    /// Give up on a windowed editor that has not closed; the file is left
+    /// alone.
+    fn stop_waiting(&mut self) {
+        self.editor = None;
+        if let Some(editing) = self.editing.take() {
+            self.notice = Some(format!(
+                "stopped waiting for {} · #{} is unchanged",
+                editing.name,
+                editing.index + 1
+            ));
+        }
+    }
+
+    /// Apply what the editor left in the file, and say what happened.
+    fn conclude_edit(&mut self, editing: &Editing, outcome: Result<(), String>) {
+        let ordinal = editing.index + 1;
+        let text = match outcome.and_then(|()| {
+            std::fs::read_to_string(&editing.path)
+                .map_err(|error| format!("reading the edited message: {error}"))
+        }) {
+            Ok(text) => text,
+            Err(error) => {
+                let _ = std::fs::remove_file(&editing.path);
+                self.notice = Some(format!("#{ordinal} not changed · {error}"));
+                return;
+            }
+        };
+        if text == editing.original {
+            let _ = std::fs::remove_file(&editing.path);
+            self.notice = Some(format!("#{ordinal} unchanged"));
+            return;
+        }
+        let Some(before) = self.document.message(editing.index).cloned() else {
+            return;
+        };
+        match draft::apply(&before, &text) {
+            Ok(after) if after == before => {
+                let _ = std::fs::remove_file(&editing.path);
+                self.notice = Some(format!("#{ordinal} unchanged"));
+            }
+            Ok(after) => {
+                let _ = std::fs::remove_file(&editing.path);
+                self.edit
+                    .record_message(editing.index, before, after.clone());
+                self.put_message(editing.index, after);
+                self.notice = Some(format!("#{ordinal} edited"));
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "#{ordinal} not changed · {error} · your text is kept at {}",
+                    editing.path.display()
+                ));
+            }
+        }
+    }
+
+    /// Put `message` at `index` and show it.
+    fn put_message(&mut self, index: usize, message: Message) {
+        self.document.replace_message(index, message);
+        if let (Some(edited), Some(original)) =
+            (self.edited.get_mut(index), self.original.get(index))
+        {
+            *edited = self.document.message(index) != Some(original);
+        }
+        if let Some(rendered) = self.document.render(self.width, Filters::crop()) {
+            self.accept(rendered);
+        }
+    }
+
+    /// Reflect an undo or redo in the document.
+    fn revert(&mut self, reverted: Option<Reverted>, missing: &str) {
+        match reverted {
+            None => self.after_edit(Some(missing.to_string())),
+            Some(Reverted::Kept) => self.after_edit(None),
+            Some(Reverted::Message { index, message }) => {
+                self.put_message(index, message);
+                self.after_edit(None);
+            }
+        }
     }
 
     fn accept(&mut self, rendered: Rendered) {
@@ -884,17 +1201,6 @@ impl Cropper {
                 .extend(wrap(plain, self.cols).map(|range| Row { line: index, range }));
         }
         self.top = self.top.min(self.visual.len().saturating_sub(1));
-    }
-
-    fn resize(&mut self, columns: usize) {
-        let width = crop_render_width(columns);
-        if width != self.width {
-            self.width = width;
-            if let Some(rendered) = self.document.render(self.width, Filters::crop()) {
-                self.accept(rendered);
-                self.focus_cursor();
-            }
-        }
     }
 
     fn key(&mut self, key: KeyEvent) {
@@ -955,17 +1261,19 @@ impl Cropper {
                 self.after_edit(snapped_notice("kept", &extra));
             }
             KeyCode::Char('u') => {
-                let notice = (!self.edit.undo()).then(|| "nothing to undo".to_string());
-                self.after_edit(notice);
+                let reverted = self.edit.undo();
+                self.revert(reverted, "nothing to undo");
             }
             KeyCode::Char('U') => {
-                let notice = (!self.edit.redo()).then(|| "nothing to redo".to_string());
-                self.after_edit(notice);
+                let reverted = self.edit.redo();
+                self.revert(reverted, "nothing to redo");
             }
             KeyCode::Char('r') if control => {
-                let notice = (!self.edit.redo()).then(|| "nothing to redo".to_string());
-                self.after_edit(notice);
+                let reverted = self.edit.redo();
+                self.revert(reverted, "nothing to redo");
             }
+            KeyCode::Char('e') => self.begin_edit(How::Pane),
+            KeyCode::Char('E') => self.begin_edit(How::Takeover),
             KeyCode::Char(':') => {
                 self.prompt = Some(String::new());
                 self.notice = None;
@@ -1135,19 +1443,70 @@ impl Cropper {
         }
     }
 
-    fn update_viewport(&mut self, columns: usize, rows: usize) {
-        let content_columns = crop_render_width(columns);
-        self.overview = if columns.saturating_sub(3 + content_columns) >= SIDE_MARGIN {
+    /// How a `width` by `height` screen is divided: the columns and rows
+    /// the transcript gets, and the editor pane's place when one is open.
+    /// The overview takes the right edge or the bottom by the window's
+    /// shape; a pane takes the same place, and the overview yields to it.
+    fn layout(width: usize, height: usize, pane: bool) -> Layout {
+        let overview = if width.saturating_sub(3 + crop_render_width(width)) >= SIDE_MARGIN {
             Overview::Side
         } else {
             Overview::Bottom
         };
-        self.rows = match self.overview {
-            Overview::Side => content_rows(rows),
-            Overview::Bottom => crop_content_rows(rows),
+        let rect = |x: usize, y: usize, w: usize, h: usize| Rect {
+            x: u16::try_from(x).unwrap_or(u16::MAX),
+            y: u16::try_from(y).unwrap_or(u16::MAX),
+            width: u16::try_from(w).unwrap_or(u16::MAX),
+            height: u16::try_from(h).unwrap_or(u16::MAX),
         };
-        if content_columns != self.cols {
-            self.cols = content_columns;
+        match (pane, overview) {
+            (false, Overview::Side) => Layout {
+                overview,
+                columns: width,
+                rows: content_rows(height),
+                pane: None,
+            },
+            (false, Overview::Bottom) => Layout {
+                overview,
+                columns: width,
+                rows: crop_content_rows(height),
+                pane: None,
+            },
+            (true, Overview::Side) => {
+                let split = width / 2;
+                Layout {
+                    overview,
+                    columns: split,
+                    rows: content_rows(height),
+                    pane: Some(rect(split, 0, width - split, content_rows(height))),
+                }
+            }
+            (true, Overview::Bottom) => {
+                let split = height / 2;
+                Layout {
+                    overview,
+                    columns: width,
+                    rows: content_rows(split),
+                    pane: Some(rect(0, split, width, height.saturating_sub(split + 1))),
+                }
+            }
+        }
+    }
+
+    fn update_viewport(&mut self, columns: usize, rows: usize) {
+        let pane = matches!(self.editor, Some(Editor::Pane(_)));
+        let layout = Self::layout(columns, rows, pane);
+        self.overview = layout.overview;
+        self.rows = layout.rows;
+        let width = crop_render_width(layout.columns);
+        if width != self.width {
+            self.width = width;
+            self.cols = width;
+            if let Some(rendered) = self.document.render(self.width, Filters::crop()) {
+                self.accept(rendered);
+            }
+        } else if width != self.cols {
+            self.cols = width;
             self.relayout();
         }
         self.focus_cursor();
@@ -1194,6 +1553,10 @@ impl Cropper {
             .map(|(row_index, row)| {
                 let message = self.message_of_line(row.line);
                 let removed = message.is_some_and(|message| !self.edit.kept[message]);
+                let edited = message.is_some_and(|message| self.edited[message]);
+                let rule_row = message.is_some_and(|message| {
+                    self.message_starts[message] == row.line && row.range.start == 0
+                });
                 let edge = match &selected_rows {
                     Some(rows) if rows.contains(&row_index) => {
                         if rows.len() == 1 {
@@ -1207,11 +1570,22 @@ impl Cropper {
                         }
                     }
                     _ if removed => CropEdge::Removed,
+                    _ if edited => CropEdge::Edited,
                     _ => CropEdge::Outside,
                 };
                 let line = &self.lines[row.line];
-                let text = if removed {
-                    let rule = removed_rule(line, self.cols);
+                let text = if removed || (edited && rule_row) {
+                    let rule = if removed {
+                        labelled_rule(
+                            line,
+                            self.cols,
+                            "removed",
+                            Style::new().add_modifier(Modifier::DIM),
+                        )
+                    } else {
+                        let style = line.runs.first().map_or(Style::new(), |(_, style)| *style);
+                        labelled_rule(line, self.cols, "edited", style)
+                    };
                     Line::from(
                         row_spans(&rule, &(0..rule.plain.len()), &[])
                             .into_iter()
@@ -1236,7 +1610,10 @@ impl Cropper {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.area = (area.width, area.height);
         self.update_viewport(usize::from(area.width), usize::from(area.height));
+        let pane_open = matches!(self.editor, Some(Editor::Pane(_)));
+        let layout = Self::layout(usize::from(area.width), usize::from(area.height), pane_open);
         let selection = self.edit.selecting().then(|| self.edit.selection());
         let visible = self.visible_lines(selection.as_ref());
         let gutter = Rect {
@@ -1248,7 +1625,9 @@ impl Cropper {
         };
         let content = Rect {
             x: area.x.saturating_add(gutter.width),
-            width: area.width.saturating_sub(gutter.width),
+            width: u16::try_from(layout.columns)
+                .unwrap_or(u16::MAX)
+                .saturating_sub(gutter.width),
             ..gutter
         };
         frame.render_widget(
@@ -1270,18 +1649,72 @@ impl Cropper {
             content,
         );
 
-        if self.overview == Overview::Side {
+        self.draw_beside(frame, area, &layout, pane_open, selection.as_ref());
+
+        let status_area = Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        let status = if let Some(prompt) = &self.prompt {
+            Line::from(format!(":{prompt}"))
+        } else {
+            crop_status(
+                &self.edit,
+                self.notice.as_deref(),
+                self.editing.as_ref(),
+                matches!(self.editor, Some(Editor::Window(_))),
+                self.color,
+            )
+        };
+        frame.render_widget(Paragraph::new(status), status_area);
+        if let Some(prompt) = &self.prompt {
+            let column = u16::try_from(prompt.chars().count() + 1).unwrap_or(u16::MAX);
+            frame.set_cursor_position((
+                status_area.x + column.min(status_area.width.saturating_sub(1)),
+                status_area.y,
+            ));
+        }
+
+        if self.mode == Mode::Help {
+            draw_help(frame, area, self.color);
+        }
+    }
+
+    /// Paint what sits beside or under the transcript: the editor pane
+    /// while one is open, else the overview.
+    fn draw_beside(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        layout: &Layout,
+        pane_open: bool,
+        selection: Option<&std::ops::Range<usize>>,
+    ) {
+        if let Some(pane) = layout.pane.filter(|_| pane_open) {
+            self.draw_pane(
+                frame,
+                Rect {
+                    x: area.x + pane.x,
+                    y: area.y + pane.y,
+                    ..pane
+                },
+            );
+        } else if self.overview == Overview::Side {
             let width = u16::try_from(MINIMAP_WIDTH).unwrap_or(u16::MAX);
             let minimap_area = Rect {
                 x: area.x + area.width.saturating_sub(width),
+                y: area.y,
                 width,
-                ..gutter
+                height: u16::try_from(self.rows)
+                    .unwrap_or(u16::MAX)
+                    .min(area.height),
             };
             let lines = minimap(
                 &self.kinds,
                 &self.edit.kept,
                 self.edit.cursor,
-                selection.as_ref(),
+                selection,
                 self.messages_on_screen(),
                 self.rows,
                 self.color,
@@ -1308,36 +1741,103 @@ impl Cropper {
                 &self.kinds,
                 &self.edit.kept,
                 self.edit.cursor,
-                selection.as_ref(),
+                selection,
                 usize::from(area.width),
                 self.color,
             );
             frame.render_widget(Paragraph::new(timeline), timeline_area);
         }
+    }
 
-        let status_area = Rect {
-            y: area.y + area.height.saturating_sub(1),
-            height: 1,
-            ..area
+    /// Paint the editor's screen into `pane`, behind a border on the side
+    /// facing the transcript, and put the cursor where the editor has it.
+    fn draw_pane(&mut self, frame: &mut Frame, pane: Rect) {
+        let Some(editing) = &self.editing else {
+            return;
         };
-        let status = if let Some(prompt) = &self.prompt {
-            Line::from(format!(":{prompt}"))
+        let Some(Editor::Pane(editor)) = &mut self.editor else {
+            return;
+        };
+        let (rows, cols) = pane_inner(pane, self.overview);
+        editor.resize(rows, cols);
+        let title = format!(
+            " {} · Message #{} · save and quit to apply ",
+            editing.name,
+            editing.index + 1
+        );
+        let border = if self.color {
+            Style::new().fg(Color::Cyan)
         } else {
-            crop_status(&self.edit, self.notice.as_deref(), self.color)
+            Style::new()
         };
-        frame.render_widget(Paragraph::new(status), status_area);
-        if let Some(prompt) = &self.prompt {
-            let column = u16::try_from(prompt.chars().count() + 1).unwrap_or(u16::MAX);
+        let block = Block::default()
+            .borders(match self.overview {
+                Overview::Side => Borders::LEFT | Borders::TOP,
+                Overview::Bottom => Borders::TOP,
+            })
+            .border_style(border)
+            .title(title);
+        let inner = block.inner(pane);
+        let Some(parser) = editor.screen() else {
+            return;
+        };
+        let screen = parser.screen();
+        frame.render_widget(Clear, pane);
+        frame.render_widget(
+            PseudoTerminal::new(screen)
+                .cursor(Cursor::default().visibility(false))
+                .block(block),
+            pane,
+        );
+        if !screen.hide_cursor() {
+            let (row, col) = screen.cursor_position();
             frame.set_cursor_position((
-                status_area.x + column.min(status_area.width.saturating_sub(1)),
-                status_area.y,
+                inner.x + col.min(inner.width.saturating_sub(1)),
+                inner.y + row.min(inner.height.saturating_sub(1)),
             ));
         }
-
-        if self.mode == Mode::Help {
-            draw_help(frame, area, self.color);
-        }
     }
+}
+
+/// The screen divided up: see [`Cropper::layout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Layout {
+    overview: Overview,
+    columns: usize,
+    rows: usize,
+    pane: Option<Rect>,
+}
+
+/// The rows and columns inside a pane's border.
+fn pane_inner(pane: Rect, overview: Overview) -> (u16, u16) {
+    match overview {
+        Overview::Side => (pane.height.saturating_sub(1), pane.width.saturating_sub(1)),
+        Overview::Bottom => (pane.height.saturating_sub(1), pane.width),
+    }
+}
+
+/// A message out in the user's editor.
+struct Editing {
+    index: usize,
+    path: std::path::PathBuf,
+    /// The file as written, to tell an untouched save from an edit.
+    original: String,
+    /// The editor's name, for the pane title and notices.
+    name: String,
+}
+
+/// How the editor is shown: in a pane of this screen, or given the whole
+/// terminal until it exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum How {
+    Pane,
+    Takeover,
+}
+
+/// Where the editor runs.
+enum Editor {
+    Pane(editpane::Pane),
+    Window(editpane::Detached),
 }
 
 /// What the next key means: an edit, closing the help, or confirming a
@@ -1451,6 +1951,7 @@ enum CropEdge {
     End,
     Only,
     Removed,
+    Edited,
     Outside,
 }
 
@@ -1462,6 +1963,7 @@ fn crop_gutter(cursor: bool, edge: CropEdge, color: bool) -> Span<'static> {
         CropEdge::End => '└',
         CropEdge::Only => '─',
         CropEdge::Removed => '×',
+        CropEdge::Edited => '✎',
         CropEdge::Outside => ' ',
     };
     let mut style = if cursor {
@@ -1481,17 +1983,17 @@ fn crop_gutter(cursor: bool, edge: CropEdge, color: bool) -> Span<'static> {
     Span::styled(format!("{pointer}{rail} "), style)
 }
 
-/// A removed message's header: its label, then `removed`, dimmed, in place
-/// of the body that no longer shows.
-fn removed_rule(rule: &Styled, width: usize) -> Styled {
+/// A message's header with a note after its label: `removed`, dimmed, in
+/// place of the body that no longer shows; or `edited`.
+fn labelled_rule(rule: &Styled, width: usize, note: &str, style: Style) -> Styled {
     let label = rule.plain.trim_end_matches('─').trim_end();
-    let mut plain = format!("{label} · removed ");
+    let mut plain = format!("{label} · {note} ");
     let used = plain.width();
     plain.push_str(&"─".repeat(width.saturating_sub(used).max(2)));
     let end = plain.len();
     Styled {
         plain,
-        runs: vec![(0..end, Style::new().add_modifier(Modifier::DIM))],
+        runs: vec![(0..end, style)],
     }
 }
 
@@ -1578,7 +2080,13 @@ fn timeline(
     Line::from(spans)
 }
 
-fn crop_status(edit: &CropEdit, notice: Option<&str>, color: bool) -> Line<'static> {
+fn crop_status(
+    edit: &CropEdit,
+    notice: Option<&str>,
+    editing: Option<&Editing>,
+    windowed: bool,
+    color: bool,
+) -> Line<'static> {
     let accent = if color {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
@@ -1586,6 +2094,7 @@ fn crop_status(edit: &CropEdit, notice: Option<&str>, color: bool) -> Line<'stat
     };
     let key = Style::new().add_modifier(Modifier::BOLD);
     let mut spans = vec![Span::styled(" CROP ", accent), Span::raw("  ")];
+    let at_removed = !edit.kept[edit.cursor];
     let kept = if edit.removed_count() == 0 {
         format!("all {} kept", edit.total())
     } else {
@@ -1604,6 +2113,19 @@ fn crop_status(edit: &CropEdit, notice: Option<&str>, color: bool) -> Line<'stat
         spans.push(Span::styled(format!("#{}", edit.cursor + 1), key));
     }
     spans.push(Span::raw("  "));
+    if let Some(editing) = editing {
+        let text = if windowed {
+            format!(
+                "editing #{} in {} · waiting for it to close · CTRL-C stop waiting",
+                editing.index + 1,
+                editing.name
+            )
+        } else {
+            format!("editing #{} in {}", editing.index + 1, editing.name)
+        };
+        spans.push(Span::raw(text));
+        return Line::from(spans);
+    }
     if let Some(notice) = notice {
         let style = if color {
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -1622,8 +2144,9 @@ fn crop_status(edit: &CropEdit, notice: Option<&str>, color: bool) -> Line<'stat
         ]
     } else {
         &[
-            ("SPACE", "remove/restore"),
+            ("SPACE", if at_removed { "restore" } else { "remove" }),
             ("V", "select"),
+            ("E", "edit"),
             ("ENTER", "save"),
             ("?", "help"),
         ]
@@ -1664,6 +2187,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("x d Del", "remove"),
             ("r", "restore"),
             ("t", "keep only the selection"),
+            ("e", "edit the message in your editor, in a pane"),
+            ("E", "edit with the editor taking the whole terminal"),
             ("u U", "undo / redo"),
         ],
     ),
@@ -1676,7 +2201,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-const HELP_NOTE: &str = "Removed messages collapse to their header. A tool call and its result are removed or restored together.";
+const HELP_NOTE: &str = "Removed messages collapse to their header. A tool call and its result are removed or restored together. Editing opens the message in your editor, beside or under the transcript.";
 
 fn help_lines() -> Vec<Line<'static>> {
     let key = Style::new().add_modifier(Modifier::BOLD);
@@ -2262,7 +2787,7 @@ mod tests {
     #[test]
     fn crop_edit_undoes_and_redoes_without_recording_no_ops() {
         let mut edit = CropEdit::new(3, &[]).unwrap();
-        assert!(!edit.undo());
+        assert!(edit.undo().is_none());
         edit.jump_to(1);
         edit.cut();
         edit.jump_to(2);
@@ -2272,15 +2797,15 @@ mod tests {
         edit.restore();
         assert_eq!(edit.undo.len(), 2);
 
-        assert!(edit.undo());
+        assert!(edit.undo().is_some());
         assert_eq!(
             edit.kept_spans(),
             vec![txcript::Span(0..1), txcript::Span(2..3)]
         );
-        assert!(edit.undo());
+        assert!(edit.undo().is_some());
         assert_eq!(edit.kept_spans(), vec![txcript::Span(0..3)]);
         assert!(!edit.edited());
-        assert!(edit.redo());
+        assert!(edit.redo().is_some());
         assert_eq!(
             edit.kept_spans(),
             vec![txcript::Span(0..1), txcript::Span(2..3)]
@@ -2288,7 +2813,7 @@ mod tests {
         // A new edit drops the redo branch.
         edit.jump_to(0);
         edit.cut();
-        assert!(!edit.redo());
+        assert!(edit.redo().is_none());
     }
 
     #[test]
@@ -2480,7 +3005,12 @@ mod tests {
     #[test]
     fn removed_rule_keeps_the_label_and_says_so() {
         let rule = parse_ansi("\x1b[1;36m── Message #2 · Assistant ──────────\x1b[0m");
-        let removed = removed_rule(&rule, 40);
+        let removed = labelled_rule(
+            &rule,
+            40,
+            "removed",
+            Style::new().add_modifier(Modifier::DIM),
+        );
         assert!(
             removed
                 .plain
@@ -2602,10 +3132,11 @@ mod tests {
                 .map(|span| span.content.to_string())
                 .collect::<String>()
         };
-        let idle = plain(crop_status(&edit, None, false));
+        let idle = plain(crop_status(&edit, None, None, false, false));
         assert!(idle.contains("all 4 kept"));
         assert!(idle.contains("#1"));
-        assert!(idle.contains("SPACE remove/restore"));
+        assert!(idle.contains("SPACE remove"));
+        assert!(idle.contains("E edit"));
         assert!(idle.contains("? help"));
 
         edit.jump_to(1);
@@ -2613,12 +3144,18 @@ mod tests {
         edit.jump_to(2);
         edit.toggle_selecting();
         edit.jump_to(3);
-        let selecting = plain(crop_status(&edit, None, false));
+        let selecting = plain(crop_status(&edit, None, None, false, false));
         assert!(selecting.contains("3/4 kept"));
         assert!(selecting.contains("#3–4 selected"));
         assert!(selecting.contains("T keep only"));
 
-        let noticed = plain(crop_status(&edit, Some("also removed #2"), false));
+        let noticed = plain(crop_status(
+            &edit,
+            Some("also removed #2"),
+            None,
+            false,
+            false,
+        ));
         assert!(noticed.contains("also removed #2"));
         assert!(!noticed.contains("keep only"));
         assert_eq!(snapped_notice("removed", &[]), None);
@@ -2652,6 +3189,181 @@ mod tests {
 
         assert!(error.contains("restoring the terminal"));
         assert!(error.contains("restore failed"));
+    }
+
+    #[test]
+    fn crop_edit_keeps_message_edits_in_the_same_history_as_cuts() {
+        let mut edit = CropEdit::new(3, &[]).unwrap();
+        let before = text_message("old");
+        let after = text_message("new");
+        edit.jump_to(1);
+        edit.cut();
+        edit.record_message(2, before.clone(), after.clone());
+        assert!(edit.edited());
+        assert_eq!(
+            edit.undo(),
+            Some(Reverted::Message {
+                index: 2,
+                message: before.clone()
+            })
+        );
+        assert_eq!(edit.undo(), Some(Reverted::Kept));
+        assert_eq!(edit.kept_spans(), vec![txcript::Span(0..3)]);
+        assert_eq!(edit.redo(), Some(Reverted::Kept));
+        assert_eq!(
+            edit.redo(),
+            Some(Reverted::Message {
+                index: 2,
+                message: after
+            })
+        );
+        assert_eq!(edit.redo(), None);
+        // A new edit after an undo drops the redo branch.
+        edit.undo();
+        edit.record_message(0, before.clone(), text_message("newer"));
+        assert_eq!(edit.redo(), None);
+    }
+
+    #[test]
+    fn an_edited_file_changes_the_message_and_undo_puts_it_back() {
+        let mut editor = cropper(3);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message-2.md");
+        let original = draft::draft(editor.document.message(1).unwrap()).unwrap();
+        std::fs::write(&path, original.replace("message 1", "message one, edited")).unwrap();
+        let editing = Editing {
+            index: 1,
+            path: path.clone(),
+            original: original.clone(),
+            name: "vi".into(),
+        };
+        editor.conclude_edit(&editing, Ok(()));
+        assert_eq!(editor.notice.as_deref(), Some("#2 edited"));
+        assert!(editor.edited[1]);
+        assert!(!path.exists(), "an applied draft is cleaned up");
+        assert_eq!(
+            editor.document.message(1).unwrap().content,
+            vec![txcript::common::Block::Text {
+                text: "message one, edited".into()
+            }]
+        );
+        assert!(
+            editor
+                .lines
+                .iter()
+                .any(|line| line.plain.contains("message one, edited"))
+        );
+        press_crop(&mut editor, KeyCode::Char('u'));
+        assert!(!editor.edited[1]);
+        assert_eq!(editor.document.message(1), editor.original.get(1));
+        press_crop(&mut editor, KeyCode::Char('U'));
+        assert!(editor.edited[1]);
+
+        // An untouched file changes nothing.
+        std::fs::write(&path, &original).unwrap();
+        let editing = Editing {
+            index: 1,
+            path: path.clone(),
+            original,
+            name: "vi".into(),
+        };
+        editor.conclude_edit(&editing, Ok(()));
+        assert_eq!(editor.notice.as_deref(), Some("#2 unchanged"));
+
+        // An editor that failed leaves the message alone.
+        std::fs::write(&path, "whatever").unwrap();
+        editor.conclude_edit(
+            &editing_at(&path, 1),
+            Err("the editor exited with exit status: 1".into()),
+        );
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("#2 not changed")
+        );
+        assert!(!path.exists());
+
+        // A file that no longer parses keeps the user's text around: a
+        // message with two blocks needs its headings back.
+        let mut two_blocks = editor.document.message(1).unwrap().clone();
+        two_blocks.content.push(txcript::common::Block::Text {
+            text: "second".into(),
+        });
+        editor.document.replace_message(1, two_blocks);
+        std::fs::write(&path, "no headings here").unwrap();
+        editor.conclude_edit(&editing_at(&path, 1), Ok(()));
+        let notice = editor.notice.clone().unwrap();
+        assert!(notice.contains("heading is missing"), "{notice}");
+        assert!(notice.contains(&path.display().to_string()));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn editing_is_refused_on_a_removed_message_and_needs_something_to_edit() {
+        let mut editor = cropper(2);
+        press_crop(&mut editor, KeyCode::Char('x'));
+        press_crop(&mut editor, KeyCode::Char('e'));
+        assert!(editor.editing.is_none());
+        assert!(editor.notice.as_deref().unwrap().contains("restore it"));
+        assert_eq!(editor.result, None);
+    }
+
+    #[test]
+    fn a_pane_takes_the_overview_side_or_the_bottom() {
+        let wide = Cropper::layout(190, 40, true);
+        assert_eq!(wide.overview, Overview::Side);
+        assert_eq!(wide.columns, 95);
+        assert_eq!(wide.rows, 39);
+        let pane = wide.pane.unwrap();
+        assert_eq!((pane.x, pane.y, pane.width, pane.height), (95, 0, 95, 39));
+        assert_eq!(pane_inner(pane, Overview::Side), (38, 94));
+
+        let tall = Cropper::layout(100, 40, true);
+        assert_eq!(tall.overview, Overview::Bottom);
+        assert_eq!(tall.columns, 100);
+        assert_eq!(tall.rows, 19);
+        let pane = tall.pane.unwrap();
+        assert_eq!((pane.x, pane.y, pane.width, pane.height), (0, 20, 100, 19));
+        assert_eq!(pane_inner(pane, Overview::Bottom), (18, 100));
+        assert_eq!(Cropper::layout(100, 40, false).pane, None);
+    }
+
+    #[test]
+    fn edited_messages_are_marked_in_the_gutter_and_the_rule() {
+        let marker = crop_gutter(false, CropEdge::Edited, true);
+        assert_eq!(marker.content.as_ref(), " ✎ ");
+        let rule = parse_ansi("\x1b[1;36m── Message #2 · Assistant ──────────\x1b[0m");
+        let style = rule.runs[0].1;
+        let edited = labelled_rule(&rule, 40, "edited", style);
+        assert!(
+            edited
+                .plain
+                .starts_with("── Message #2 · Assistant · edited ─")
+        );
+        assert_eq!(edited.plain.width(), 40);
+        assert_eq!(edited.runs[0].1, style);
+    }
+
+    fn text_message(text: &str) -> Message {
+        Message {
+            role: txcript::common::Role::User,
+            content: vec![txcript::common::Block::Text { text: text.into() }],
+            timestamp: chrono::DateTime::UNIX_EPOCH,
+            model: None,
+            stop_reason: None,
+            usage: None,
+        }
+    }
+
+    fn editing_at(path: &std::path::Path, index: usize) -> Editing {
+        Editing {
+            index,
+            path: path.to_path_buf(),
+            original: String::new(),
+            name: "vi".into(),
+        }
     }
 
     fn press_crop(editor: &mut Cropper, code: KeyCode) {

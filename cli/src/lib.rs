@@ -54,6 +54,8 @@ use txcript::harness::{amp, chatgpt, claude_chat, simple};
 use txcript::{Codec, Common, HarnessId, Store, TextCodec, Transcript, local};
 
 pub mod cache;
+mod draft;
+mod editpane;
 mod export;
 pub mod fragment;
 mod graphics;
@@ -1150,16 +1152,24 @@ fn crop_loaded(
     let rendered = document
         .render(editor_width, view::Filters::crop())
         .ok_or_else(|| format!("cannot render a session with {total} messages"))?;
-    let Some(spans) = pager::crop(document, rendered, editor_width, initial)? else {
+    let Some(outcome) = pager::crop(document, rendered, editor_width, initial)? else {
         return Ok(ExitCode::SUCCESS);
     };
-    let mut cropped = common.crop_to(&spans).map_err(|error| error.to_string())?;
+    let mut cropped = outcome
+        .common
+        .crop_to(&outcome.spans)
+        .map_err(|error| error.to_string())?;
     fresh_identity(&mut cropped, target, None);
     stamp_live_cwd(&mut cropped, None);
     let cropped_id = write_and_report(source, target, &cropped, None)?;
+    let edited = match outcome.edited {
+        0 => String::new(),
+        1 => " (1 message edited)".to_string(),
+        count => format!(" ({count} messages edited)"),
+    };
     println!(
-        "  cropped {} as {}",
-        fragment::format_spans(&spans),
+        "  cropped {}{edited} as {}",
+        fragment::format_spans(&outcome.spans),
         style::scrub(&cropped_id)
     );
     Ok(ExitCode::SUCCESS)

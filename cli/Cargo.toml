@@ -33,6 +33,9 @@ clap_complete = "4.6.7"
 crossterm = "0.29.0"
 flate2 = "1.1.9"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+# The crop editor runs the user's editor in a pane: a pseudo-terminal, a
+# screen parsed from its output, and a widget that paints it.
+portable-pty = "0.9.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 rmcp = { version = "2.2.0", default-features = false, features = ["macros", "server", "transport-io"], optional = true }
 # Bundled SQLite is already in the graph through txcript's stores.
@@ -42,8 +45,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 terminal_size = "0.4.3"
 tokio = { version = "1.48.0", features = ["io-std", "macros", "rt"], optional = true }
+tui-term = { version = "0.3.4", default-features = false, features = ["vt100"] }
 txcript = { version = "0.12.1", path = "..", features = ["opencode", "search"] }
 unicode-width = "0.2"
+vt100 = "0.16.2"
 # v7 for codex rollouts, v4 for every other harness — see `fresh_identity`.
 uuid = { version = "1.23.4", features = ["v4", "v7"] }
 

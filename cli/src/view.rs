@@ -249,6 +249,25 @@ impl Document {
         self.common.body.len()
     }
 
+    pub(crate) fn messages(&self) -> &[Message] {
+        &self.common.body
+    }
+
+    pub(crate) fn message(&self, index: usize) -> Option<&Message> {
+        self.common.body.get(index)
+    }
+
+    /// Put `message` at `index`; later renders show it.
+    pub(crate) fn replace_message(&mut self, index: usize, message: Message) {
+        if let Some(slot) = self.common.body.get_mut(index) {
+            *slot = message;
+        }
+    }
+
+    pub(crate) const fn transcript(&self) -> &Transcript<Common> {
+        &self.common
+    }
+
     pub(crate) const fn color_enabled(&self) -> bool {
         self.color
     }
