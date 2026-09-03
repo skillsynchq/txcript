@@ -1,7 +1,7 @@
 //! Typed conversion for coding-agent session transcripts.
 //!
 //! Claude Code, Claude Chat, Cowork, Codex, `OpenCode`, pi, Campfire, Cursor,
-//! Grok, Hermes, Amp, and Antigravity record similar conversation data in
+//! Grok, Kimi, Hermes, Amp, and Antigravity record similar conversation data in
 //! different stores. This crate maps each format through [`Transcript<Common>`] and
 //! converts with [`convert::<A, B>`](convert): `A` -> [`Common`] -> `B`.
 //!

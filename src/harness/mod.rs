@@ -18,6 +18,7 @@ pub mod cursor_desktop;
 pub mod fx;
 pub mod grok;
 pub mod hermes;
+pub mod kimi;
 pub mod opencode;
 pub mod pi;
 pub mod simple;
