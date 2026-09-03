@@ -433,6 +433,7 @@ mod tests {
     }
 
     /// Wait up to two seconds for `done` to hold.
+    #[cfg(unix)]
     fn settle(mut done: impl FnMut() -> bool) -> bool {
         for _ in 0..200 {
             if done() {
