@@ -1,74 +1,64 @@
 ---
 name: release
-description: Cut a txcript release — preflight the workspace, bump versions, tag, watch the publish-crates and publish-npm workflows, and verify on crates.io and npm. Use when asked to release, publish, or ship a new version of txcript.
+description: Cut a txcript release — dispatch the prepare-release workflow, approve the plan, watch the tag publish to crates.io, npm, and GitHub Releases, and verify. Use when asked to release, publish, or ship a new version of txcript.
 argument-hint: [version]
 ---
 
 # Release txcript
 
-Publishes the `txcript` library to crates.io and the WASM package to npm via
-the tag-triggered `publish-crates` and `publish-npm` workflows. Three releases
-(v0.1.0–v0.3.0) established this procedure; follow it in order. A crates.io
-version is **permanent** — it can be yanked but never deleted or reused — so
-every gate runs before the tag exists.
+Releases are cut by two workflows. `prepare-release` computes the version
+from the conventional-commit PR titles merged since the last tag, generates
+the `CHANGELOG.md` section, bumps every manifest, and lands one commit plus
+its tag on main. The tag runs `release`, which publishes crates.io, npm, and
+CLI binaries, then creates the GitHub Release from the changelog section.
+
+Nothing runs locally. Main is releasable by construction: `ci` proves the
+crate packages, the npm bundle builds, and the CLI builds in release mode on
+every PR, and the ruleset requires PRs to be up to date before merge.
 
 ## Inputs
 
-`$ARGUMENTS`: optional target version. If absent, propose one from the diff
-since the last tag: breaking API change on 0.x → minor bump, otherwise patch.
-Confirm the version with the user before tagging — this is the one
-irreversible decision.
+`$ARGUMENTS`: optional version. Without one, the workflow derives it: a
+`feat` PR since the last tag is a minor bump, otherwise patch, and a breaking
+change stays a minor bump until 1.0. Preview locally with
+`git-cliff --bumped-version` and `git-cliff --unreleased --tag vX.Y.Z --strip all`.
 
-## Preflight (before any version edit)
+## Procedure
 
-1. Working tree clean, on `main`, up to date with origin. Uncommitted files
-   fail `cargo publish --locked`.
-2. `cargo test --workspace` — bare `cargo test` skips the CLI member.
-3. `cargo clippy --workspace --all-targets` — pedantic baseline,
-   `unwrap/expect/panic` denied in `src/`.
-4. `cargo fmt --all --check` — CI gates on this and the other preflight
-   commands do not, so unformatted code passes every check here and fails the
-   run you're waiting on before tagging (cost a round trip at v0.5.0).
-5. `cargo test --no-default-features` — the featureless build is a supported
-   surface and has broken independently of the default build before.
-6. `cargo publish --dry-run --locked -p txcript` — catches packaging errors
-   (missing metadata, dirty files) that the workflow would only surface after
-   the tag is pushed.
+1. Confirm main's latest CI run is green: `gh run list --branch main -L 3`.
+2. Dispatch: `gh workflow run prepare-release.yml` (add `-f version=X.Y.Z`
+   to override). Then `gh run watch` the run.
+3. The Plan job writes the version and changelog section to the run summary
+   and the Tag job waits on the `release` environment. Read the summary,
+   then approve in the Actions UI. This is the one irreversible decision: a
+   crates.io version can be yanked but never reused.
+4. The Tag job pushes `chore(release): vX.Y.Z` and the tag atomically. If
+   main moved mid-run it rebuilds the commit on the new head; if the derived
+   version changed because of what landed, it fails and asks for a rerun.
+5. The tag starts `release`. Watch it: `gh run list --workflow release.yml -L 1`
+   then `gh run watch <id>`. Jobs: verify, crates.io, npm, binaries for five
+   targets, GitHub Release.
 
-## Bump and tag
+## Verify
 
-1. Set the new version in **all four** places: `Cargo.toml` (root `txcript`),
-   `cli/Cargo.toml` (`txcript-cli` — `publish = false`, but its version tracks
-   the library), the `txcript = { version = … }` pin inside `cli/Cargo.toml`,
-   and `package.json` (the npm/WASM package). The pin only *has* to move on a
-   minor bump — `^0.4.0` admits 0.4.3 but not 0.5.0 — which is exactly when
-   it's easiest to forget. `package.json` had drifted three releases behind by
-   v0.5.0; the npm workflow guards tag-vs-`package.json`, so drift there is a
-   dispatch-time failure, not a tag-time one. `cargo check` once so
-   `Cargo.lock` picks up the bump; commit the lockfile with the manifests.
-2. Commit the bump, push, and confirm CI is green on that commit before
-   tagging.
-3. Annotated tag matching the manifest exactly:
-   `git tag -a v<X.Y.Z> -m "v<X.Y.Z>" && git push origin v<X.Y.Z>`.
-   The workflow's first step compares `${GITHUB_REF_NAME#v}` against the
-   manifest and hard-fails on mismatch.
+- crates.io: `cargo search txcript` or `https://crates.io/api/v1/crates/txcript`.
+- npm: `npm view txcript version`.
+- Release: `gh release view vX.Y.Z` shows the changelog notes, the package
+  links, and ten assets (five archives, five checksums).
+- `cargo binstall --git https://github.com/skillsynchq/txcript txcript-cli`
+  installs the new binary.
 
-## Watch and verify
+## When something fails
 
-1. The tag push fires **two** workflows: `publish-crates` (cargo, with
-   `cargo publish --locked -p txcript` — only the library ships) and
-   `publish-npm` (builds the WASM bundle and publishes via OIDC trusted
-   publishing — no token, npm trusts this repo + workflow filename as of
-   v0.5.0). Watch both runs (`gh run watch` in the background).
-2. Verify crates.io: `cargo search txcript` or fetch
-   `https://crates.io/api/v1/crates/txcript` and check `max_version`.
-3. Verify npm: `npm view txcript version`. If the npm run failed on its
-   version guard, `package.json` missed the bump (step 1 of Bump and tag);
-   fix the manifest, then re-dispatch on the tag is not possible — the tag
-   must carry the right `package.json`, so a failed guard means cutting a
-   patch release with the manifest fixed.
+- `verify` fails on a manifest mismatch: the tag was pushed by hand without
+  a bump. Delete nothing; run `prepare-release` for the next patch.
+- A publish job fails after the tag exists: fix forward. The crates.io
+  version may already be taken, so the next run needs a new version.
+- `release` can be rerun on an existing tag with
+  `gh workflow run release.yml --ref vX.Y.Z`; the GitHub Release step fails
+  if the release already exists, which is the intended guard.
 
 ## Report
 
-State the published version, both workflow run URLs, and the crates.io and
-npm verification results.
+State the version, the prepare and release run URLs, the release URL, and
+the crates.io and npm verification results.

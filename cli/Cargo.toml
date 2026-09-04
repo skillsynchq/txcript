@@ -62,3 +62,14 @@ tempfile = "3.27.0"
 
 [lints]
 workspace = true
+
+# Prebuilt binaries are attached to every GitHub Release, one archive per
+# target with the executable at the archive root. Install without compiling:
+#   cargo binstall --git https://github.com/skillsynchq/txcript txcript-cli
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/txcript-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

@@ -2,7 +2,8 @@ name: ci
 
 # The quality gate: every push and PR runs the same checks the publish tags
 # assume. Formatting, the full clippy deny set, tests across all features,
-# the wasm32 build, and the declared MSRV.
+# the wasm32 build, the declared MSRV, and the packaging steps the release
+# performs: crate dry-run, npm bundle, and a release build of the CLI.
 on:
   push:
     branches: [main]
@@ -69,3 +70,49 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo check --workspace --all-features
+
+  # Publish readiness. Every merged head must be releasable as-is, so the
+  # packaging steps the release runs are proven here, on the PR.
+  crate-package:
+    name: crates.io package (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo publish --dry-run --locked -p txcript
+
+  npm-package:
+    name: npm package (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.126
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun run build
+      - run: npm pack --dry-run --ignore-scripts
+
+  cli-release-build:
+    name: CLI release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo build --release --locked -p txcript-cli
+      - run: ./target/release/txcript --version

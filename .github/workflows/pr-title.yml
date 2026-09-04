@@ -1,0 +1,34 @@
+name: pr-title
+
+# Every PR title must be a conventional commit. Squash merges make the title
+# the commit on main, and the changelog and version bump are computed from
+# those commits, so an off-format title means a missing changelog line or a
+# wrong version.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check:
+    name: PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            revert
+            docs
+            test
+            build
+            ci
+            chore
+            style
