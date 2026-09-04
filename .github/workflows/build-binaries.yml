@@ -1,0 +1,81 @@
+name: build-binaries
+
+# Builds the CLI for every supported target and uploads one archive per
+# target as a workflow artifact. release.yml calls it and attaches the
+# archives to the GitHub Release; the matrix also runs on PRs that touch
+# this file so a broken target is caught before a tag depends on it.
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/build-binaries.yml
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # Static Linux binaries: bundled SQLite compiles with the musl C toolchain.
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - run: cargo build --release --locked -p txcript-cli --target ${{ matrix.target }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          name="txcript-${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/txcript" LICENSE dist/
+          tar -czf "$name.tar.gz" -C dist txcript LICENSE
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          ./dist/txcript --version
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "txcript-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/txcript.exe", LICENSE dist/
+          Compress-Archive -Path dist/txcript.exe, dist/LICENSE -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          & ./dist/txcript.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: txcript-${{ matrix.target }}
+          path: |
+            txcript-${{ matrix.target }}.tar.gz
+            txcript-${{ matrix.target }}.tar.gz.sha256
+            txcript-${{ matrix.target }}.zip
+            txcript-${{ matrix.target }}.zip.sha256
+          if-no-files-found: error

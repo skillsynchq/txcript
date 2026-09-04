@@ -1,0 +1,122 @@
+name: release
+
+# Publishes a version tag: the library to crates.io, the WASM package to npm,
+# CLI binaries for every target, and the GitHub Release with notes from the
+# CHANGELOG.md section. The release is created only after every publish
+# succeeded, so a release page never points at a package that isn't there.
+#
+# Tags come from prepare-release.yml. A hand-pushed `vX.Y.Z` tag works too,
+# as long as the manifests and changelog already carry that version.
+#
+# npm trusted publishing is bound to this filename. crates.io uses the
+# CARGO_REGISTRY_TOKEN secret.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches every manifest
+        id: v
+        run: |
+          set -eu
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) echo "::error::run this on a version tag, got $GITHUB_REF"; exit 1 ;; esac
+          tag="${GITHUB_REF_NAME#v}"
+          cargo="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          cli="$(grep -m1 '^version = ' cli/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          npm="$(node -p "require('./package.json').version")"
+          echo "tag=$tag Cargo.toml=$cargo cli/Cargo.toml=$cli package.json=$npm"
+          for v in "$cargo" "$cli" "$npm"; do
+            [ "$tag" = "$v" ] || { echo "::error::tag $tag does not match every manifest"; exit 1; }
+          done
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+      - name: Changelog has this version
+        run: .github/scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md && cat notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+
+  crates-io:
+    name: Publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Only the library goes to crates.io; the cli crate is publish = false.
+      - run: cargo publish --locked -p txcript
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  npm:
+    name: Publish to npm
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.126
+      # The build script runs through Bun; npm still invokes the prepare
+      # lifecycle during publish, so Bun must be on PATH.
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1; Node 24 can bundle older.
+      - run: npm install -g npm@latest
+      - run: bun run build
+      - run: npm publish --access public --ignore-scripts
+
+  binaries:
+    name: Build CLI binaries
+    needs: verify
+    uses: ./.github/workflows/build-binaries.yml
+
+  github-release:
+    name: Create GitHub Release
+    needs: [verify, crates-io, npm, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release with notes and binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ls -R artifacts
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file artifacts/release-notes/notes.md \
+            artifacts/txcript-*/txcript-*

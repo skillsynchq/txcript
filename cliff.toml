@@ -1,0 +1,53 @@
+# git-cliff configuration: one CHANGELOG.md section per release, generated
+# from the conventional-commit PR titles merged since the previous tag.
+# The prepare-release workflow runs it; run `git-cliff --unreleased --tag
+# vX.Y.Z --strip all` locally to preview the next section.
+
+[changelog]
+trim = true
+# Rendered once per release. The heading carries the compare link so the
+# file stays self-contained without a reference list at the bottom.
+body = """
+## [{{ version | trim_start_matches(pat="v") }}]\
+{% if previous.version %}(https://github.com/skillsynchq/txcript/compare/{{ previous.version }}...{{ version }}){% endif %} \
+- {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.breaking %}**Breaking:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+# Squash merges leave "(#N)" on the subject; turn it into a PR link.
+postprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/skillsynchq/txcript/pull/${1}))" },
+]
+
+[git]
+conventional_commits = true
+# A subject that escapes the PR-title check still lands under Changed
+# instead of vanishing from the changelog.
+filter_unconventional = false
+split_commits = false
+# The hidden numeric prefix fixes the section order; `striptags` removes it.
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^fix", group = "<!-- 2 -->Fixed" },
+  { message = "^perf", group = "<!-- 1 -->Changed" },
+  { message = "^refactor", group = "<!-- 1 -->Changed" },
+  { message = "^revert", group = "<!-- 3 -->Removed" },
+  { message = "^(chore|ci|docs|test|build|style)", skip = true },
+  { message = ".*", group = "<!-- 1 -->Changed" },
+]
+filter_commits = false
+tag_pattern = "v[0-9].*"
+topo_order = false
+sort_commits = "oldest"
+
+[bump]
+# Pre-1.0 policy, matching the release skill: a feature is a minor bump, a
+# breaking change is a minor bump too until 1.0.
+features_always_bump_minor = true
+breaking_always_bump_major = false
+initial_tag = "v0.1.0"

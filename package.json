@@ -2,7 +2,18 @@
   "name": "txcript",
   "version": "0.12.1",
   "description": "Convert coding-agent session transcripts between harness formats.",
+  "keywords": [
+    "transcript",
+    "claude",
+    "codex",
+    "agent",
+    "wasm"
+  ],
   "license": "Apache-2.0",
+  "homepage": "https://github.com/skillsynchq/txcript#readme",
+  "bugs": {
+    "url": "https://github.com/skillsynchq/txcript/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/skillsynchq/txcript.git"

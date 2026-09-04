@@ -1,0 +1,131 @@
+name: prepare-release
+
+# Cuts a release. Computes the next version from the conventional commits
+# since the last tag (or takes one as input), generates the changelog
+# section, bumps every manifest, and pushes the release commit and its tag
+# to main in one atomic push. The tag then runs release.yml.
+#
+# Main is releasable by construction (ci.yml proves packaging on every PR),
+# so this workflow only proves the bump it adds. If main moves while it
+# runs, the push is rejected and the release commit is rebuilt on the new
+# head; nothing partial ever lands.
+#
+# Pushes as the release GitHub App, which bypasses the main and tag
+# rulesets and whose pushes trigger workflows (GITHUB_TOKEN's do not).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z). Leave empty to derive it from the commits since the last tag."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One release at a time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.14.1
+      - name: Resolve version
+        id: version
+        run: |
+          set -eu
+          input='${{ inputs.version }}'
+          if [ -n "$input" ]; then
+            ver="${input#v}"
+          else
+            ver="$(git-cliff --bumped-version 2>/dev/null)"
+            ver="${ver#v}"
+          fi
+          echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not a version: $ver"; exit 1; }
+          current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          [ "$ver" != "$current" ] || { echo "::error::$ver is already the current version"; exit 1; }
+          [ "$(printf '%s\n%s\n' "$current" "$ver" | sort -V | tail -1)" = "$ver" ] || { echo "::error::$ver is below current $current"; exit 1; }
+          ! git rev-parse -q --verify "refs/tags/v$ver" >/dev/null || { echo "::error::tag v$ver already exists"; exit 1; }
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+      - name: Show the plan
+        run: |
+          {
+            echo "## Release v${{ steps.version.outputs.version }}"
+            echo
+            echo "Head: \`$(git rev-parse --short HEAD)\` (${{ github.ref_name }})"
+            echo
+            git-cliff --unreleased --tag "v${{ steps.version.outputs.version }}" --strip all 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    name: Tag main
+    needs: plan
+    runs-on: ubuntu-latest
+    # Required reviewer on the environment is the approval step: the plan
+    # above is in the run summary when the button appears.
+    environment: release
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.14.1
+      - name: Commit as the release App
+        run: |
+          id="$(gh api "/users/${{ steps.app.outputs.app-slug }}[bot]" --jq .id)"
+          git config user.name '${{ steps.app.outputs.app-slug }}[bot]'
+          git config user.email "${id}+${{ steps.app.outputs.app-slug }}[bot]@users.noreply.github.com"
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+      - name: Build the release commit and push it with its tag
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          tag="v$VERSION"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset -q --hard origin/main
+            git tag -d "$tag" 2>/dev/null || true
+            # Without an explicit version, the bump must still be what was
+            # approved; a feat landing mid-run would change it.
+            if [ -z '${{ inputs.version }}' ]; then
+              now="$(git-cliff --bumped-version 2>/dev/null)"
+              [ "${now#v}" = "$VERSION" ] || { echo "::error::main moved and the derived version is now ${now#v}, not $VERSION; rerun"; exit 1; }
+            fi
+            git-cliff --unreleased --tag "$tag" --strip all 2>/dev/null > section.md
+            .github/scripts/changelog-insert.sh section.md
+            rm section.md
+            .github/scripts/bump-version.sh "$VERSION"
+            cargo publish --dry-run --locked -p txcript
+            git add Cargo.toml Cargo.lock cli/Cargo.toml package.json CHANGELOG.md
+            git commit -q -m "chore(release): $tag"
+            git tag -a "$tag" -m "$tag"
+            if git push --atomic origin HEAD:main "refs/tags/$tag"; then
+              echo "pushed $tag on $(git rev-parse --short HEAD) (attempt $attempt)"
+              exit 0
+            fi
+            echo "main moved during attempt $attempt; rebuilding on the new head"
+          done
+          echo "::error::could not land the release commit after 5 attempts"
+          exit 1
