@@ -5,7 +5,7 @@ name: pr-title
 # those commits, so an off-format title means a missing changelog line or a
 # wrong version.
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
