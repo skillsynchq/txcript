@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "txcript"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "aes",
  "base64",
@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "txcript-cli"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "base64",
  "chrono",
