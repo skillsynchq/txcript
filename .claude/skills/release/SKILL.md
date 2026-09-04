@@ -6,9 +6,10 @@ argument-hint: [version]
 
 # Release txcript
 
-Publishes the `txcript` library to crates.io and the WASM package to npm via
-the tag-triggered `publish-crates` and `publish-npm` workflows. Three releases
-(v0.1.0–v0.3.0) established this procedure; follow it in order. A crates.io
+Publishes the `txcript` library to crates.io, the WASM package to npm, and a
+GitHub Release with notes, via the tag-triggered `publish-crates`,
+`publish-npm`, and `release` workflows. Three releases (v0.1.0–v0.3.0)
+established this procedure; follow it in order. A crates.io
 version is **permanent** — it can be yanked but never deleted or reused — so
 every gate runs before the tag exists.
 
@@ -46,20 +47,30 @@ irreversible decision.
    v0.5.0; the npm workflow guards tag-vs-`package.json`, so drift there is a
    dispatch-time failure, not a tag-time one. `cargo check` once so
    `Cargo.lock` picks up the bump; commit the lockfile with the manifests.
-2. Commit the bump, push, and confirm CI is green on that commit before
-   tagging.
-3. Annotated tag matching the manifest exactly:
+2. Update `CHANGELOG.md`: rename the `## [Unreleased]` section to
+   `## [X.Y.Z] - YYYY-MM-DD`, open a fresh empty `## [Unreleased]` above it,
+   and add the `[X.Y.Z]: …/compare/v<prev>...vX.Y.Z` link at the bottom
+   (repoint `[Unreleased]` at the new tag). Every user-visible change since
+   the last tag must be under Added/Changed/Fixed/Removed. The `release`
+   workflow takes the GitHub Release notes from this section and **fails the
+   tag** when the section is missing, so check it locally first:
+   `.github/scripts/release-notes.sh X.Y.Z`.
+3. Commit the bump and changelog together, push, and confirm CI is green on
+   that commit before tagging.
+4. Annotated tag matching the manifest exactly:
    `git tag -a v<X.Y.Z> -m "v<X.Y.Z>" && git push origin v<X.Y.Z>`.
    The workflow's first step compares `${GITHUB_REF_NAME#v}` against the
    manifest and hard-fails on mismatch.
 
 ## Watch and verify
 
-1. The tag push fires **two** workflows: `publish-crates` (cargo, with
-   `cargo publish --locked -p txcript` — only the library ships) and
+1. The tag push fires **three** workflows: `publish-crates` (cargo, with
+   `cargo publish --locked -p txcript` — only the library ships),
    `publish-npm` (builds the WASM bundle and publishes via OIDC trusted
    publishing — no token, npm trusts this repo + workflow filename as of
-   v0.5.0). Watch both runs (`gh run watch` in the background).
+   v0.5.0), and `release` (creates the GitHub Release with the changelog
+   section as notes). Watch all three runs (`gh run watch` in the
+   background).
 2. Verify crates.io: `cargo search txcript` or fetch
    `https://crates.io/api/v1/crates/txcript` and check `max_version`.
 3. Verify npm: `npm view txcript version`. If the npm run failed on its
@@ -67,8 +78,10 @@ irreversible decision.
    fix the manifest, then re-dispatch on the tag is not possible — the tag
    must carry the right `package.json`, so a failed guard means cutting a
    patch release with the manifest fixed.
+4. Verify the release: `gh release view vX.Y.Z` shows the changelog notes and
+   the crates.io / npm / docs.rs links.
 
 ## Report
 
-State the published version, both workflow run URLs, and the crates.io and
-npm verification results.
+State the published version, the three workflow run URLs, the GitHub Release
+URL, and the crates.io and npm verification results.

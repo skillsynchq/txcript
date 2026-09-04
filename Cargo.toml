@@ -39,6 +39,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "Convert coding-agent session transcripts between harness formats."
 license = "Apache-2.0"
+homepage = "https://github.com/skillsynchq/txcript"
 repository = "https://github.com/skillsynchq/txcript"
 readme = "README.md"
 keywords = ["transcript", "claude", "codex", "agent", "wasm"]

@@ -1,0 +1,37 @@
+name: release
+
+# Creates the GitHub Release for a version tag, with notes taken from the
+# matching CHANGELOG.md section. Runs alongside publish-crates and
+# publish-npm on the same tag push. A tag whose version has no changelog
+# section fails here, so every release ships with notes.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag=$tag manifest=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag $tag != Cargo.toml version $ver"; exit 1; }
+      - name: Release notes from CHANGELOG.md
+        run: .github/scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md
