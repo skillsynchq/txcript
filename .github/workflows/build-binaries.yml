@@ -25,10 +25,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
+          # Linux links glibc; the 22.04 runners set the floor at glibc 2.35.
+          # musl is out: the live harnesses build BoringSSL, which needs a
+          # C++ toolchain the musl tools do not provide.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
           - target: x86_64-apple-darwin
             os: macos-15-intel
           - target: aarch64-apple-darwin
@@ -43,13 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # Static Linux binaries: bundled SQLite compiles with the musl C toolchain.
-      - if: contains(matrix.target, 'musl')
-        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
       - run: cargo build --release --locked -p txcript-cli --target ${{ matrix.target }}
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
