@@ -117,9 +117,11 @@ jobs:
             .github/scripts/changelog-insert.sh section.md
             rm section.md
             .github/scripts/bump-version.sh "$VERSION"
-            cargo publish --dry-run --locked -p txcript
             git add Cargo.toml Cargo.lock cli/Cargo.toml package.json CHANGELOG.md
             git commit -q -m "chore(release): $tag"
+            # The dry-run packages the committed tree, so it runs after the
+            # commit; it proves the bump, not main (ci.yml already did).
+            cargo publish --dry-run --locked -p txcript
             git tag -a "$tag" -m "$tag"
             if git push --atomic origin HEAD:main "refs/tags/$tag"; then
               echo "pushed $tag on $(git rev-parse --short HEAD) (attempt $attempt)"
