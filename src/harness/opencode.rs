@@ -413,10 +413,12 @@ fn build_export(meta: &Meta, messages: &[Message]) -> Export {
                 }
             }
         }
-        out.push(MessageRecord {
-            info: Value::Object(info),
-            parts,
-        });
+        if !parts.is_empty() || matches!(msg.role, Role::Assistant) {
+            out.push(MessageRecord {
+                info: Value::Object(info),
+                parts,
+            });
+        }
         idx += 1;
     }
 
@@ -523,27 +525,26 @@ fn assistant_part(
                 "metadata": {},
                 "time": time,
             });
-            // Fold the immediately-following ToolResult into state.output.
+            // Fold matching ToolResult from the following user turn into state.output.
             if let Some(next) = messages.get(*idx + 1)
                 && matches!(next.role, Role::User)
-                && next.content.len() == 1
-                && let Block::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = &next.content[0]
-                && tool_use_id == id
+                && let Some(result) = next.content.iter().find_map(|b| match b {
+                    Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } if tool_use_id == id => Some((content, *is_error)),
+                    _ => None,
+                })
+                && let Value::Object(obj) = &mut state
             {
-                if let Value::Object(obj) = &mut state {
-                    if *is_error {
-                        obj.insert("status".into(), json!("error"));
-                        obj.insert("error".into(), json!(output_to_string(content)));
-                        obj.remove("output");
-                    } else {
-                        obj.insert("output".into(), json!(output_to_string(content)));
-                    }
+                if result.1 {
+                    obj.insert("status".into(), json!("error"));
+                    obj.insert("error".into(), json!(output_to_string(result.0)));
+                    obj.remove("output");
+                } else {
+                    obj.insert("output".into(), json!(output_to_string(result.0)));
                 }
-                *idx += 1;
             }
             json!({ "type": "tool", "tool": oc_name, "callID": id, "state": state })
         }
