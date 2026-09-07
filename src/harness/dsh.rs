@@ -3,11 +3,13 @@
 //! Official persistence writes one append-only JSONL log per session, Zstandard
 //! framed by default (`session.jsonl.zstd`). The first line is a `type: session`
 //! header; the rest are `SessionEvent` records (and packed `*-chunks` rows).
-//! There is no documented session-import CLI, the on-disk format is version 0
-//! with no migration, and the persistence seam has no delete API, so
-//! [`DshStore`] is read-only: sessions can be discovered, loaded, searched,
-//! exported, and converted into another harness, but txcript never writes
-//! `~/.dsh/sessions`.
+//!
+//! dsh finds sessions by walking its root, so no import command is needed —
+//! but it also validates what it finds, and three of its checks fail the
+//! *whole* listing rather than skipping one session: a first Zstandard frame
+//! that is not exactly the header line, a header whose id and cwd do not name
+//! the path it was found at, and a root that mixes `.jsonl` with
+//! `.jsonl.zstd`. Writing therefore reproduces dsh's own layout exactly.
 //!
 //! Native body retains the header and every log line as raw JSON, including
 //! packed chunk rows and unknown event types. The Common projection uses the
@@ -77,7 +79,7 @@ impl Codec for Dsh {
     }
 }
 
-/// Read-only access to `dsh` session directories.
+/// Read/write access to `dsh` session directories.
 #[derive(Debug, Clone)]
 pub struct DshStore {
     pub sessions_dir: PathBuf,
@@ -152,12 +154,45 @@ impl Store for DshStore {
         Ok(Transcript::new(meta, body))
     }
 
-    fn save(&self, _transcript: &Transcript<Dsh>) -> Result<Saved<PathBuf>> {
-        Err(read_only_error())
+    fn save(&self, transcript: &Transcript<Dsh>) -> Result<Saved<PathBuf>> {
+        let id = session_id(transcript);
+        let cwd = session_cwd(transcript);
+        let dir = self
+            .sessions_dir
+            .join(project_key(cwd.as_deref()))
+            .join(encode_segment(&id)?);
+
+        let mut body = transcript.body.clone();
+        stamp_identity(&mut body.header, &id, cwd.as_deref());
+
+        self.retire_other_copies(&id, &dir);
+        fs::create_dir_all(&dir)?;
+        let compressed = self.root_compresses();
+        let log = dir.join(if compressed {
+            "session.jsonl.zstd"
+        } else {
+            "session.jsonl"
+        });
+        let bytes = if compressed {
+            encode_log(&body)?
+        } else {
+            plain_log(&body)?.into_bytes()
+        };
+        fs::write(&log, bytes)?;
+        // The opposite encoding in the same session directory is the same
+        // poison as one elsewhere in the root, and a re-save that switched
+        // encodings would leave it behind.
+        let _ = fs::remove_file(dir.join(if compressed {
+            "session.jsonl"
+        } else {
+            "session.jsonl.zstd"
+        }));
+        Ok(Saved { id, reference: dir })
     }
 
-    fn delete(&self, _reference: &PathBuf) -> Result<()> {
-        Err(read_only_error())
+    fn delete(&self, reference: &PathBuf) -> Result<()> {
+        fs::remove_dir_all(reference)?;
+        Ok(())
     }
 
     fn fingerprints(&self, refs: &[PathBuf]) -> Result<HashMap<String, String>> {
@@ -171,11 +206,228 @@ impl Store for DshStore {
     }
 }
 
-fn read_only_error() -> Error {
-    Error::Unconvertible {
-        harness: Dsh::NAME,
-        detail: "dsh session storage is read-only in txcript; dsh has no documented session import command and its persistence seam does not delete logs".to_string(),
+impl DshStore {
+    /// Whether a new log should be Zstandard framed.
+    ///
+    /// dsh refuses to list *any* session in a root that holds both `.jsonl`
+    /// and `.jsonl.zstd` artifacts — under either configuration, not just the
+    /// mismatched one. So the root's existing artifacts decide, and only an
+    /// empty root falls back to dsh's own default of `zstd`.
+    /// Remove copies of `id` filed under a different project directory.
+    ///
+    /// A session's project directory is keyed by its cwd, so a re-save after a
+    /// cwd change lands somewhere new. dsh treats one id under two project
+    /// directories as corruption and fails its whole listing, so the stale copy
+    /// cannot stay. Best effort: a copy that cannot be removed is not worth
+    /// failing an otherwise good write over.
+    fn retire_other_copies(&self, id: &str, keep: &Path) {
+        let Ok(encoded) = encode_segment(id) else {
+            return;
+        };
+        let Ok(projects) = fs::read_dir(&self.sessions_dir) else {
+            return;
+        };
+        for project in projects.flatten().map(|entry| entry.path()) {
+            let candidate = project.join(&encoded);
+            if candidate != keep && log_path(&candidate).is_some() {
+                let _ = fs::remove_dir_all(&candidate);
+            }
+        }
     }
+
+    fn root_compresses(&self) -> bool {
+        let Ok(projects) = fs::read_dir(&self.sessions_dir) else {
+            return true;
+        };
+        for project in projects.flatten().map(|entry| entry.path()) {
+            let Ok(sessions) = fs::read_dir(&project) else {
+                continue;
+            };
+            for session_dir in sessions.flatten().map(|entry| entry.path()) {
+                if session_dir.join("session.jsonl.zstd").is_file() {
+                    return true;
+                }
+                if session_dir.join("session.jsonl").is_file() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// `meta` is the canonical identity, not the retained native header: a copy is
+/// given a new id and timestamp before it is written, and the header it
+/// inherited still names the original.
+fn session_id(transcript: &Transcript<Dsh>) -> String {
+    if !transcript.meta.id.is_empty() {
+        return transcript.meta.id.clone();
+    }
+    transcript
+        .body
+        .header
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map_or_else(
+            || format!("session-{}", Uuid::new_v5(&NS, b"empty-id")),
+            String::from,
+        )
+}
+
+fn session_cwd(transcript: &Transcript<Dsh>) -> Option<String> {
+    transcript
+        .meta
+        .cwd
+        .clone()
+        .or_else(|| {
+            transcript
+                .body
+                .header
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .filter(|cwd| !cwd.is_empty())
+}
+
+/// dsh cross-checks a log it finds against the path its own header would
+/// name, and a mismatch fails the whole listing rather than skipping the one
+/// session. So the header is stamped with the id and cwd that built the path.
+fn stamp_identity(header: &mut Value, id: &str, cwd: Option<&str>) {
+    let Some(object) = header.as_object_mut() else {
+        return;
+    };
+    object.insert("id".to_string(), json!(id));
+    match cwd {
+        Some(cwd) => {
+            object.insert("cwd".to_string(), json!(cwd));
+        }
+        // `cwd: null` is not the same as an absent `cwd`: dsh keys `_no-cwd`
+        // off `undefined`, and a null would not round-trip through its header
+        // schema.
+        None => {
+            object.remove("cwd");
+        }
+    }
+}
+
+/// dsh's `encodeSegment`: injective over UTF-16 code units, which is what
+/// neutralizes `..`, absolute paths, and separators in an id that is otherwise
+/// an unvalidated string.
+fn encode_segment(raw: &str) -> Result<String> {
+    use std::fmt::Write as _;
+
+    if raw.is_empty() {
+        return Err(Error::Unconvertible {
+            harness: Dsh::NAME,
+            detail: "a dsh session id cannot be empty".to_string(),
+        });
+    }
+    match raw {
+        "." => return Ok("~002E".to_string()),
+        ".." => return Ok("~002E~002E".to_string()),
+        _ => {}
+    }
+    let mut out = String::with_capacity(raw.len());
+    for unit in raw.encode_utf16() {
+        match char::from_u32(u32::from(unit)) {
+            Some(ch) if is_path_safe(ch) => out.push(ch),
+            _ => {
+                let _ = write!(out, "~{unit:04X}");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// dsh's `projectKey`: separators collapse to a single `-`, unsafe units take
+/// the same `~XXXX` escape, and the result is wrapped in `--`. Deliberately
+/// lossy — it groups sessions for humans, and the session id below it is what
+/// identifies them.
+fn project_key(cwd: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let Some(cwd) = cwd else {
+        return "_no-cwd".to_string();
+    };
+    let mut readable = String::with_capacity(cwd.len());
+    let mut separator_run = false;
+    for unit in cwd.encode_utf16() {
+        match char::from_u32(u32::from(unit)) {
+            Some('/' | '\\' | ':') => {
+                if !separator_run {
+                    readable.push('-');
+                }
+                separator_run = true;
+            }
+            Some(ch) if is_path_safe(ch) => {
+                readable.push(ch);
+                separator_run = false;
+            }
+            _ => {
+                let _ = write!(readable, "~{unit:04X}");
+                separator_run = false;
+            }
+        }
+    }
+    // Every retained unit is ASCII — safe characters are, and escapes are —
+    // so truncating by byte matches dsh's truncation by UTF-16 unit.
+    let trimmed = readable.trim_start_matches('-');
+    let name = if trimmed.is_empty() { "root" } else { trimmed };
+    format!("--{}--", &name[..name.len().min(251)])
+}
+
+fn is_path_safe(ch: char) -> bool {
+    ch != '~' && (ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+/// The uncompressed artifact: the header line, then one line per event.
+fn plain_log(body: &DshSession) -> Result<String> {
+    Ok(format!("{}{}", header_line(body)?, event_lines(body)?))
+}
+
+/// The Zstandard artifact: one frame holding exactly the header line, then one
+/// holding the event lines. dsh checks that the first frame decodes to a
+/// single line, so the split is part of the format, not a writer's choice.
+fn encode_log(body: &DshSession) -> Result<Vec<u8>> {
+    let mut out = compress_frame(header_line(body)?.as_bytes())?;
+    out.extend(compress_frame(event_lines(body)?.as_bytes())?);
+    Ok(out)
+}
+
+fn header_line(body: &DshSession) -> Result<String> {
+    Ok(format!("{}\n", serde_json::to_string(&body.header)?))
+}
+
+fn event_lines(body: &DshSession) -> Result<String> {
+    let lines = body
+        .events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n");
+    Ok(format!("{lines}\n"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compress_frame(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+
+    // dsh compresses every frame with the content checksum enabled, and
+    // validates it on read.
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)?;
+    encoder.include_checksum(true)?;
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish()?)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn compress_frame(_bytes: &[u8]) -> Result<Vec<u8>> {
+    Err(Error::Malformed {
+        harness: Dsh::NAME,
+        detail: "zstd session logs cannot be written in wasm".to_string(),
+    })
 }
 
 fn log_path(session_dir: &Path) -> Option<PathBuf> {

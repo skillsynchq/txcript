@@ -94,7 +94,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | JSON session dir | ⇄ | ✓ | [spec](docs/formats/grok.md) |
-| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `dsh` | `~/.dsh/sessions/` | zstd JSONL event log | → | — | [spec](docs/formats/dsh.md) |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `dsh` | `~/.dsh/sessions/` | zstd JSONL event log | ⇄ | ✓ | [spec](docs/formats/dsh.md) |
 | [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | event-log session dir | ⇄ | ✓ | [spec](docs/formats/fx.md) |
 | Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](docs/formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | thread JSON | → | — <sup>1</sup> | [spec](docs/formats/amp.md) |
@@ -113,11 +113,16 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 
 ### DeepSeek Harness
 
-DeepSeek Harness (`dsh`) is supported as a read-only source. Sessions are
-discovered from `$DSH_HOME/sessions` (default `~/.dsh/sessions`) and can be
-searched, exported, or continued into another harness. dsh has no documented
-session import command and its persistence seam does not delete logs, so
-txcript never writes into the session store. See
+Sessions are discovered from `$DSH_HOME/sessions` (default `~/.dsh/sessions`).
+dsh ships no session import command, but it finds sessions by walking that
+root, so txcript writes the layout it scans for.
+
+It also validates what it finds, and three of its checks fail the whole listing
+rather than skipping one session: the first Zstandard frame must decode to
+exactly the header line, the header's id and cwd must name the path it was
+found at, and a root must not mix `.jsonl` with `.jsonl.zstd`. Writes reproduce
+dsh's own derivation rather than approximating it, and were verified by running
+the official persistence backend against a txcript-written root. See
 [`docs/formats/dsh.md`](docs/formats/dsh.md).
 
 ## Install

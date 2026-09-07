@@ -63,17 +63,54 @@ full log even though Common shows the model-visible surface.
 
 ## Store capabilities
 
-DeepSeek Harness has no documented session-import CLI. The persistence seam
-also has no delete API. The txcript dsh store is therefore **read-only**:
+The store reads and writes. dsh ships no session-import command, but it does
+not need one: it discovers sessions by walking its root, so writing one is a
+matter of reproducing the layout it scans for.
 
-- `list`, `query`, `view`, and `export` work;
-- a dsh session can be converted into any writable target harness;
-- `save` and `delete` return an explicit read-only error;
-- txcript never writes directly into `~/.dsh/sessions`.
+What makes that exact rather than approximate is dsh's validation. Three of its
+checks fail the **entire** listing rather than skipping the one bad session, so
+each is a hard requirement on the writer:
+
+| Check | Requirement |
+| --- | --- |
+| `assertZstdHeaderFrame` | the first Zstandard frame decodes to exactly one line — the header |
+| `assertStoredIdentity` | the header's own `id` and `cwd` name the path the log was found at |
+| `checkRootEncoding` | one root never mixes `.jsonl` with `.jsonl.zstd` |
+
+A duplicate session id across two project directories is rejected the same way.
+
+### Layout derivation
+
+- **Project directory** — `--<key>--`, where `key` collapses each run of `/`,
+  `\`, or `:` to a single `-`, keeps `[A-Za-z0-9._-]`, escapes every other
+  UTF-16 code unit as `~XXXX`, strips leading dashes, falls back to `root` if
+  nothing remains, and truncates to 251 characters. A session with no cwd goes
+  under `_no-cwd`.
+- **Session directory** — the id under the same `~XXXX` escape, with `.` and
+  `..` special-cased whole. This is what contains a traversing id: escaping the
+  separators turns `../../evil` into the literal directory
+  `..~002F..~002Fevil`.
+
+Escaping operates on UTF-16 code units, not Unicode scalars, which is what
+makes it injective over lone surrogates.
+
+### What `save` writes
+
+`<root>/<project>/<encoded id>/session.jsonl.zstd` — a checksummed Zstandard
+frame holding the header line, then one holding the event lines. The header is
+stamped with the id and cwd that built the path, because a copy given a new
+identity would otherwise keep pointing at the original's.
+
+The physical encoding follows whatever the root already uses; only an empty
+root falls back to dsh's own default of `zstd`. Re-saving a session whose cwd
+changed removes the copy under the old project directory, since leaving it
+would be the duplicate-id corruption above.
+
+`delete` removes the session directory. dsh's persistence seam has no delete
+API, but it also keeps no index — an absent directory is simply not scanned.
 
 The native resume command documented for a TUI profile is
-`dsh --profile tui --resume <id>`. Cross-harness continuation is supported;
-native dsh continuation is refused.
+`dsh --profile tui --resume <id>`.
 
 ## Provenance
 
@@ -81,7 +118,16 @@ Open source. Layout and event vocabulary follow the DeepSeek Harness
 packages `@deepseek-ai/dsh-session` and
 `@deepseek-ai/dsh-session-persistence-jsonl` (session format version 0,
 developer preview; the project warns of compatibility-breaking changes).
-The reader was also checked against a local `session.jsonl.zstd` written by
-dsh around 2026-08-14.
+The path derivation, frame layout, and validation rules above are that
+package's own `encodeSegment`, `projectKey`, `encodeMaterialization`, and
+`listArtifacts`.
 
-Last verified: 2026-08-29
+The reader was checked against a local `session.jsonl.zstd` written by dsh
+around 2026-08-14. The writer was checked by running the official backend's
+`listArtifacts` and `loadStored` against a txcript-written root: it lists the
+session and decodes all 1148 of its event records. Compressing the log as one
+frame instead of two — which txcript itself still reads — makes that same check
+fail with dsh's `first frame is not exactly one header line`.
+
+Last verified: 2026-09-07, against `@deepseek-ai/dsh-session-persistence-jsonl`
+0.0.1-rc.1.

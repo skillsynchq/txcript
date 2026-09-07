@@ -4,7 +4,7 @@
 
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
-use txcript::harness::{campfire, claude_code, codex, grok, pi};
+use txcript::harness::{campfire, claude_code, codex, dsh, grok, pi};
 use txcript::{Codec, Common, Store, Transcript};
 
 #[cfg(feature = "opencode")]
@@ -104,6 +104,17 @@ fn grok_delete_removes_the_session_directory() {
         leftover_sessions.is_empty(),
         "no files left behind: {leftover_sessions:?}"
     );
+}
+
+#[test]
+fn dsh_delete_removes_the_session_directory() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let store = dsh::DshStore::new(dir.path().to_path_buf());
+    roundtrip(&store);
+    // dsh scans project directories for session directories, so an empty
+    // project directory is harmless — a leftover log is not.
+    let leftovers: Vec<_> = walk_files(dir.path());
+    assert!(leftovers.is_empty(), "no log left behind: {leftovers:?}");
 }
 
 #[cfg(feature = "opencode")]

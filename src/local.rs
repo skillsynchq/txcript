@@ -717,10 +717,13 @@ pub fn write(
             common,
             |s| s.sessions_dir,
         ),
-        HarnessId::Dsh => Err(Error::Unconvertible {
-            harness: "dsh",
-            detail: "DeepSeek Harness session storage is read-only and dsh has no documented session import command; sessions can be converted from dsh, but not continued into it".to_string(),
-        }),
+        HarnessId::Dsh => go(
+            dsh::DshStore::default_root(),
+            dsh::DshStore::new,
+            root,
+            common,
+            |s| s.sessions_dir,
+        ),
         HarnessId::Fx => go(
             fx::FxStore::default_root(),
             fx::FxStore::new,

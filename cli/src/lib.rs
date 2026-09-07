@@ -928,6 +928,13 @@ mod identity_tests {
     }
 
     #[test]
+    fn dsh_can_be_continued_in_place() {
+        // Only the two pull-only remote sources are refused here. dsh is a
+        // local store txcript writes, so it takes the normal write path.
+        assert!(ensure_resumable_source(HarnessId::Dsh, HarnessId::Dsh).is_ok());
+    }
+
+    #[test]
     fn resume_alias_is_accepted_for_continue_command() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["txcript", "resume", "session-123"]).unwrap();
@@ -1609,11 +1616,6 @@ fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), S
     } else if source == HarnessId::ChatGpt && target == HarnessId::ChatGpt {
         Err(
             "ChatGPT is pull-only: choose another --with harness; txcript never continues conversations in ChatGPT"
-                .to_string(),
-        )
-    } else if source == HarnessId::Dsh && target == HarnessId::Dsh {
-        Err(
-            "DeepSeek Harness is read-only: choose another --with harness; txcript never writes dsh session logs"
                 .to_string(),
         )
     } else {
