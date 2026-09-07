@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use crate::common;
 use crate::harness::{
     amp, antigravity, campfire, chatgpt, claude_chat, claude_code, codex, cowork, cursor,
-    cursor_desktop, fx, grok, hermes, opencode, pi, simple,
+    cursor_desktop, fx, grok, hermes, kimi, opencode, pi, simple,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
@@ -213,6 +213,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Antigravity => go::<antigravity::Antigravity>(text),
         HarnessId::Simple => go::<simple::Simple>(text),
         HarnessId::Cowork => go::<cowork::Cowork>(text),
+        HarnessId::Kimi => go::<kimi::Kimi>(text),
     }
 }
 
@@ -237,6 +238,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Antigravity => go::<antigravity::Antigravity>(common),
         HarnessId::Simple => go::<simple::Simple>(common),
         HarnessId::Cowork => go::<cowork::Cowork>(common),
+        HarnessId::Kimi => go::<kimi::Kimi>(common),
     }
 }
 

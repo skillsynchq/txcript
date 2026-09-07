@@ -64,7 +64,7 @@ pub mod mcp;
 mod pager;
 mod view;
 
-pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
+pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, kimi, fx, hermes, \
      amp, antigravity, simple, cowork";
 
 /// The `txcript` binary's command line.
@@ -928,6 +928,13 @@ mod identity_tests {
     }
 
     #[test]
+    fn kimi_can_be_continued_in_place() {
+        // Kimi reads whatever its session index points at, so a Kimi session
+        // continues into Kimi like any writable file-backed harness.
+        assert!(ensure_resumable_source(HarnessId::Kimi, HarnessId::Kimi).is_ok());
+    }
+
+    #[test]
     fn resume_alias_is_accepted_for_continue_command() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["txcript", "resume", "session-123"]).unwrap();
@@ -1069,6 +1076,7 @@ mod style {
             HarnessId::Cursor => "\x1b[34m",           // blue
             HarnessId::CursorDesktop => "\x1b[96m",    // bright cyan
             HarnessId::Grok => "\x1b[37m",             // white
+            HarnessId::Kimi => "\x1b[38;5;141m",       // violet
             HarnessId::Fx => "\x1b[38;5;39m",          // azure
             HarnessId::Hermes => "\x1b[93m",           // bright yellow
             HarnessId::Amp => "\x1b[95m",              // bright magenta

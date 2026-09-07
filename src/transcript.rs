@@ -456,6 +456,7 @@ pub enum HarnessId {
     Grok,
     Fx,
     Hermes,
+    Kimi,
     Amp,
     Antigravity,
     Simple,
@@ -463,7 +464,7 @@ pub enum HarnessId {
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 16] = [
+    pub const ALL: [HarnessId; 17] = [
         HarnessId::ClaudeCode,
         HarnessId::ClaudeChat,
         HarnessId::ChatGpt,
@@ -476,6 +477,7 @@ impl HarnessId {
         HarnessId::Grok,
         HarnessId::Fx,
         HarnessId::Hermes,
+        HarnessId::Kimi,
         HarnessId::Amp,
         HarnessId::Antigravity,
         HarnessId::Simple,
@@ -498,6 +500,7 @@ impl HarnessId {
             HarnessId::Grok => "grok",
             HarnessId::Fx => "fx",
             HarnessId::Hermes => "hermes",
+            HarnessId::Kimi => "kimi",
             HarnessId::Amp => "amp",
             HarnessId::Antigravity => "antigravity",
             HarnessId::Simple => "simple",
@@ -538,6 +541,7 @@ impl FromStr for HarnessId {
             }
             "fx" | "fx_cli" | "fx-cli" | "fxcli" | "vercel_fx" | "vercel-fx" => Ok(HarnessId::Fx),
             "hermes" | "hermes_agent" | "hermes-agent" | "hermesagent" => Ok(HarnessId::Hermes),
+            "kimi" | "kimi_code" | "kimi-code" | "kimicode" => Ok(HarnessId::Kimi),
             "amp" | "ampcode" | "amp_code" | "amp-code" => Ok(HarnessId::Amp),
             "antigravity" | "agy" | "antigravity_cli" | "antigravity-cli" | "anti-gravity" => {
                 Ok(HarnessId::Antigravity)
