@@ -44,12 +44,22 @@ Each event is `{ type, seq, time, data, ... }`. Surface events
 | --- | --- |
 | `user/message` with text parts | user text message |
 | `assistant/message` `reasoning` / `text` / `tool-call` | thinking / text / tool-use |
+| `assistant/message` `usage` / `interrupted` | `Usage` / `StopReason::Aborted` |
 | `tool/result` | user tool-result (`isError` kept) |
 
-The ordered surface is rebuilt before projection: a `replace` `surfaceOp`
-truncates earlier surface nodes. Packed chunk rows and `assistant/chunk`
-stream events are ignored for Common because the assembled `assistant/message`
-already carries the step.
+The ordered surface is rebuilt before projection. Surface nodes are tracked by
+event `seq`, because log-only events sit between them and a node's seq is not
+its surface position. A `replace` `surfaceOp` names the inclusive **seq** range
+it shadows — both endpoints must be on the current surface — and substitutes
+the replacing node for that whole run; a range txcript cannot resolve shadows
+nothing. Packed chunk rows and `assistant/chunk` stream events are ignored for
+Common because the assembled `assistant/message` already carries the step.
+
+`usage` maps `inputTokens`/`outputTokens` and the optional
+`cacheReadTokens`/`cacheWriteTokens` onto Common's `Usage`. `reasoningTokens`
+has no Common counterpart and survives in the native body only. Shadowed
+surface nodes likewise stay in the native body, so a text round trip keeps the
+full log even though Common shows the model-visible surface.
 
 ## Store capabilities
 
