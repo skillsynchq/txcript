@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -23,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::common::{Block, Message, Meta, Role, StopReason, Tool, ToolOutput};
+use crate::common::{Block, Message, Meta, Role, StopReason, Tool, ToolOutput, Usage};
 use crate::error::{Error, Result};
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
@@ -227,37 +226,21 @@ fn read_log_text(path: &Path) -> Result<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn decode_zstd(bytes: &[u8]) -> Result<String> {
-    // Official JSONL backend concatenates independent Zstandard frames
-    // (header frame, then one frame per append batch). Decode each.
-    let starts = zstd_frame_starts(bytes);
-    let starts = if starts.is_empty() { vec![0] } else { starts };
+    use std::io::Read as _;
+
+    // The official JSONL backend concatenates independent Zstandard frames
+    // (header frame, then one per append batch). The streaming decoder parses
+    // frame structure and continues across frame boundaries on its own, so the
+    // whole file decodes in one pass. Splitting on the frame magic instead
+    // would be wrong: those four bytes also occur inside compressed block
+    // payloads and checksums, and a false split turns a valid log into a
+    // decoder error.
     let mut out = Vec::new();
-    for (index, start) in starts.iter().enumerate() {
-        let end = starts.get(index + 1).copied().unwrap_or(bytes.len());
-        let mut decoder =
-            zstd::stream::read::Decoder::new(std::io::Cursor::new(&bytes[*start..end]))?;
-        decoder.read_to_end(&mut out)?;
-    }
+    zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))?.read_to_end(&mut out)?;
     String::from_utf8(out).map_err(|error| Error::Malformed {
         harness: Dsh::NAME,
         detail: format!("zstd session log is not utf-8: {error}"),
     })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn zstd_frame_starts(bytes: &[u8]) -> Vec<usize> {
-    const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-    let mut starts = Vec::new();
-    let mut index = 0;
-    while index + 4 <= bytes.len() {
-        if bytes[index..index + 4] == MAGIC {
-            starts.push(index);
-            index += 4;
-        } else {
-            index += 1;
-        }
-    }
-    starts
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -349,10 +332,17 @@ fn first_event_time(events: &[Value]) -> Option<DateTime<Utc>> {
         .and_then(DateTime::from_timestamp_millis)
 }
 
-fn json_usize(value: Option<&Value>) -> Option<usize> {
-    value
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
+/// `data.usage` is dsh's `TokenUsage`: required `inputTokens`/`outputTokens`
+/// plus optional cache and reasoning tallies. Common has no reasoning counter,
+/// so `reasoningTokens` survives only in the native body.
+fn usage_from_data(data: Option<&Value>) -> Option<Usage> {
+    let usage = data?.get("usage")?;
+    Some(Usage {
+        input_tokens: usage.get("inputTokens").and_then(Value::as_u64)?,
+        output_tokens: usage.get("outputTokens").and_then(Value::as_u64)?,
+        cache_read_input_tokens: usage.get("cacheReadTokens").and_then(Value::as_u64),
+        cache_creation_input_tokens: usage.get("cacheWriteTokens").and_then(Value::as_u64),
+    })
 }
 
 fn event_time(event: &Value, fallback: DateTime<Utc>) -> DateTime<Utc> {
@@ -363,10 +353,31 @@ fn event_time(event: &Value, fallback: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or(fallback)
 }
 
+/// Resolve a `replace` op's inclusive seq range to surface positions. `None`
+/// when either endpoint is missing from the current surface or the range runs
+/// backwards — the same conditions dsh itself rejects.
+fn replacement_range(
+    surface: &[(Option<u64>, &Value)],
+    op: &serde_json::Map<String, Value>,
+) -> Option<(usize, usize)> {
+    let position = |seq: Option<&Value>| {
+        let seq = seq.and_then(Value::as_u64)?;
+        surface.iter().position(|(node, _)| *node == Some(seq))
+    };
+    let start = position(op.get("start"))?;
+    let end = position(op.get("end"))?;
+    (start <= end).then_some((start, end))
+}
+
 /// Rebuild the ordered surface, then project those nodes into Common messages.
 /// Packed `*-chunks` rows and log-only events stay in the native body.
 fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message> {
-    let mut surface: Vec<&Value> = Vec::new();
+    // The surface is an ordered list of event seqs, not a list of log indexes:
+    // log-only events (turn/step markers, chunks, packed rows) sit between
+    // surface nodes, so a node's seq and its surface position diverge
+    // immediately. A `replace` op names the inclusive *seq* range it shadows,
+    // and both endpoints must currently be on the surface.
+    let mut surface: Vec<(Option<u64>, &Value)> = Vec::new();
     for event in events {
         let Some(kind) = event.get("type").and_then(Value::as_str) else {
             continue;
@@ -374,24 +385,25 @@ fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message>
         if !matches!(kind, "user/message" | "assistant/message" | "tool/result") {
             continue;
         }
+        let seq = event.get("seq").and_then(Value::as_u64);
+        let node = (seq, event);
         match event.get("surfaceOp") {
             Some(Value::Object(op)) if op.get("op").and_then(Value::as_str) == Some("replace") => {
-                let start = json_usize(op.get("start")).unwrap_or(0);
-                let end = json_usize(op.get("end")).unwrap_or(start);
-                if start < surface.len() {
-                    let end = end.min(surface.len().saturating_sub(1)).max(start);
-                    surface.drain(start..=end);
-                    surface.insert(start, event);
-                } else {
-                    surface.push(event);
+                match replacement_range(&surface, op) {
+                    Some((start, end)) => {
+                        surface.splice(start..=end, std::iter::once(node));
+                    }
+                    // A range we cannot resolve (truncated log, unknown seq)
+                    // shadows nothing; keep the node rather than drop history.
+                    None => surface.push(node),
                 }
             }
-            _ => surface.push(event),
+            _ => surface.push(node),
         }
     }
 
     let mut messages = Vec::new();
-    for event in surface {
+    for (_, event) in surface {
         let timestamp = event_time(event, fallback);
         match event.get("type").and_then(Value::as_str) {
             Some("user/message") => {
@@ -418,17 +430,26 @@ fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message>
                 let has_tool = blocks
                     .iter()
                     .any(|block| matches!(block, Block::ToolUse { .. }));
+                // `data.interrupted` is only ever `true`, and marks the partial
+                // prefix a cancelled turn had already streamed.
+                let interrupted = data
+                    .and_then(|value| value.get("interrupted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let stop_reason = if interrupted {
+                    StopReason::Aborted
+                } else if has_tool {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                };
                 messages.push(Message {
                     role: Role::Assistant,
                     content: blocks,
                     timestamp,
                     model,
-                    stop_reason: Some(if has_tool {
-                        StopReason::ToolUse
-                    } else {
-                        StopReason::EndTurn
-                    }),
-                    usage: None,
+                    stop_reason: Some(stop_reason),
+                    usage: usage_from_data(data),
                 });
             }
             Some("tool/result") => {
@@ -651,7 +672,8 @@ fn body_from_common(transcript: &Transcript<Common>) -> DshSession {
                                 }]
                             }
                         },
-                        "sourceEventSeqs": [],
+                        // `sourceEventSeqs` is omitted, not empty: dsh rejects
+                        // an empty array on anything but `assistant/message`.
                         "surfaceOp": "append"
                     }));
                     seq += 1;
@@ -688,20 +710,39 @@ fn body_from_common(transcript: &Transcript<Common>) -> DshSession {
             if let Some(model) = &message.model {
                 source["model"] = json!(model);
             }
+            let mut data = json!({
+                "turn": 1,
+                "step": index + 1,
+                "message": {
+                    "role": "assistant",
+                    "id": msg_id,
+                    "content": content,
+                    "source": source
+                }
+            });
+            if let Some(usage) = &message.usage {
+                let mut tokens = json!({
+                    "inputTokens": usage.input_tokens,
+                    "outputTokens": usage.output_tokens,
+                });
+                if let Some(read) = usage.cache_read_input_tokens {
+                    tokens["cacheReadTokens"] = json!(read);
+                }
+                if let Some(write) = usage.cache_creation_input_tokens {
+                    tokens["cacheWriteTokens"] = json!(write);
+                }
+                data["usage"] = tokens;
+            }
+            // dsh only ever writes `interrupted: true`; absence means a
+            // completed turn.
+            if message.stop_reason == Some(StopReason::Aborted) {
+                data["interrupted"] = json!(true);
+            }
             events.push(json!({
                 "type": "assistant/message",
                 "seq": seq,
                 "time": time,
-                "data": {
-                    "turn": 1,
-                    "step": index + 1,
-                    "message": {
-                        "role": "assistant",
-                        "id": msg_id,
-                        "content": content,
-                        "source": source
-                    }
-                },
+                "data": data,
                 "surfaceOp": "append"
             }));
             seq += 1;
@@ -787,23 +828,126 @@ mod tests {
         ));
     }
 
+    fn user_event(seq: u64, text: &str, surface_op: &Value) -> Value {
+        json!({"type": "user/message", "seq": seq, "time": seq, "data": {
+            "content": [{"type": "text", "text": text}]
+        }, "surfaceOp": surface_op})
+    }
+
     #[test]
     fn surface_replace_drops_shadowed_nodes() {
+        // Log-only events between surface nodes push each node's seq past its
+        // surface position, so a replace op must be resolved by seq.
         let events = vec![
-            json!({"type": "user/message", "seq": 0, "time": 1, "data": {
-                "content": [{"type": "text", "text": "old"}]
-            }, "surfaceOp": "append"}),
-            json!({"type": "user/message", "seq": 1, "time": 2, "data": {
-                "content": [{"type": "text", "text": "kept"}]
-            }, "surfaceOp": "append"}),
-            json!({"type": "user/message", "seq": 2, "time": 3, "data": {
-                "content": [{"type": "text", "text": "summary"}]
-            }, "surfaceOp": {"op": "replace", "start": 0, "end": 0}}),
+            user_event(0, "old", &json!("append")),
+            json!({"type": "step/start", "seq": 1, "time": 1, "data": {}}),
+            user_event(2, "kept", &json!("append")),
+            user_event(
+                3,
+                "summary",
+                &json!({"op": "replace", "start": 0, "end": 0}),
+            ),
         ];
         let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
         assert_eq!(messages.len(), 2);
         assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "summary"));
         assert!(matches!(&messages[1].content[0], Block::Text { text } if text == "kept"));
+    }
+
+    #[test]
+    fn surface_replace_spans_the_whole_seq_range() {
+        // Compaction shadows a contiguous run: nodes at seq 1 and 3 must both
+        // go, even though seq 3 sits at surface index 1.
+        let events = vec![
+            user_event(1, "first", &json!("append")),
+            json!({"type": "assistant/chunk", "seq": 2, "time": 2, "data": {}}),
+            user_event(3, "second", &json!("append")),
+            user_event(4, "kept", &json!("append")),
+            user_event(
+                9,
+                "summary",
+                &json!({"op": "replace", "start": 1, "end": 3}),
+            ),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "summary"));
+        assert!(matches!(&messages[1].content[0], Block::Text { text } if text == "kept"));
+    }
+
+    #[test]
+    fn surface_replace_with_unresolvable_range_keeps_history() {
+        // A range naming a seq that never reached the surface shadows nothing.
+        let events = vec![
+            user_event(4, "kept", &json!("append")),
+            user_event(
+                7,
+                "summary",
+                &json!({"op": "replace", "start": 2, "end": 2}),
+            ),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "kept"));
+        assert!(matches!(&messages[1].content[0], Block::Text { text } if text == "summary"));
+    }
+
+    #[test]
+    fn assistant_usage_and_interruption_survive_projection() {
+        let events = vec![
+            json!({"type": "assistant/message", "seq": 0, "time": 5, "data": {
+            "turn": 1, "step": 1,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "partial"}],
+                "source": {"kind": "model", "model": "deepseek-v4-flash"}
+            },
+            "usage": {
+                "inputTokens": 13972,
+                "outputTokens": 205,
+                "cacheReadTokens": 64,
+                "cacheWriteTokens": 32,
+                "reasoningTokens": 106
+            },
+            "interrupted": true
+        }, "surfaceOp": "append"}),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].stop_reason, Some(StopReason::Aborted));
+        let usage = messages[0].usage.expect("usage projected");
+        assert_eq!(usage.input_tokens, 13972);
+        assert_eq!(usage.output_tokens, 205);
+        assert_eq!(usage.cache_read_input_tokens, Some(64));
+        assert_eq!(usage.cache_creation_input_tokens, Some(32));
+    }
+
+    #[test]
+    fn assistant_without_usage_keeps_normal_stop_reason() {
+        let events = vec![
+            json!({"type": "assistant/message", "seq": 0, "time": 5, "data": {
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+        }, "surfaceOp": "append"}),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages[0].stop_reason, Some(StopReason::EndTurn));
+        assert!(messages[0].usage.is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn decode_zstd_spans_concatenated_frames() {
+        // The backend writes the header in its own frame, then one frame per
+        // append batch; all of them must decode as a single JSONL stream.
+        let header = b"{\"type\":\"session\",\"version\":0,\"id\":\"s1\"}\n";
+        let batch = b"{\"type\":\"user/message\",\"seq\":0,\"time\":1,\"data\":{},\"surfaceOp\":\"append\"}\n";
+        let mut bytes = zstd::encode_all(&header[..], 0).unwrap();
+        bytes.extend(zstd::encode_all(&batch[..], 0).unwrap());
+
+        let text = decode_zstd(&bytes).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.starts_with("{\"type\":\"session\""));
+        assert!(text.contains("user/message"));
     }
 
     #[test]
