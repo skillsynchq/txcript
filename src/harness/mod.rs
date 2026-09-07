@@ -15,6 +15,7 @@ pub mod codex;
 pub mod cowork;
 pub mod cursor;
 pub mod cursor_desktop;
+pub mod dsh;
 pub mod fx;
 pub mod grok;
 pub mod hermes;

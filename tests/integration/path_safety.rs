@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
-use txcript::harness::{amp, antigravity, campfire, claude_code, codex, cursor, grok, pi};
+use txcript::harness::{amp, antigravity, campfire, claude_code, codex, cursor, dsh, grok, pi};
 use txcript::{Codec, Common, Store, Transcript};
 
 fn small_common(id: &str) -> Transcript<Common> {
@@ -80,6 +80,7 @@ fn hostile_ids_cannot_escape_any_file_backed_store() {
     assert_save_confined(&campfire::CampfireStore::new(root.to_path_buf()), root);
     assert_save_confined(&cursor::CursorStore::new(root.to_path_buf()), root);
     assert_save_confined(&grok::GrokStore::new(root.to_path_buf()), root);
+    assert_save_confined(&dsh::DshStore::new(root.to_path_buf()), root);
     assert_save_confined(&amp::AmpStore::new(root.to_path_buf()), root);
     assert_save_confined(
         &antigravity::AntigravityStore::new(root.to_path_buf()),

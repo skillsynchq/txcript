@@ -64,7 +64,7 @@ pub mod mcp;
 mod pager;
 mod view;
 
-pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
+pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, dsh, fx, hermes, \
      amp, antigravity, simple, cowork";
 
 /// The `txcript` binary's command line.
@@ -928,6 +928,13 @@ mod identity_tests {
     }
 
     #[test]
+    fn dsh_can_be_continued_in_place() {
+        // Only the two pull-only remote sources are refused here. dsh is a
+        // local store txcript writes, so it takes the normal write path.
+        assert!(ensure_resumable_source(HarnessId::Dsh, HarnessId::Dsh).is_ok());
+    }
+
+    #[test]
     fn resume_alias_is_accepted_for_continue_command() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["txcript", "resume", "session-123"]).unwrap();
@@ -1069,6 +1076,7 @@ mod style {
             HarnessId::Cursor => "\x1b[34m",           // blue
             HarnessId::CursorDesktop => "\x1b[96m",    // bright cyan
             HarnessId::Grok => "\x1b[37m",             // white
+            HarnessId::Dsh => "\x1b[38;5;43m",         // teal
             HarnessId::Fx => "\x1b[38;5;39m",          // azure
             HarnessId::Hermes => "\x1b[93m",           // bright yellow
             HarnessId::Amp => "\x1b[95m",              // bright magenta
