@@ -557,12 +557,18 @@ fn tool_result(result: Value) -> (ToolOutput, bool) {
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut output = object.get("output").cloned().unwrap_or(Value::Null);
-    if let Some(note) = object.get("note").and_then(Value::as_str)
-        && let Some(text) = output.as_str()
-    {
-        output = Value::String(format!("{text}\n\n[kimi note: {note}]"));
-    }
+    let output = object.get("output").cloned().unwrap_or(Value::Null);
+    let Some(note) = object.get("note").and_then(Value::as_str) else {
+        return (tool_output(output), is_error);
+    };
+    // A note annotates the result — truncation, a permission decision — so it
+    // must survive whatever shape `output` has. Text takes it as a suffix;
+    // every other shape (object, array, null) keeps its structure and carries
+    // the note beside it rather than losing it.
+    let output = match output {
+        Value::String(text) => Value::String(format!("{text}\n\n[kimi note: {note}]")),
+        other => json!({"output": other, "note": note}),
+    };
     (tool_output(output), is_error)
 }
 
@@ -585,6 +591,15 @@ const NS: Uuid = Uuid::from_bytes([
 /// the reader does not depend on it.
 const PROTOCOL_VERSION: &str = "1.5";
 
+/// Emit the text accumulated so far as one user entry, if any.
+fn flush_user_text(pending: &mut Vec<Value>, wire: &mut Vec<Value>, time: i64) {
+    if pending.is_empty() {
+        return;
+    }
+    let content = std::mem::take(pending);
+    wire.push(json!({"type": "context.append_message", "time": time, "message": {"role": "user", "content": content, "toolCalls": []}}));
+}
+
 fn body_from_common(transcript: &Transcript<Common>) -> KimiSession {
     let timestamp = transcript.meta.timestamp.timestamp_millis();
     let state = json!({
@@ -599,29 +614,33 @@ fn body_from_common(transcript: &Transcript<Common>) -> KimiSession {
     for (index, message) in transcript.body.iter().enumerate() {
         let time = message.timestamp.timestamp_millis();
         if message.role == Role::User {
-            let mut content = Vec::new();
+            // One ordered pass: emitting all text first and all tool results
+            // second would reorder a mixed message, so adjacent text is
+            // coalesced into one entry and a tool result flushes whatever text
+            // precedes it.
+            let mut pending = Vec::new();
             for block in &message.content {
-                if let Block::Text { text } = block {
-                    content.push(json!({"type": "text", "text": text}));
+                match block {
+                    Block::Text { text } => pending.push(json!({"type": "text", "text": text})),
+                    Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        flush_user_text(&mut pending, &mut wire, time);
+                        let output = match content {
+                            ToolOutput::Text(text) => Value::String(text.clone()),
+                            ToolOutput::Json(value) => value.clone(),
+                        };
+                        wire.push(json!({"type": "context.append_loop_event", "time": time, "event": {"type": "tool.result", "toolCallId": tool_use_id, "result": {"output": output, "isError": is_error}}}));
+                    }
+                    Block::Thinking { .. }
+                    | Block::ToolUse { .. }
+                    | Block::Image { .. }
+                    | Block::Artifact { .. } => {}
                 }
             }
-            if !content.is_empty() {
-                wire.push(json!({"type": "context.append_message", "time": time, "message": {"role": "user", "content": content, "toolCalls": []}}));
-            }
-            for block in &message.content {
-                if let Block::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                {
-                    let output = match content {
-                        ToolOutput::Text(text) => Value::String(text.clone()),
-                        ToolOutput::Json(value) => value.clone(),
-                    };
-                    wire.push(json!({"type": "context.append_loop_event", "time": time, "event": {"type": "tool.result", "toolCallId": tool_use_id, "result": {"output": output, "isError": is_error}}}));
-                }
-            }
+            flush_user_text(&mut pending, &mut wire, time);
         } else {
             let step_uuid = Uuid::new_v5(
                 &NS,
@@ -668,6 +687,91 @@ mod tests {
             tool_result(json!({"output": "boom", "note": "truncated", "isError": true}));
         assert!(error);
         assert!(matches!(content, ToolOutput::Text(text) if text.contains("truncated")));
+    }
+
+    #[test]
+    fn tool_result_keeps_note_for_every_output_shape() {
+        // A note must not depend on `output` being a string.
+        let note_of = |result: Value| match tool_result(result).0 {
+            ToolOutput::Json(value) => value.get("note").and_then(Value::as_str).map(String::from),
+            ToolOutput::Text(text) => text.contains("truncated").then(|| "truncated".to_string()),
+        };
+        assert_eq!(
+            note_of(json!({"output": {"x": 1}, "note": "truncated"})).as_deref(),
+            Some("truncated")
+        );
+        assert_eq!(
+            note_of(json!({"output": null, "note": "truncated"})).as_deref(),
+            Some("truncated")
+        );
+        assert_eq!(
+            note_of(json!({"output": [1, 2], "note": "truncated"})).as_deref(),
+            Some("truncated")
+        );
+        // The structured output itself is preserved alongside the note.
+        let ToolOutput::Json(value) = tool_result(json!({"output": {"x": 1}, "note": "n"})).0
+        else {
+            panic!("structured output should stay structured");
+        };
+        assert_eq!(value.get("output"), Some(&json!({"x": 1})));
+        // No note means no wrapper.
+        assert!(matches!(
+            tool_result(json!({"output": {"x": 1}})).0,
+            ToolOutput::Json(value) if value == json!({"x": 1})
+        ));
+    }
+
+    #[test]
+    fn mixed_user_blocks_keep_their_order() {
+        // `[ToolResult, Text]` must not come back as `[Text, ToolResult]`.
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                Block::ToolResult {
+                    tool_use_id: "c1".to_string(),
+                    content: ToolOutput::Text("result".to_string()),
+                    is_error: false,
+                },
+                Block::Text {
+                    text: "after".to_string(),
+                },
+            ],
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            model: None,
+            stop_reason: None,
+            usage: None,
+        };
+        let meta = Meta {
+            id: "session_probe".to_string(),
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            cwd: None,
+            git_branch: None,
+            title: None,
+            cli_version: None,
+            model: None,
+        };
+        let transcript = Transcript::new(meta, vec![message]);
+        let body = body_from_common(&transcript);
+
+        let kinds: Vec<&str> = body
+            .wire
+            .iter()
+            .filter_map(|entry| match entry.get("type").and_then(Value::as_str) {
+                Some("context.append_message") => Some("text"),
+                Some("context.append_loop_event") => entry
+                    .get("event")
+                    .and_then(|event| event.get("type"))
+                    .and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["tool.result", "text"]);
+
+        // And the order survives a full round trip through Common.
+        let back = wire_to_messages(&body.wire, DateTime::<Utc>::UNIX_EPOCH);
+        let blocks: Vec<&Block> = back.iter().flat_map(|m| m.content.iter()).collect();
+        assert!(matches!(blocks[0], Block::ToolResult { .. }));
+        assert!(matches!(blocks[1], Block::Text { text } if text == "after"));
     }
 
     #[test]

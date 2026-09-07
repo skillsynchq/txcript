@@ -71,12 +71,12 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
-    common <--> kimi["Kimi Code"]
     common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
     simple["Simple (any agent)"] --> common
     hermes["Hermes Agent"] --> common
     amp["Amp"] --> common
+    kimi["Kimi Code"] --> common
 ```
 
 Discovery, listing, search, and `view` work for every harness with a backing store. The `id` strings are what the CLI and WASM APIs take.
