@@ -287,9 +287,10 @@ fn save_points_the_agent_homedir_at_where_the_session_landed() {
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(moved.reference.join("state.json")).unwrap())
             .unwrap();
+    let agent_dir = moved.reference.join("agents").join("main");
     assert_eq!(
         state["agents"]["main"]["homedir"],
-        json!(moved.reference.join("agents/main").to_str().unwrap())
+        json!(agent_dir.to_str().unwrap())
     );
 }
 
@@ -374,9 +375,10 @@ fn saved_state_carries_what_kimi_reads_a_session_by() {
             .unwrap();
 
     assert_eq!(state["updatedAt"], json!(1_767_323_045_000_i64));
+    let agent_dir = saved.reference.join("agents").join("main");
     assert_eq!(
         state["agents"]["main"]["homedir"],
-        json!(saved.reference.join("agents/main").to_str().unwrap())
+        json!(agent_dir.to_str().unwrap())
     );
 }
 
