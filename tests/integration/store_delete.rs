@@ -185,6 +185,18 @@ fn grok_bot_delete_removes_the_session_directory() {
     assert!(leftovers.is_empty(), "no files left behind: {leftovers:?}");
 }
 
+#[cfg(feature = "dsh_zstd")]
+#[test]
+fn dsh_delete_removes_the_session_directory() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let store = txcript::harness::dsh::DshStore::new(dir.path().to_path_buf());
+    roundtrip(&store);
+    // dsh scans project directories for session directories, so an empty
+    // project directory is harmless — a leftover log is not.
+    let leftovers: Vec<_> = walk_files(dir.path());
+    assert!(leftovers.is_empty(), "no log left behind: {leftovers:?}");
+}
+
 #[cfg(feature = "opencode")]
 #[test]
 fn cursor_delete_removes_the_whole_session_dir() {
