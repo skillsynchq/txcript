@@ -4,7 +4,7 @@
 
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
-use txcript::harness::{campfire, claude_code, codex, grok, pi};
+use txcript::harness::{campfire, claude_code, codex, grok, kimi, pi};
 use txcript::{Codec, Common, Store, Transcript};
 
 #[cfg(feature = "opencode")]
@@ -104,6 +104,20 @@ fn grok_delete_removes_the_session_directory() {
         leftover_sessions.is_empty(),
         "no files left behind: {leftover_sessions:?}"
     );
+}
+
+#[test]
+fn kimi_delete_removes_the_session_directory() {
+    // Kimi's index lives one level above `sessions/`, so the store is rooted
+    // the way Kimi itself lays a data directory out.
+    let home = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let store = kimi::KimiStore::new(sessions.clone());
+    roundtrip(&store);
+    // The workspace directory may remain, but no session files do.
+    let leftover: Vec<_> = walk_files(&sessions);
+    assert!(leftover.is_empty(), "no files left behind: {leftover:?}");
 }
 
 #[cfg(feature = "opencode")]

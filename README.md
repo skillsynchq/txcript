@@ -71,12 +71,12 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
+    common <--> kimi["Kimi Code"]
     common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
     simple["Simple (any agent)"] --> common
     hermes["Hermes Agent"] --> common
     amp["Amp"] --> common
-    kimi["Kimi Code"] --> common
 ```
 
 Discovery, listing, search, and `view` work for every harness with a backing store. The `id` strings are what the CLI and WASM APIs take.
@@ -94,7 +94,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | JSON session dir | ⇄ | ✓ | [spec](docs/formats/grok.md) |
-| [Kimi Code](https://github.com/MoonshotAI/kimi-cli) | `kimi` | `~/.kimi-code/sessions/` | state JSON + wire JSONL | → | — | [spec](docs/formats/kimi.md) |
+| [Kimi Code](https://github.com/MoonshotAI/kimi-cli) | `kimi` | `~/.kimi-code/sessions/` | state JSON + wire JSONL | ⇄ | ✓ | [spec](docs/formats/kimi.md) |
 | [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | event-log session dir | ⇄ | ✓ | [spec](docs/formats/fx.md) |
 | Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](docs/formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | thread JSON | → | — <sup>1</sup> | [spec](docs/formats/amp.md) |
@@ -110,14 +110,6 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 <sup>4</sup> Claude Chat is a live, pull-only source. On macOS, explicitly selecting `--from claude_chat` reuses the signed-in Claude Desktop session automatically; aggregate discovery does not contact Claude Chat. Credentials passed through environment variables are not accepted. An optional `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restricts discovery to one organization; otherwise the app's active organization is used. Claude Chat has no supported conversation API: txcript reads a private endpoint that Anthropic can observe or restrict, and the Rust crate warns at build time wherever discovery is called directly. txcript only reads: it refuses save, delete, same-harness continue, and `--with claude_chat`. Files Claude generated in the conversation come along; continued into Claude Code, they are written beside the new session and appear as Claude Code artifacts. Claude's data-export ZIP and `conversations.json` are not supported.
 
 <sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. txcript only reads: it refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT has no supported conversation API, so this access may change or be restricted. ChatGPT data-export archives are not supported.
-
-### Kimi Code
-
-Kimi Code is supported as a read-only source. Its sessions are discovered from
-`~/.kimi-code/sessions/` and can be searched, exported, or continued into
-another harness. Kimi has no documented session import command, so txcript
-never writes directly into its session store. See
-[`docs/formats/kimi.md`](docs/formats/kimi.md).
 
 ## Install
 

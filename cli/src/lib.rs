@@ -928,6 +928,13 @@ mod identity_tests {
     }
 
     #[test]
+    fn kimi_can_be_continued_in_place() {
+        // Kimi reads whatever its session index points at, so a Kimi session
+        // continues into Kimi like any writable file-backed harness.
+        assert!(ensure_resumable_source(HarnessId::Kimi, HarnessId::Kimi).is_ok());
+    }
+
+    #[test]
     fn resume_alias_is_accepted_for_continue_command() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["txcript", "resume", "session-123"]).unwrap();
@@ -1609,11 +1616,6 @@ fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), S
     } else if source == HarnessId::ChatGpt && target == HarnessId::ChatGpt {
         Err(
             "ChatGPT is pull-only: choose another --with harness; txcript never continues conversations in ChatGPT"
-                .to_string(),
-        )
-    } else if source == HarnessId::Kimi && target == HarnessId::Kimi {
-        Err(
-            "Kimi Code is read-only: choose another --with harness; txcript never writes undocumented Kimi session files"
                 .to_string(),
         )
     } else {

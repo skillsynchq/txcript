@@ -73,22 +73,80 @@ granularity.
 
 ## Store capabilities
 
-Kimi Code has no documented session import or deletion command. The txcript
-Kimi store is therefore **read-only**:
+The store reads and writes. Kimi ships no import command, but it does not need
+one: sessions are loaded from whatever `session_index.jsonl` points at, so
+writing one is a matter of laying out the files Kimi expects.
 
-- `list`, `query`, `view`, and `export` work;
-- a Kimi session can be converted into any writable target harness;
-- `save` and `delete` return an explicit read-only error;
-- txcript never writes directly into `~/.kimi-code/sessions`.
+### The session index
 
-The native Kimi resume command is `kimi --session <id>`. Cross-harness
-continuation is supported; native Kimi continuation is refused because the
-store cannot safely create a Kimi session without an official import contract.
+`<data root>/session_index.jsonl` is an append-only log, one JSON record per
+line, sitting one level above `sessions/`:
+
+```json
+{"sessionId": "session_<uuid>", "sessionDir": "/abs/path", "workDir": "/abs/cwd"}
+{"sessionId": "session_<uuid>", "deleted": true}
+```
+
+**It is the only discovery path.** Kimi does not scan the sessions directory,
+so a session written without an index record is invisible to `kimi session
+list` and `kimi --session`. Removal is a `deleted` tombstone rather than a
+rewrite, which is how txcript's `delete` retires a session too.
+
+Kimi validates each record on read: `sessionDir` must be absolute, must sit
+inside the sessions directory, and its last path segment must equal
+`sessionId`.
+
+### Workspace directory names
+
+A session directory lives under `sessions/wd_<slug>_<hash>/`, where `slug` is
+the working directory's last path segment — lowercased, every run of characters
+outside `[a-z0-9._-]` collapsed to `-`, trimmed of leading and trailing
+dashes, capped at 40 characters — and `hash` is the first 12 hex characters of
+`sha256(workDir)`, with the path normalized to forward slashes and no trailing
+slash.
+
+Getting this name wrong does not hide a session, because the index points at it
+directly, but it does break Kimi's own `--cwd` filtering and `kimi -c`, both of
+which resolve a working directory to this exact name.
+
+### What `save` writes
+
+- `sessions/wd_<slug>_<hash>/<session id>/state.json`
+- `sessions/wd_<slug>_<hash>/<session id>/agents/main/wire.jsonl`
+- one appended record in `<data root>/session_index.jsonl`
+
+An id that is not usable as a single path component is rejected before
+anything is written. A session converted from another harness has no Kimi
+`state.json`, so `save` fills in the identity fields Kimi and txcript's
+directory-free `from_text` read back: `sessionId`, `workDir`, `title`,
+`createdAt`, and `updatedAt`. The last one is not decorative — `kimi session
+list` renders its timestamp column from `updatedAt` alone, so a session written
+without it lists at the Unix epoch.
+
+`agents.main.homedir` is rewritten rather than preserved, because it names
+where the session actually is: Kimi resolves the wire log through it, and
+txcript's directory-free readers recover the session id from it. A session
+saved under a second root would otherwise keep pointing at the first. Saving is
+therefore idempotent rather than byte-preserving on `state.json` — a
+`load → save → load` round trip is stable from the first save onward.
+
+The native Kimi resume command is `kimi --session <id>`.
 
 ## Provenance
 
-The format is based on the Kimi Code CLI wire protocol observed in local
-sessions and the public CLI interface documented by `kimi --help`. The wire
-protocol is an implementation detail and may change between Kimi releases;
-unknown events are retained to make the reader fail conservatively rather than
-silently discarding native data.
+**Reverse-engineered.** The wire protocol comes from sessions observed locally
+and the CLI surface documented by `kimi --help`. The index contract and the
+workspace-name derivation come from the shipped `kimi` binary's own
+`readSessionIndex` and `encodeWorkDirKey`, and were confirmed end to end
+against an isolated `KIMI_CODE_HOME`: a session written by txcript is listed by
+`kimi session list`, and `kimi export` reports a `sessionFirstActivity` derived
+from the `time` field in the written wire log — so Kimi parses the events
+back, not just the directory. The derived workspace names reproduce the
+existing directory names of real local sessions exactly.
+
+The wire protocol is an implementation detail and may change between Kimi
+releases; unknown events are retained to make the reader fail conservatively
+rather than silently discarding native data.
+
+Last verified: 2026-09-07, against Kimi Code 0.41.0 (wire protocol 1.5) and
+real local sessions.

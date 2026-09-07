@@ -724,13 +724,13 @@ pub fn write(
             common,
             |s| s.sessions_dir,
         ),
-        // Kimi has no documented session import command. Sessions convert
-        // *from* Kimi, never into it.
-        HarnessId::Kimi => Err(Error::Unconvertible {
-            harness: "kimi",
-            detail: "Kimi Code session storage is read-only and Kimi has no documented session import command; sessions can be converted from Kimi, but not continued into it"
-                .to_string(),
-        }),
+        HarnessId::Kimi => go(
+            kimi::KimiStore::default_root(),
+            kimi::KimiStore::new,
+            root,
+            common,
+            |s| s.sessions_dir,
+        ),
         // Hermes's state.db is read-only in txcript and Hermes has no
         // session-import command. Sessions convert *from* Hermes, never
         // into it.

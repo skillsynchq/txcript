@@ -2,10 +2,13 @@
 //!
 //! Kimi keeps session metadata in `state.json` and the append-only event stream
 //! for each agent in `agents/<name>/wire.jsonl`. The main conversation is the
-//! `agents/main` stream. Kimi has no documented session import or deletion
-//! interface, so [`KimiStore`] is deliberately read-only: sessions can be
-//! discovered, loaded, searched, exported, and converted into another
-//! harness, but txcript never writes an undocumented Kimi session.
+//! `agents/main` stream.
+//!
+//! [`KimiStore`] reads and writes. Kimi ships no import command, but it does
+//! not need one: it loads whatever `session_index.jsonl` points at, so writing
+//! a session means laying out the two files and appending one index record.
+//! The index is the only discovery path — a session on disk that is missing
+//! from it does not exist as far as Kimi is concerned.
 //!
 //! The native body retains both JSON files as raw JSON. This makes loading and
 //! rendering a session lossless even when Kimi adds bookkeeping events that
@@ -19,10 +22,11 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::common::{Block, Message, Meta, Role, StopReason, Tool, ToolOutput};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
 
@@ -76,7 +80,7 @@ impl Codec for Kimi {
     }
 }
 
-/// Read-only access to Kimi Code's session directories.
+/// Read/write access to Kimi Code's session directories.
 #[derive(Debug, Clone)]
 pub struct KimiStore {
     pub sessions_dir: PathBuf,
@@ -87,6 +91,32 @@ impl KimiStore {
         Self {
             sessions_dir: path.into(),
         }
+    }
+
+    /// `session_index.jsonl` sits in Kimi's data root, one level above
+    /// `sessions/`.
+    fn index_path(&self) -> Option<PathBuf> {
+        self.sessions_dir
+            .parent()
+            .map(|home| home.join("session_index.jsonl"))
+    }
+
+    /// Append one record to Kimi's session index, creating it if needed.
+    fn append_index(&self, record: &Value) -> Result<()> {
+        let Some(path) = self.index_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut line = serde_json::to_string(record)?;
+        line.push('\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, line.as_bytes())?;
+        Ok(())
     }
 
     /// Resolve `$KIMI_HOME/sessions`, falling back to
@@ -152,12 +182,51 @@ impl Store for KimiStore {
         Ok(Transcript::new(meta, body))
     }
 
-    fn save(&self, _transcript: &Transcript<Kimi>) -> Result<Saved<PathBuf>> {
-        Err(read_only_error())
+    fn save(&self, transcript: &Transcript<Kimi>) -> Result<Saved<PathBuf>> {
+        let id = if transcript.meta.id.is_empty() {
+            format!("session_{}", Uuid::new_v4())
+        } else {
+            transcript.meta.id.clone()
+        };
+        super::checked_id_component(Kimi::NAME, &id)?;
+        let work_dir = transcript.meta.cwd.clone().unwrap_or_default();
+
+        let session_dir = self.sessions_dir.join(workspace_key(&work_dir)).join(&id);
+        let agent_dir = session_dir.join("agents").join("main");
+        fs::create_dir_all(&agent_dir)?;
+
+        let mut state = transcript.body.state.clone();
+        ensure_state_identity(&mut state, &transcript.meta, &id, &agent_dir);
+        fs::write(
+            session_dir.join("state.json"),
+            serde_json::to_string_pretty(&state)?,
+        )?;
+        fs::write(
+            agent_dir.join("wire.jsonl"),
+            jsonl::render(&transcript.body.wire)?,
+        )?;
+
+        // Kimi finds sessions only through the index; a session that is on
+        // disk but absent from it does not exist as far as the CLI is
+        // concerned.
+        self.append_index(&json!({
+            "sessionId": id,
+            "sessionDir": session_dir.to_string_lossy(),
+            "workDir": work_dir,
+        }))?;
+
+        Ok(Saved {
+            id,
+            reference: session_dir,
+        })
     }
 
-    fn delete(&self, _reference: &PathBuf) -> Result<()> {
-        Err(read_only_error())
+    fn delete(&self, reference: &PathBuf) -> Result<()> {
+        let id = session_id_from_path(reference);
+        fs::remove_dir_all(reference)?;
+        // The index is append-only, so a removal is a tombstone record rather
+        // than a rewrite — matching how Kimi itself retires a session.
+        self.append_index(&json!({"sessionId": id, "deleted": true}))
     }
 
     fn fingerprints(&self, refs: &[PathBuf]) -> Result<HashMap<String, String>> {
@@ -174,10 +243,85 @@ impl Store for KimiStore {
     }
 }
 
-fn read_only_error() -> Error {
-    Error::Unconvertible {
-        harness: Kimi::NAME,
-        detail: "Kimi Code session storage is read-only in txcript; Kimi has no documented session import or delete command".to_string(),
+/// Kimi's workspace directory name: `wd_<slug>_<sha256(workDir)[..12]>`, where
+/// the slug is the working directory's last path segment, lowercased with
+/// every run of non-`[a-z0-9._-]` characters collapsed to `-`, trimmed of
+/// leading and trailing dashes and capped at 40 characters.
+///
+/// Getting this wrong does not hide a session — the index still points at it —
+/// but it breaks Kimi's own `--cwd` filtering and `kimi -c`, which resolve a
+/// working directory to this exact name.
+fn workspace_key(work_dir: &str) -> String {
+    const MAX_SLUG: usize = 40;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let normalized = work_dir.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    let base = normalized.rsplit('/').next().unwrap_or(normalized);
+
+    let mut slug = String::with_capacity(base.len());
+    let mut pending_dash = false;
+    for ch in base.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-') {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+            if slug.len() >= MAX_SLUG {
+                break;
+            }
+        } else {
+            pending_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+
+    let digest = <Sha256 as Digest>::digest(normalized.as_bytes());
+    let mut hash = String::with_capacity(12);
+    for &byte in digest.iter().take(6) {
+        hash.push(char::from(HEX[(byte >> 4) as usize]));
+        hash.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    format!("wd_{slug}_{hash}")
+}
+
+/// Make the written `state.json` self-describing. Kimi's own loader and
+/// txcript's directory-free `from_text` both read the id back out of it;
+/// `updatedAt` is what Kimi renders a session's time from (without it the CLI
+/// lists the session at the epoch); and `agents.<name>.homedir` is an absolute
+/// path only the store can fill in.
+///
+/// Every field but the id is filled in only when absent, so a native session's
+/// own bookkeeping survives a load/save round trip untouched.
+fn ensure_state_identity(state: &mut Value, meta: &Meta, id: &str, agent_dir: &Path) {
+    let Some(object) = state.as_object_mut() else {
+        return;
+    };
+    object.insert("sessionId".to_string(), json!(id));
+    if let Some(cwd) = &meta.cwd {
+        object.entry("workDir").or_insert_with(|| json!(cwd));
+    }
+    if let Some(title) = &meta.title {
+        object.entry("title").or_insert_with(|| json!(title));
+    }
+    let millis = meta.timestamp.timestamp_millis();
+    object.entry("createdAt").or_insert_with(|| json!(millis));
+    object.entry("updatedAt").or_insert_with(|| json!(millis));
+    // `homedir` is bound to where the session actually is, so it is rewritten
+    // rather than preserved: a session saved under a different root must not
+    // keep pointing at the old one.
+    let main = json!({
+        "homedir": agent_dir.to_string_lossy(),
+        "type": "main",
+        "parentAgentId": Value::Null,
+    });
+    match object.entry("agents").or_insert_with(|| json!({})) {
+        Value::Object(agents) => {
+            agents.insert("main".to_string(), main);
+        }
+        other => *other = json!({"main": main}),
     }
 }
 

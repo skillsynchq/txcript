@@ -161,7 +161,7 @@ fn native_text_round_trip_retains_unknown_wire_events() {
 }
 
 #[test]
-fn read_only_store_discovers_and_refuses_writes() {
+fn store_discovers_and_loads_a_session() {
     let root = tempfile::tempdir().unwrap();
     let session = root.path().join("wd_repo_hash").join("session_abc");
     write_session(&session, &sample_body());
@@ -175,8 +175,6 @@ fn read_only_store_discovers_and_refuses_writes() {
 
     let loaded = store.load(&found[0].reference).unwrap();
     assert_eq!(loaded.body, body);
-    assert!(store.save(&loaded).is_err());
-    assert!(store.delete(&found[0].reference).is_err());
 }
 
 #[test]
@@ -192,6 +190,226 @@ fn discovery_does_not_depend_on_the_directory_name() {
     let found = kimi::KimiStore::new(root.path()).discover().unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].meta.id, "conversation-7");
+}
+
+/// Kimi resolves its data root first and `sessions/` beneath it, so a store
+/// rooted at `<home>/sessions` puts the session index at `<home>`.
+fn kimi_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    home
+}
+
+fn saveable(id: &str, cwd: &str) -> txcript::Transcript<kimi::Kimi> {
+    let mut body = sample_body();
+    // Shaped like a real state.json, which always carries a creation time.
+    body.state = json!({
+        "sessionId": id,
+        "workDir": cwd,
+        "title": "Parser work",
+        "createdAt": 1_767_323_045_000_i64
+    });
+    txcript::Transcript::new(
+        common::Meta {
+            id: id.into(),
+            timestamp: ts("2026-01-02T03:04:05.000Z"),
+            cwd: Some(cwd.into()),
+            git_branch: None,
+            title: Some("Parser work".into()),
+            cli_version: None,
+            model: None,
+        },
+        body,
+    )
+}
+
+#[test]
+fn save_writes_the_layout_kimi_discovers() {
+    // Kimi keys a workspace directory by `wd_<slug>_<sha256(workDir)[:12]>`
+    // and finds sessions only through `session_index.jsonl` — there is no
+    // directory-scan fallback, so a save that skips the index is invisible.
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let saved = store.save(&saveable("session_abc", "/repo")).unwrap();
+
+    assert_eq!(saved.id, "session_abc");
+    let expected = home
+        .path()
+        .join("sessions")
+        .join("wd_repo_816fc349d3fa")
+        .join("session_abc");
+    assert_eq!(saved.reference, expected);
+    assert!(expected.join("state.json").is_file());
+    assert!(expected.join("agents/main/wire.jsonl").is_file());
+
+    let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(index.trim()).unwrap();
+    assert_eq!(entry["sessionId"], json!("session_abc"));
+    assert_eq!(entry["workDir"], json!("/repo"));
+    assert_eq!(entry["sessionDir"], json!(expected.to_str().unwrap()));
+}
+
+#[test]
+fn saved_session_is_discovered_and_loads_back() {
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let original = saveable("session_abc", "/repo");
+    store.save(&original).unwrap();
+
+    let found = store.discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].meta.id, "session_abc");
+
+    let loaded = store.load(&found[0].reference).unwrap();
+    // The wire log is carried through verbatim.
+    assert_eq!(loaded.body.wire, original.body.wire);
+    // `state` is normalized on the way out — `agents.main.homedir` names where
+    // the session actually landed — so the round-trip contract is that the
+    // normalization is a fixed point, not that it is a no-op.
+    let again = store.save(&loaded).unwrap();
+    assert_eq!(store.load(&again.reference).unwrap().body, loaded.body);
+}
+
+#[test]
+fn save_points_the_agent_homedir_at_where_the_session_landed() {
+    // Kimi resolves an agent's wire log through `agents.<name>.homedir`, and
+    // txcript's directory-free readers recover the session id from it. Saving
+    // into a different root has to rewrite it, or the copy points at the
+    // original.
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let saved = store.save(&saveable("session_abc", "/repo")).unwrap();
+
+    let elsewhere = kimi_home();
+    let other = kimi::KimiStore::new(elsewhere.path().join("sessions"));
+    let moved = other.save(&store.load(&saved.reference).unwrap()).unwrap();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(moved.reference.join("state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["agents"]["main"]["homedir"],
+        json!(moved.reference.join("agents/main").to_str().unwrap())
+    );
+}
+
+#[test]
+fn delete_removes_the_session_and_tombstones_the_index() {
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let saved = store.save(&saveable("session_abc", "/repo")).unwrap();
+
+    store.delete(&saved.reference).unwrap();
+    assert!(!saved.reference.exists());
+    // Kimi's index is append-only; a removal is a `deleted` record, not an
+    // edit, so a live Kimi reading the index still converges on "gone".
+    let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(index.lines().last().unwrap()).unwrap();
+    assert_eq!(last["sessionId"], json!("session_abc"));
+    assert_eq!(last["deleted"], json!(true));
+    assert_eq!(store.discover().unwrap().len(), 0);
+}
+
+#[test]
+fn save_fills_identity_a_converted_session_lacks() {
+    // A session converted from another harness has no Kimi state.json, so the
+    // fields Kimi and `from_text` read the session back from must be supplied.
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let mut transcript = saveable("session_abc", "/repo");
+    transcript.body.state = json!({});
+
+    let saved = store.save(&transcript).unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(saved.reference.join("state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["sessionId"], json!("session_abc"));
+    assert_eq!(state["workDir"], json!("/repo"));
+    assert_eq!(state["createdAt"], json!(1_767_323_045_000_i64));
+    // And the id survives without the directory, which is what the wasm
+    // parser and `from_text` depend on.
+    let text = kimi::Kimi::to_text(&store.load(&saved.reference).unwrap()).unwrap();
+    assert_eq!(kimi::Kimi::from_text(&text).unwrap().meta.id, "session_abc");
+}
+
+/// Kimi accepts sessions written from outside — it reads whatever the index
+/// points at — so `continue --with kimi` writes a real session rather than
+/// refusing.
+#[test]
+fn continuing_into_kimi_writes_a_session() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let common = kimi::Kimi::to_common(&saveable("session_abc", "/repo")).unwrap();
+    let written = txcript::local::write(txcript::HarnessId::Kimi, &common, Some(&sessions))
+        .expect("kimi accepts written sessions");
+    assert_eq!(written.id, "session_abc");
+
+    // Reach the session through discovery rather than the printed location,
+    // which is a Debug rendering shared by every harness.
+    let store = kimi::KimiStore::new(&sessions);
+    let found = store.discover().unwrap();
+    assert_eq!(found.len(), 1);
+    let dir = &found[0].reference;
+    assert!(dir.join("state.json").is_file());
+    assert!(dir.join("agents/main/wire.jsonl").is_file());
+    assert!(home.path().join("session_index.jsonl").is_file());
+}
+
+#[test]
+fn saved_state_carries_what_kimi_reads_a_session_by() {
+    // Kimi renders a session's time from `updatedAt` — without it the CLI
+    // lists the session at the epoch — and locates each agent's log through
+    // `agents.<name>.homedir`, which only the store knows the absolute path
+    // for. Both must be written even when the source had neither.
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let mut transcript = saveable("session_abc", "/repo");
+    transcript.body.state = json!({});
+
+    let saved = store.save(&transcript).unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(saved.reference.join("state.json")).unwrap())
+            .unwrap();
+
+    assert_eq!(state["updatedAt"], json!(1_767_323_045_000_i64));
+    assert_eq!(
+        state["agents"]["main"]["homedir"],
+        json!(saved.reference.join("agents/main").to_str().unwrap())
+    );
+}
+
+#[test]
+fn save_preserves_state_a_native_session_already_had() {
+    // A real Kimi state.json owns these fields; a save must not overwrite the
+    // session's own bookkeeping with txcript's idea of it.
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let mut transcript = saveable("session_abc", "/repo");
+    transcript.body.state["updatedAt"] = json!(1_799_999_999_000_i64);
+    transcript.body.state["isCustomTitle"] = json!(true);
+
+    let saved = store.save(&transcript).unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(saved.reference.join("state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["updatedAt"], json!(1_799_999_999_000_i64));
+    assert_eq!(state["isCustomTitle"], json!(true));
+}
+
+#[test]
+fn save_refuses_an_id_that_would_escape_the_store() {
+    let home = kimi_home();
+    let store = kimi::KimiStore::new(home.path().join("sessions"));
+    let error = store
+        .save(&saveable("../../escape", "/repo"))
+        .expect_err("a traversing id must be rejected");
+    assert!(
+        error.to_string().contains("not usable as a file name"),
+        "expected an id-shape rejection, got: {error}"
+    );
+    assert!(!home.path().parent().unwrap().join("escape").exists());
 }
 
 fn write_session(dir: &std::path::Path, body: &kimi::KimiSession) {
