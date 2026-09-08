@@ -4,6 +4,11 @@
 //! blobs. JSON message blobs carry the conversation; non-JSON/protobuf blobs
 //! carry Cursor's internal graph state. This harness preserves every blob byte
 //! for native load/save, while converting JSON message blobs through `Common`.
+//!
+//! `from_common` must write both graphs Cursor actually resumes from:
+//! `ConversationStateStructure` field 8 (`turns`) *and* field 1
+//! (`root_prompt_messages_json`) — blob ids of those JSON messages. The
+//! CLI's model prompt is field 1; turns without it resume as an empty thread.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -497,6 +502,7 @@ fn db_from_messages(meta: &Meta, messages: &[Message]) -> Result<CursorDb> {
 #[derive(Debug, Default)]
 struct CursorStateTurn {
     user_text: String,
+    started_ms: u64,
     steps: Vec<CursorStateStep>,
 }
 
@@ -523,14 +529,20 @@ struct CursorStateToolResult {
 fn cursor_state_blobs(
     meta: &Meta,
     messages: &[Message],
-    _message_ids: &[String],
+    message_ids: &[String],
 ) -> Vec<CursorBlob> {
     let turns = cursor_state_turns(meta, messages);
     let mut blobs = Vec::new();
     let mut turn_ids = Vec::new();
+    let prompt_ids: Vec<[u8; 32]> = message_ids.iter().filter_map(|id| blob_id32(id)).collect();
 
     for (turn_idx, turn) in turns.iter().enumerate() {
-        let user_blob = cursor_blob(cursor_user_message_proto(meta, turn_idx, &turn.user_text));
+        let user_blob = cursor_blob(cursor_user_message_proto(
+            meta,
+            turn_idx,
+            &turn.user_text,
+            turn.started_ms,
+        ));
         let user_id = sha256(&user_blob.data);
         blobs.push(user_blob);
 
@@ -554,7 +566,11 @@ fn cursor_state_blobs(
         blobs.push(turn_blob);
     }
 
-    blobs.push(cursor_blob(cursor_root_state_proto(meta, &turn_ids)));
+    blobs.push(cursor_blob(cursor_root_state_proto(
+        meta,
+        &turn_ids,
+        &prompt_ids,
+    )));
     blobs
 }
 
@@ -574,6 +590,7 @@ fn cursor_state_turns(meta: &Meta, messages: &[Message]) -> Vec<CursorStateTurn>
                     }
                     current = Some(CursorStateTurn {
                         user_text,
+                        started_ms: message_started_ms(message),
                         steps: Vec::new(),
                     });
                 }
@@ -583,6 +600,7 @@ fn cursor_state_turns(meta: &Meta, messages: &[Message]) -> Vec<CursorStateTurn>
                 if !tool_result_text.is_empty() {
                     let turn = current.get_or_insert_with(|| CursorStateTurn {
                         user_text: "Tool result".to_string(),
+                        started_ms: message_started_ms(message),
                         steps: Vec::new(),
                     });
                     turn.steps
@@ -595,6 +613,7 @@ fn cursor_state_turns(meta: &Meta, messages: &[Message]) -> Vec<CursorStateTurn>
                         .title
                         .clone()
                         .unwrap_or_else(|| "Continue.".to_string()),
+                    started_ms: message_started_ms(message),
                     steps: Vec::new(),
                 });
                 turn.steps
@@ -742,11 +761,24 @@ fn cursor_blob(data: Vec<u8>) -> CursorBlob {
     CursorBlob { id, data }
 }
 
-fn cursor_user_message_proto(meta: &Meta, turn_idx: usize, text: &str) -> Vec<u8> {
+fn cursor_user_message_proto(
+    meta: &Meta,
+    turn_idx: usize,
+    text: &str,
+    started_ms: u64,
+) -> Vec<u8> {
+    let message_id = cursor_message_id(&meta.id, turn_idx, text);
     let mut out = Vec::new();
     pb_string(&mut out, 1, text);
-    pb_string(&mut out, 2, &cursor_message_id(&meta.id, turn_idx, text));
+    pb_string(&mut out, 2, &message_id);
+    // Native writes selected_context as a present-empty message (field 3).
+    pb_len(&mut out, 3, &[]);
     pb_varint_field(&mut out, 4, 1);
+    pb_string(&mut out, 17, &message_id);
+    if started_ms > 0 {
+        pb_varint_field(&mut out, 25, started_ms);
+        pb_varint_field(&mut out, 26, started_ms);
+    }
     out
 }
 
@@ -1186,8 +1218,15 @@ fn cursor_turn_structure_proto(user_id: &[u8; 32], step_ids: &[[u8; 32]]) -> Vec
     turn
 }
 
-fn cursor_root_state_proto(meta: &Meta, turn_ids: &[[u8; 32]]) -> Vec<u8> {
+fn cursor_root_state_proto(
+    meta: &Meta,
+    turn_ids: &[[u8; 32]],
+    prompt_ids: &[[u8; 32]],
+) -> Vec<u8> {
     let mut root = Vec::new();
+    for prompt_id in prompt_ids {
+        pb_len(&mut root, 1, prompt_id);
+    }
     for turn_id in turn_ids {
         pb_len(&mut root, 8, turn_id);
     }
@@ -1199,6 +1238,14 @@ fn cursor_root_state_proto(meta: &Meta, turn_ids: &[[u8; 32]]) -> Vec<u8> {
         pb_varint_field(&mut root, 26, ms);
     }
     root
+}
+
+fn message_started_ms(message: &Message) -> u64 {
+    u64::try_from(message.timestamp.timestamp_millis()).unwrap_or(0)
+}
+
+fn blob_id32(hex_id: &str) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(hex_decode(hex_id).ok()?).ok()
 }
 
 fn cursor_message_id(session_id: &str, turn_idx: usize, text: &str) -> String {

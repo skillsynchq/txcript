@@ -196,7 +196,19 @@ fn from_common_writes_cursor_resume_state_turns() {
     let turn_refs = len_fields(&root.data, 8);
 
     assert_eq!(turn_refs.len(), 1);
-    assert!(len_fields(&root.data, 1).is_empty());
+    let prompt_refs = len_fields(&root.data, 1);
+    assert_eq!(prompt_refs.len(), 4);
+    for prompt_ref in &prompt_refs {
+        let prompt_id = hex_encode_test(prompt_ref);
+        let blob = native
+            .body
+            .blobs
+            .iter()
+            .find(|blob| blob.id == prompt_id)
+            .expect("prompt json blob exists");
+        let obj: serde_json::Value = serde_json::from_slice(&blob.data).expect("prompt json");
+        assert!(obj.get("role").and_then(serde_json::Value::as_str).is_some());
+    }
 
     let turn_id = hex_encode_test(&turn_refs[0]);
     let turn_blob = native
@@ -214,10 +226,14 @@ fn from_common_writes_cursor_resume_state_turns() {
     assert!(step_refs.len() >= 3);
 
     let user_id = hex_encode_test(&user_refs[0]);
-    assert!(
-        native.body.blobs.iter().any(|blob| blob.id == user_id),
-        "user message blob exists"
-    );
+    let user_blob = native
+        .body
+        .blobs
+        .iter()
+        .find(|blob| blob.id == user_id)
+        .expect("user message blob exists");
+    assert_eq!(string_fields(&user_blob.data, 17).len(), 1);
+    assert!(!varint_fields(&user_blob.data, 25).is_empty());
     let mut read_tool_call = None;
     for step_ref in step_refs {
         let step_id = hex_encode_test(&step_ref);
