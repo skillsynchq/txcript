@@ -579,6 +579,14 @@ mod tests {
         let other = format!("call-{}y", "x".repeat(79));
         assert_eq!(other.len(), 85);
         assert_ne!(sanitize_tool_id(&raw), sanitize_tool_id(&other));
+        // Live Cursor toolCallId from the 2026-09-10 one-mcp hop: two UUIDs
+        // joined by a newline, 85 bytes. Codex 400'd on this exact string.
+        let cursor = "call-373bdab5-8d27-48f2-b656-b24f2a48fe3e-0\nfc_64275aa7-deb0-9662-8c56-93498915a3e7_0";
+        assert_eq!(cursor.len(), 85);
+        let clamped = sanitize_tool_id(cursor);
+        assert!(clamped.len() <= TOOL_ID_MAX_LEN, "{clamped}");
+        assert!(!clamped.contains('\n'), "{clamped}");
+        assert_eq!(sanitize_tool_id(cursor), sanitize_tool_id(cursor));
     }
 
     /// A known tool with a known schema becomes the typed variant, and round
