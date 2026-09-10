@@ -11,7 +11,9 @@
 //!
 //! `from_common` emits both `response_item` and `event_msg` logs so Codex can
 //! resume and replay the session. It also emits `turn_context`, `token_count`,
-//! and `task_complete` records for model and usage metadata.
+//! and `task_complete` records for model and usage metadata. Tool ids are
+//! folded through [`crate::common::sanitize_message_tool_ids`] so Codex Responses `call_id`
+//! stays at most 64 characters and use/result pairs remain linked.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -22,7 +24,9 @@ use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::common::{Block, ImageSource, Message, Meta, Role, Tool, ToolOutput, Usage};
+use crate::common::{
+    Block, ImageSource, Message, Meta, Role, Tool, ToolOutput, Usage, sanitize_message_tool_ids,
+};
 use crate::error::Result;
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
@@ -476,6 +480,7 @@ fn tool_result(
 // ── codec: from_common ─────────────────────────────────────────────────
 
 fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
+    let messages: Vec<Message> = messages.iter().map(sanitize_message_tool_ids).collect();
     let mut lines = Vec::new();
 
     // session_meta — codex requires model_provider/base_instructions present

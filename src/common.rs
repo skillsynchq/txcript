@@ -13,6 +13,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// Session-level metadata, common to every harness.
 ///
@@ -103,12 +104,19 @@ pub enum Block {
     Artifact { artifact: Artifact },
 }
 
-/// Fold a native tool-call id onto Anthropic's `tool_use.id` grammar
-/// (`^[a-zA-Z0-9_-]+$`). Common is the Anthropic-shaped hub; this is the
-/// charset every harness can round-trip through it.
+/// Codex Responses `call_id` max (`string_above_max_length`). Anthropic's
+/// `tool_use.id` charset is the other half of this grammar; length is the
+/// tighter of the two writers that share Common.
+pub const TOOL_ID_MAX_LEN: usize = 64;
+
+/// Fold a native tool-call id onto the grammar every writer can emit:
+/// ASCII `[A-Za-z0-9_-]` and at most [`TOOL_ID_MAX_LEN`] characters. Overlong
+/// ids keep a stable prefix and a UUID-v5 suffix of the folded value so a
+/// `ToolUse` and its `ToolResult` still share one id after the hop.
 #[must_use]
 pub fn sanitize_tool_id(raw: &str) -> String {
-    raw.chars()
+    let folded: String = raw
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
@@ -116,7 +124,26 @@ pub fn sanitize_tool_id(raw: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    clamp_tool_id_len(&folded)
+}
+
+fn clamp_tool_id_len(id: &str) -> String {
+    if id.len() <= TOOL_ID_MAX_LEN {
+        return id.to_string();
+    }
+    // Namespace is fixed: changing it rewrites every clamped hop id.
+    const NS: Uuid = Uuid::from_bytes([
+        0xb4, 0x70, 0x11, 0x64, 0xca, 0x11, 0x4d, 0x40, 0x88, 0x64, 0x00, 0x64, 0x00, 0x00, 0x00,
+        0x40,
+    ]);
+    let hash = Uuid::new_v5(&NS, id.as_bytes()).simple().to_string();
+    let keep = TOOL_ID_MAX_LEN.saturating_sub(hash.len().saturating_add(1));
+    let mut out = String::with_capacity(TOOL_ID_MAX_LEN);
+    out.extend(id.chars().take(keep));
+    out.push('_');
+    out.push_str(&hash);
+    out
 }
 
 /// Rewrite tool-call ids on a message so use/result pairs stay linked.
@@ -537,6 +564,21 @@ mod tests {
             sanitize_tool_id("toolu_01Fr4RzrGVoJBMVCyX6X4dMw"),
             "toolu_01Fr4RzrGVoJBMVCyX6X4dMw"
         );
+    }
+
+    /// Codex Responses rejects `call_id` over 64. Cursor ids can be longer;
+    /// use/result pairs must hash to the same clamped value.
+    #[test]
+    fn sanitize_tool_id_clamps_codex_call_id_limit() {
+        let raw = format!("call-{}", "x".repeat(80));
+        assert_eq!(raw.len(), 85);
+        let out = sanitize_tool_id(&raw);
+        assert!(out.len() <= TOOL_ID_MAX_LEN, "{out}");
+        assert_eq!(out, sanitize_tool_id(&raw));
+        assert_eq!(sanitize_tool_id(&out), out);
+        let other = format!("call-{}y", "x".repeat(79));
+        assert_eq!(other.len(), 85);
+        assert_ne!(sanitize_tool_id(&raw), sanitize_tool_id(&other));
     }
 
     /// A known tool with a known schema becomes the typed variant, and round

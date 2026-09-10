@@ -207,7 +207,11 @@ fn from_common_writes_cursor_resume_state_turns() {
             .find(|blob| blob.id == prompt_id)
             .expect("prompt json blob exists");
         let obj: serde_json::Value = serde_json::from_slice(&blob.data).expect("prompt json");
-        assert!(obj.get("role").and_then(serde_json::Value::as_str).is_some());
+        assert!(
+            obj.get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
     }
 
     let turn_id = hex_encode_test(&turn_refs[0]);
@@ -579,6 +583,59 @@ fn native_call_ids_are_sanitized_into_common() {
         })
         .collect();
     assert_eq!(ids, ["call-abc-12_fc_def_4"]);
+}
+
+#[test]
+fn native_call_ids_are_clamped_to_codex_max() {
+    let tool_call_id = format!("call-{}", "x".repeat(80));
+    assert_eq!(tool_call_id.len(), 85);
+    let body = cursor::CursorDb {
+        blobs: vec![cursor::CursorBlob {
+            id: "assistant".into(),
+            data: serde_json::to_vec(&json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool-call",
+                    "toolCallId": tool_call_id,
+                    "toolName": "ReadFile",
+                    "args": { "target_file": "/repo/x.rs" }
+                }]
+            }))
+            .unwrap(),
+        }],
+        meta: Vec::new(),
+        session_meta: Some(json!({"schemaVersion": 1, "hasConversation": true})),
+    };
+    let transcript = Transcript::<cursor::Cursor>::new(
+        common::Meta {
+            id: "sess".into(),
+            timestamp: ts("2026-01-02T03:04:05.000Z"),
+            cwd: None,
+            git_branch: None,
+            title: None,
+            cli_version: None,
+            model: None,
+        },
+        body,
+    );
+    let common = cursor::Cursor::to_common(&transcript).unwrap();
+    let ids: Vec<&str> = common
+        .body
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            common::Block::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert!(
+        ids[0].len() <= common::TOOL_ID_MAX_LEN,
+        "id len {} > {}: {}",
+        ids[0].len(),
+        common::TOOL_ID_MAX_LEN,
+        ids[0]
+    );
 }
 
 fn latest_root_blob(body: &cursor::CursorDb) -> &cursor::CursorBlob {
