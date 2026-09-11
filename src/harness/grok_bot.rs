@@ -1285,6 +1285,10 @@ pub fn common_to_transcript_entries(common: &Transcript<Common>) -> Vec<Value> {
     let mut out = Vec::new();
     let mut user_i = 0u32;
     let mut asst_turn = 0u32;
+    // Part counter is per assistant *turn* (reset on each emitted user entry),
+    // not per assistant *message* — consecutive assistant messages after tools
+    // must not reuse `tNa0` or SQLite UNIQUE on transcript_entries.id fails.
+    let mut part = 0u32;
     for message in &common.body {
         let ts = u64::try_from(message.timestamp.timestamp_millis().max(0)).unwrap_or(0);
         match message.role {
@@ -1303,6 +1307,7 @@ pub fn common_to_transcript_entries(common: &Transcript<Common>) -> Vec<Value> {
                 let id = format!("t{user_i}u");
                 user_i += 1;
                 asst_turn = user_i.saturating_sub(1);
+                part = 0;
                 out.push(json!({
                     "kind": "message",
                     "id": id,
@@ -1313,7 +1318,6 @@ pub fn common_to_transcript_entries(common: &Transcript<Common>) -> Vec<Value> {
                 }));
             }
             Role::Assistant => {
-                let mut part = 0u32;
                 for block in &message.content {
                     let Block::Text { text } = block else {
                         continue;

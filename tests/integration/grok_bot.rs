@@ -346,6 +346,69 @@ fn common_to_transcript_entries_maps_user_and_assistant_text() {
 }
 
 #[test]
+fn common_to_transcript_entries_ids_unique_across_consecutive_assistants() {
+    // Codex-style tool rounds emit consecutive assistant messages with no
+    // user between them; ids must stay unique or mint hits SQLite UNIQUE.
+    let common = Transcript::new(
+        Meta {
+            id: "unique-entry-ids".into(),
+            timestamp: ts(),
+            cwd: None,
+            git_branch: None,
+            title: Some("unique".into()),
+            cli_version: None,
+            model: None,
+        },
+        vec![
+            msg(Role::User, vec![Block::Text { text: "hi".into() }]),
+            msg(
+                Role::Assistant,
+                vec![Block::Text {
+                    text: "first".into(),
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                vec![Block::Text {
+                    text: "second".into(),
+                }],
+            ),
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "again".into(),
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                vec![
+                    Block::Text {
+                        text: "part0".into(),
+                    },
+                    Block::Text {
+                        text: "part1".into(),
+                    },
+                ],
+            ),
+        ],
+    );
+    let entries = grok_bot::common_to_transcript_entries(&common);
+    let ids: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["t0u", "t0a0", "t0a1", "t1u", "t1a0", "t1a1"],
+        "{entries:?}"
+    );
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "duplicate ids: {ids:?}");
+}
+
+#[test]
 fn friendly_aliases_resolve_to_grok_bot() {
     for alias in [
         "grok_bot",
