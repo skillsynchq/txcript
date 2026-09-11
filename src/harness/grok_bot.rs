@@ -723,17 +723,25 @@ fn file_fingerprint(path: &Path) -> String {
 /// (the `opencode` or `hermes` feature). Seeds `agents/<id>/store.db`
 /// `transcript_entries`, writes agent-transcripts JSONL, then `openAgent`.
 ///
+/// `metadata` is an optional JSON object from `txcript continue --metadata`.
+/// Recognized keys today: `name`, `description` (agent profile). Unknown keys
+/// are ignored.
+///
 /// # Errors
-/// When the gateway is unreachable, `SQLite` support is missing, or agent
-/// creation / seeding fails.
-pub fn mint_with_history(common: &Transcript<Common>) -> Result<Saved<PathBuf>> {
+/// When the live `agents` / `agent-transcripts` dirs are missing, the gateway
+/// is unreachable, `SQLite` support is missing, or agent creation / seeding
+/// fails.
+pub fn mint_with_history(
+    common: &Transcript<Common>,
+    metadata: Option<&Value>,
+) -> Result<Saved<PathBuf>> {
     #[cfg(any(feature = "opencode", feature = "hermes"))]
     {
-        mint_with_history_inner(common)
+        mint_with_history_inner(common, metadata)
     }
     #[cfg(not(any(feature = "opencode", feature = "hermes")))]
     {
-        let _ = common;
+        let _ = (common, metadata);
         Err(Error::Unconvertible {
             harness: GrokBot::NAME,
             detail: "continuing into grok_bot requires the opencode or hermes \
@@ -743,8 +751,37 @@ pub fn mint_with_history(common: &Transcript<Common>) -> Result<Saved<PathBuf>> 
     }
 }
 
+/// Open an existing agent in the Grok Bot UI (no CLI resume binary).
+///
+/// # Errors
+/// When the local gateway cannot be reached or rejects the request.
+pub fn open_in_ui(id: &str) -> Result<()> {
+    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    {
+        let gateway = Gateway::discover().ok_or_else(|| Error::Unconvertible {
+            harness: GrokBot::NAME,
+            detail: "no local Grok Bot gateway (expected $HOME/agent-data/gateway.json \
+                     or TXCRIPT_GROK_BOT_GATEWAY + TXCRIPT_GROK_BOT_TOKEN)"
+                .to_string(),
+        })?;
+        let _ = gateway.open_agent(id)?;
+        Ok(())
+    }
+    #[cfg(not(any(feature = "opencode", feature = "hermes")))]
+    {
+        let _ = id;
+        Err(Error::Unconvertible {
+            harness: GrokBot::NAME,
+            detail: "opening a grok_bot agent requires the opencode or hermes feature".to_string(),
+        })
+    }
+}
+
 #[cfg(any(feature = "opencode", feature = "hermes"))]
-fn mint_with_history_inner(common: &Transcript<Common>) -> Result<Saved<PathBuf>> {
+fn mint_with_history_inner(
+    common: &Transcript<Common>,
+    metadata: Option<&Value>,
+) -> Result<Saved<PathBuf>> {
     let gateway = Gateway::discover().ok_or_else(|| Error::Unconvertible {
         harness: GrokBot::NAME,
         detail: "no local Grok Bot gateway (expected $HOME/agent-data/gateway.json \
@@ -759,17 +796,9 @@ fn mint_with_history_inner(common: &Transcript<Common>) -> Result<Saved<PathBuf>
         harness: GrokBot::NAME,
         detail: "cannot resolve agent-transcripts root for grok_bot mint".to_string(),
     })?;
+    preflight_live_roots(&agents_root, &transcripts.root)?;
 
-    let name = common
-        .meta
-        .title
-        .as_deref()
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or("txcript session")
-        .chars()
-        .take(80)
-        .collect::<String>();
-    let description = "Continued into Grok Bot by txcript".to_string();
+    let (name, description) = agent_profile_from(common, metadata);
 
     let id = gateway.create_agent(&name, &description)?;
     super::checked_id_component(GrokBot::NAME, &id)?;
@@ -801,6 +830,75 @@ fn mint_with_history_inner(common: &Transcript<Common>) -> Result<Saved<PathBuf>
         id,
         reference: saved.reference,
     })
+}
+
+/// Resolve createAgent name/description from `--metadata` and transcript meta.
+#[must_use]
+pub fn agent_profile_from(
+    common: &Transcript<Common>,
+    metadata: Option<&Value>,
+) -> (String, String) {
+    let meta_name = metadata_string(metadata, "name");
+    let meta_desc = metadata_string(metadata, "description");
+    let name = meta_name
+        .or_else(|| {
+            common
+                .meta
+                .title
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.chars().take(80).collect::<String>())
+        })
+        .unwrap_or_else(|| "txcript session".to_string());
+    let description = meta_desc.unwrap_or_else(|| "Continued into Grok Bot by txcript".to_string());
+    (name.chars().take(80).collect(), description)
+}
+
+fn metadata_string(metadata: Option<&Value>, key: &str) -> Option<String> {
+    let v = metadata?.get(key)?;
+    match v {
+        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Ensure the live Grok Bot layout exists and is writable before minting.
+///
+/// # Errors
+/// When either directory is missing or not writable.
+pub fn preflight_live_roots(agents: &Path, transcripts: &Path) -> Result<()> {
+    for (label, path) in [("agents", agents), ("agent-transcripts", transcripts)] {
+        if !path.is_dir() {
+            return Err(Error::Unconvertible {
+                harness: GrokBot::NAME,
+                detail: format!(
+                    "live grok_bot {label} directory missing at {} — continue into \
+                     grok_bot needs a Grok Bot box layout (`~/agent-data/agents` and \
+                     `~/agent-data/agent-transcripts`, or TXCRIPT_GROK_BOT_AGENTS / \
+                     TXCRIPT_GROK_BOT_ROOT). Use --out <dir> for JSONL-only export",
+                    path.display()
+                ),
+            });
+        }
+        let probe = path.join(".txcript-write-probe");
+        match fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+            }
+            Err(e) => {
+                return Err(Error::Unconvertible {
+                    harness: GrokBot::NAME,
+                    detail: format!(
+                        "live grok_bot {label} directory not writable at {}: {e}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Project Common messages into the UI ledger shape used by `store.db`.

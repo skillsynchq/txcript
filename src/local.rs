@@ -634,6 +634,16 @@ pub struct Written {
     pub location: String,
 }
 
+/// Optional knobs for [`write_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteOpts<'a> {
+    /// Override the harness's default on-disk root (file-backed stores).
+    pub root: Option<&'a Path>,
+    /// Harness-specific mint / import metadata (JSON object). Unknown keys are
+    /// ignored by harnesses that do not consume them yet.
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
 /// Persist a canonical transcript in `target`'s native, resumable format.
 /// `root` overrides the harness's default on-disk root (file-backed stores
 /// only; `OpenCode` always goes through `opencode import` into the live
@@ -642,13 +652,32 @@ pub struct Written {
 ///
 /// # Errors
 /// When conversion to the target fails or its store rejects the write.
-// One dispatch arm per harness; length grows with the harness count, not
-// with complexity.
-#[allow(clippy::too_many_lines)]
 pub fn write(
     target: HarnessId,
     common: &Transcript<Common>,
     root: Option<&Path>,
+) -> Result<Written> {
+    write_with(
+        target,
+        common,
+        WriteOpts {
+            root,
+            metadata: None,
+        },
+    )
+}
+
+/// [`write`] with optional harness-specific [`WriteOpts::metadata`].
+///
+/// # Errors
+/// When conversion to the target fails or its store rejects the write.
+// One dispatch arm per harness; length grows with the harness count, not
+// with complexity.
+#[allow(clippy::too_many_lines)]
+pub fn write_with(
+    target: HarnessId,
+    common: &Transcript<Common>,
+    opts: WriteOpts<'_>,
 ) -> Result<Written> {
     fn go<S>(
         store: Option<S>,
@@ -674,6 +703,7 @@ pub fn write(
         })
     }
 
+    let root = opts.root;
     match target {
         HarnessId::ClaudeCode => write_claude_code(common, root),
         // Live web sources are server-authoritative and have no import. Their
@@ -738,7 +768,7 @@ pub fn write(
                     location: saved.reference.display().to_string(),
                 })
             } else {
-                let saved = grok_bot::mint_with_history(common)?;
+                let saved = grok_bot::mint_with_history(common, opts.metadata)?;
                 Ok(Written {
                     id: saved.id,
                     location: saved.reference.display().to_string(),
@@ -984,8 +1014,9 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             // the session is in the Agents sidebar.
             HarnessId::CursorDesktop => ("cursor".into(), Vec::new()),
             HarnessId::Grok => ("grok".into(), vec!["--resume".into(), id]),
-            // Mint opens the agent via the local gateway; no CLI resume binary.
-            HarnessId::GrokBot => ("true".into(), Vec::new()),
+            // No CLI resume: continue never launches for grok_bot (mint /
+            // openAgent already surfaced the agent in the product UI).
+            HarnessId::GrokBot => ("txcript".into(), Vec::new()),
             HarnessId::Fx => ("fx".into(), vec!["--resume".into(), id]),
             HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),

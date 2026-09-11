@@ -64,26 +64,42 @@ A minimal synthetic session:
 
 ## Continue-into / write
 
-`local::write` / `txcript continue --with grok_bot` mints a **new** box-harness
-agent on the live local gateway and seeds UI history:
+`txcript continue --with grok_bot` mints a **new** box-harness agent on the
+live local gateway and seeds UI history. It never launches a CLI resume
+(`--no-resume` is implied for `grok_bot`).
 
-1. `POST /api/createAgent` with `{name, description, harness: "box"}`
+1. Preflight: `~/agent-data/agents` and `~/agent-data/agent-transcripts` must
+   exist and be writable (or `TXCRIPT_GROK_BOT_AGENTS` /
+   `TXCRIPT_GROK_BOT_ROOT` / `GROK_BOT_TRANSCRIPTS`). Missing layout fails
+   cleanly — use `--out <dir>` for JSONL-only export without a live box.
+2. `POST /api/createAgent` with `{name, description, harness: "box"}`
    (Bearer token from `$HOME/agent-data/gateway.json`, or
    `TXCRIPT_GROK_BOT_GATEWAY` + `TXCRIPT_GROK_BOT_TOKEN`).
-2. Unlock the new agent's `store.db` by opening another agent (createAgent
-   leaves the new one active and locks the DB).
-3. Write Common text turns into `agents/<id>/store.db` `transcript_entries`
-   (`kind: message` / `send-message`).
-4. Write agent-transcripts JSONL for the read path.
-5. `POST /api/openAgent` with the new id — history appears in the product.
+3. Unlock the new agent's `store.db` by opening another agent.
+4. Write Common text turns into `agents/<id>/store.db` `transcript_entries`.
+5. Write agent-transcripts JSONL for the read path.
+6. `POST /api/openAgent` with the new id — history appears in the product.
 
-A `--root` override writes JSONL only (no gateway); that path is for tests and
-offline conversion and does **not** surface chat in the UI.
+### `--metadata`
 
-Cloning an existing agent while preserving its encrypted blob history is a
-separate verified sequence (`duplicateAgent` + restore `store.db` /
-`conversation-blobs.db` with `blobEncryptionKey` / `latestRootBlobId` kept).
-txcript's continue-into path does not need that for Common→UI text history.
+Repeatable `key=value` or a JSON object, merged left-to-right. `grok_bot`
+recognizes:
+
+| Key | Effect |
+|---|---|
+| `name` | Agent display name for `createAgent` (else transcript title / `"txcript session"`) |
+| `description` | Agent description (else a fixed txcript default) |
+
+Unknown keys are ignored (forward-compatible for other harnesses).
+
+```sh
+txcript continue ./run.json --with grok_bot \
+  --metadata name='Relay bot' \
+  --metadata description='Continued from Simple'
+
+txcript continue ./run.json --with grok_bot \
+  --metadata '{"name":"Relay bot","description":"from Simple","future":true}'
+```
 
 
 ## Caveats

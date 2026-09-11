@@ -111,7 +111,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 
 <sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. txcript only reads: it refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT has no supported conversation API, so this access may change or be restricted. ChatGPT data-export archives are not supported.
 
-<sup>6</sup> Continue-into mints a new box-harness agent via the local gateway (`createAgent` + seeding `store.db` transcript_entries + agent-transcripts JSONL + `openAgent`). Requires a reachable gateway (`~/agent-data/gateway.json`) and SQLite features. A root override writes JSONL only (no UI history).
+<sup>6</sup> Continue-into mints a new box-harness agent via the local gateway (`createAgent` + seeding `store.db` transcript_entries + agent-transcripts JSONL + `openAgent`) and never launches a CLI. Requires live `~/agent-data/agents` + `agent-transcripts` (or env overrides), a reachable gateway, and SQLite features. `--metadata name=…` / `description=…` set the minted profile. `--out <dir>` writes JSONL only (no UI history).
 
 ## Install
 

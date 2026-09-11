@@ -357,3 +357,41 @@ fn friendly_aliases_resolve_to_grok_bot() {
         assert_eq!(alias.parse::<HarnessId>().unwrap(), HarnessId::GrokBot);
     }
 }
+
+#[test]
+fn agent_profile_from_prefers_metadata_name() {
+    let common = fixpoint_common();
+    let meta = json!({"name": "Relay bot", "description": "from Simple", "extra": 1});
+    let (name, desc) = grok_bot::agent_profile_from(&common, Some(&meta));
+    assert_eq!(name, "Relay bot");
+    assert_eq!(desc, "from Simple");
+}
+
+#[test]
+fn agent_profile_from_falls_back_to_title() {
+    let common = fixpoint_common();
+    let (name, desc) = grok_bot::agent_profile_from(&common, None);
+    assert_eq!(name, "fixpoint");
+    assert!(desc.contains("txcript"));
+}
+
+#[test]
+fn preflight_rejects_missing_agents_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing_agents = tmp.path().join("no-agents");
+    let transcripts = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let err = grok_bot::preflight_live_roots(&missing_agents, &transcripts).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("agents directory missing"), "{msg}");
+}
+
+#[test]
+fn preflight_accepts_existing_writable_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    let transcripts = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::create_dir_all(&transcripts).unwrap();
+    grok_bot::preflight_live_roots(&agents, &transcripts).unwrap();
+}

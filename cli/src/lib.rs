@@ -12,9 +12,13 @@
 //!     [--from <harness>]                    #   scope the id lookup to one harness
 //!     [--out <dir>]                         #   write under <dir>; implies --no-resume
 //!     [--no-resume]                         #   write the session but don't launch
+//!     [--metadata <spec>]                   #   harness mint options (repeatable;
+//!                                           #   key=value or JSON object; grok_bot
+//!                                           #   uses name/description)
 //! txcript continue <file|->[#range]     # continue a Simple document (file, or stdin
 //!     --with <harness> [...]                #   for `-`) into <harness>; see
 //!                                           #   docs/formats/simple.md
+//!                                           #   --with grok_bot never launches a CLI
 //! txcript crop <id>[#range]             # interactively cut messages and save a copy
 //!     [--with <harness>]                    #   optionally convert the cropped copy
 //!     [--from <harness>]                    #   scope the source lookup
@@ -143,6 +147,10 @@ pub enum SessionCommand {
     /// transcript in the format of docs/formats/simple.md continues into
     /// the harness named by --with (required for documents).
     ///
+    /// `--with grok_bot` is write/mint only: it never launches a CLI resume
+    /// (`--no-resume` is implied). Use `--metadata` for mint options such as
+    /// `name` / `description`.
+    ///
     /// Anything that writes a copy writes a *new* session, with its own id and
     /// today's timestamp — the source is never modified. The printed resume
     /// command carries the new id.
@@ -170,6 +178,12 @@ pub enum SessionCommand {
         /// Write the session but don't launch the harness
         #[arg(long)]
         no_resume: bool,
+        /// Harness-specific mint / import options (repeatable). Each value is
+        /// either `key=value` or a JSON object. Merged left-to-right; unknown
+        /// keys are ignored by harnesses that do not consume them. `grok_bot`
+        /// recognizes `name` and `description` for the minted agent profile.
+        #[arg(long, value_name = "SPEC")]
+        metadata: Vec<String>,
     },
     /// Interactively crop a session into a new, resumable session
     ///
@@ -372,7 +386,8 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             from,
             out,
             no_resume,
-        } => cmd_continue(&id, with, from, out.as_ref(), no_resume),
+            metadata,
+        } => cmd_continue(&id, with, from, out.as_ref(), no_resume, &metadata),
         SessionCommand::Crop { source, with, from } => cmd_crop(&source, with, from),
         SessionCommand::View {
             source,
@@ -1162,7 +1177,7 @@ fn crop_loaded(
         .map_err(|error| error.to_string())?;
     fresh_identity(&mut cropped, target, None);
     stamp_live_cwd(&mut cropped, None);
-    let cropped_id = write_and_report(source, target, &cropped, None)?;
+    let cropped_id = write_and_report(source, target, &cropped, None, None)?;
     let edited = match outcome.edited {
         0 => String::new(),
         1 => " (1 message edited)".to_string(),
@@ -1182,7 +1197,13 @@ fn cmd_continue(
     from: Option<HarnessId>,
     out: Option<&PathBuf>,
     no_resume: bool,
+    metadata_specs: &[String],
 ) -> Result<ExitCode, String> {
+    let metadata = parse_metadata_specs(metadata_specs)?;
+    let metadata =
+        (!metadata.as_object().is_some_and(serde_json::Map::is_empty)).then_some(metadata);
+    let metadata = metadata.as_ref();
+
     // A Simple interchange document (stdin, or an existing file) rather than
     // a local session id. Checked before discovery: the document names its
     // input directly, so no session can shadow it.
@@ -1194,13 +1215,19 @@ fn cmd_continue(
                     .to_string(),
             );
         }
-        let resume = out.is_none() && !no_resume;
+        let target = with.ok_or_else(|| {
+            "a Simple document has no harness of its own to resume; \
+             pass --with <harness> (e.g. --with claude_code)"
+                .to_string()
+        })?;
+        let resume = wants_resume(target, out.is_some(), no_resume);
         return continue_document(
             &input,
             request.as_ref(),
-            with,
+            Some(target),
             out.map(PathBuf::as_path),
             resume,
+            metadata,
         );
     }
 
@@ -1214,7 +1241,8 @@ fn cmd_continue(
             target,
             request.as_ref(),
             out.map(PathBuf::as_path),
-            out.is_none() && !no_resume,
+            wants_resume(target, out.is_some(), no_resume),
+            metadata,
         );
     }
     if let Some(loaded) = load_direct_chatgpt(id, from) {
@@ -1227,7 +1255,8 @@ fn cmd_continue(
             target,
             request.as_ref(),
             out.map(PathBuf::as_path),
-            out.is_none() && !no_resume,
+            wants_resume(target, out.is_some(), no_resume),
+            metadata,
         );
     }
 
@@ -1243,26 +1272,32 @@ fn cmd_continue(
     let found = find_session(&sessions, from, src)?;
 
     // Resuming an `--out` copy can't work — the harness reads its live root, not
-    // our redirect — so a redirect implies "write only".
-    let resume = out.is_none() && !no_resume;
+    // our redirect — so a redirect implies "write only". `grok_bot` never
+    // launches a CLI either.
     match found {
-        Some(found) => continue_session(
-            found,
-            with,
-            request.as_ref(),
-            out.map(PathBuf::as_path),
-            resume,
-        ),
+        Some(found) => {
+            let target = with.unwrap_or(found.harness);
+            continue_session(
+                found,
+                with,
+                request.as_ref(),
+                out.map(PathBuf::as_path),
+                wants_resume(target, out.is_some(), no_resume),
+                metadata,
+            )
+        }
         // Modern Amp CLIs are server-authoritative and write no local thread
         // files; an Amp-shaped id that isn't on disk may still exist on
         // ampcode.com, reachable through Amp's own exporter.
         None if matches!(from, None | Some(HarnessId::Amp)) && is_amp_thread_id(src) => {
+            let target = with.unwrap_or(HarnessId::Amp);
             continue_amp_server_thread(
                 src,
                 with,
                 request.as_ref(),
                 out.map(PathBuf::as_path),
-                resume,
+                wants_resume(target, out.is_some(), no_resume),
+                metadata,
             )
         }
         None => Err(match from {
@@ -1279,6 +1314,53 @@ fn cmd_continue(
             ),
         }),
     }
+}
+
+/// Whether continue should exec a harness resume after writing.
+///
+/// `grok_bot` is always write/mint only — there is no CLI to launch.
+fn wants_resume(target: HarnessId, has_out: bool, no_resume: bool) -> bool {
+    target != HarnessId::GrokBot && !has_out && !no_resume
+}
+
+/// Merge `--metadata` specs into one JSON object.
+///
+/// Each spec is either `key=value` or a JSON object. Objects are shallow-merged
+/// left-to-right; later keys win. Non-object JSON is refused.
+fn parse_metadata_specs(specs: &[String]) -> Result<serde_json::Value, String> {
+    let mut map = serde_json::Map::new();
+    for spec in specs {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('{') {
+            let value: serde_json::Value =
+                serde_json::from_str(trimmed).map_err(|e| format!("--metadata JSON: {e}"))?;
+            let Some(obj) = value.as_object() else {
+                return Err("--metadata JSON must be an object".to_string());
+            };
+            for (k, v) in obj {
+                map.insert(k.clone(), v.clone());
+            }
+        } else if let Some((key, value)) = trimmed.split_once('=') {
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(format!(
+                    "--metadata expects key=value or a JSON object, got `{spec}`"
+                ));
+            }
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        } else {
+            return Err(format!(
+                "--metadata expects key=value or a JSON object, got `{spec}`"
+            ));
+        }
+    }
+    Ok(serde_json::Value::Object(map))
 }
 
 /// What `continue` received when it wasn't a session id: a Simple document
@@ -1326,6 +1408,7 @@ fn continue_document(
     with: Option<HarnessId>,
     out: Option<&std::path::Path>,
     resume: bool,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<ExitCode, String> {
     let target = with.ok_or_else(|| {
         "a Simple document has no harness of its own to resume; \
@@ -1365,7 +1448,7 @@ fn continue_document(
     // stores shard by cwd, and "the directory the user ran txcript in" is the
     // only sensible home for a transcript that never had one.
     stamp_live_cwd(&mut copy, out);
-    let resume_id = write_and_report(HarnessId::Simple, target, &copy, out)?;
+    let resume_id = write_and_report(HarnessId::Simple, target, &copy, out, metadata)?;
     // Stdin was consumed by the document; hand the launched harness the
     // terminal instead, or an interactive resume would read EOF.
     let stdin_tty = matches!(input, DocInput::Stdin);
@@ -1503,6 +1586,7 @@ fn continue_amp_server_thread(
     span_req: Option<&fragment::SpanReq>,
     out: Option<&std::path::Path>,
     resume: bool,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<ExitCode, String> {
     let common = load_amp_server_thread(id)?;
 
@@ -1514,7 +1598,7 @@ fn continue_amp_server_thread(
             let mut copy = common.clone();
             fresh_identity(&mut copy, target, out);
             stamp_live_cwd(&mut copy, out);
-            write_and_report(HarnessId::Amp, target, &copy, out)?
+            write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
         }
         // A sliced continue always rewrites — the server thread can't resume
         // a subset of itself in place.
@@ -1522,7 +1606,7 @@ fn continue_amp_server_thread(
             let mut copy = fragment::sliced(&common, req)?;
             fresh_identity(&mut copy, target, out);
             stamp_live_cwd(&mut copy, out);
-            write_and_report(HarnessId::Amp, target, &copy, out)?
+            write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
         }
     };
     launch(target, &resume_id, common.meta.cwd.as_deref(), resume)
@@ -1538,6 +1622,7 @@ fn continue_session(
     span_req: Option<&fragment::SpanReq>,
     out: Option<&std::path::Path>,
     resume: bool,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<ExitCode, String> {
     let target = with.unwrap_or(found.harness);
     ensure_resumable_source(found.harness, target)?;
@@ -1550,14 +1635,14 @@ fn continue_session(
             let mut common = found.read().map_err(|e| e.to_string())?;
             fresh_identity(&mut common, target, out);
             stamp_live_cwd(&mut common, out);
-            write_and_report(found.harness, target, &common, out)?
+            write_and_report(found.harness, target, &common, out, metadata)?
         }
         (Some(req), _) => {
             let common = found.read().map_err(|e| e.to_string())?;
             let mut copy = fragment::sliced(&common, req)?;
             fresh_identity(&mut copy, target, out);
             stamp_live_cwd(&mut copy, out);
-            write_and_report(found.harness, target, &copy, out)?
+            write_and_report(found.harness, target, &copy, out, metadata)?
         }
     };
 
@@ -1571,6 +1656,7 @@ fn continue_loaded_remote(
     span_req: Option<&fragment::SpanReq>,
     out: Option<&std::path::Path>,
     resume: bool,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<ExitCode, String> {
     let cwd = common.meta.cwd.clone();
     let mut copy = match span_req {
@@ -1579,7 +1665,7 @@ fn continue_loaded_remote(
     };
     fresh_identity(&mut copy, target, out);
     stamp_live_cwd(&mut copy, out);
-    let resume_id = write_and_report(source, target, &copy, out)?;
+    let resume_id = write_and_report(source, target, &copy, out, metadata)?;
     launch(target, &resume_id, cwd.as_deref(), resume)
 }
 
@@ -1672,8 +1758,17 @@ fn write_and_report(
     target: HarnessId,
     common: &Transcript<Common>,
     out: Option<&std::path::Path>,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<String, String> {
-    let written = local::write(target, common, out).map_err(|e| e.to_string())?;
+    let written = local::write_with(
+        target,
+        common,
+        local::WriteOpts {
+            root: out,
+            metadata,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let on = style::enabled();
     println!(
         "{} → {}  {}",
@@ -1706,6 +1801,11 @@ fn launch_via(
     resume: bool,
     stdin_tty: bool,
 ) -> Result<ExitCode, String> {
+    // Grok Bot has no CLI resume: mint/openAgent already surfaced the agent.
+    if target == HarnessId::GrokBot {
+        let _ = txcript::harness::grok_bot::open_in_ui(resume_id);
+        return Ok(ExitCode::SUCCESS);
+    }
     let (bin, args) = local::resume_command(target, resume_id);
     if !resume {
         return print_resume_command(&bin, &args);
@@ -2097,7 +2197,14 @@ mod query {
                         .get(&key)
                         .ok_or("internal error: picked session not found")?;
                     drop(index);
-                    super::continue_session(session, with, None, None, true)
+                    super::continue_session(
+                        session,
+                        with,
+                        None,
+                        None,
+                        with != Some(HarnessId::GrokBot),
+                        None,
+                    )
                 }
             },
         }
@@ -2917,5 +3024,29 @@ mod query {
             // One needle, spaces included: the space is not an atom separator.
             assert_eq!(q.pattern, "Cargo build");
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::parse_metadata_specs;
+
+    #[test]
+    fn merges_key_value_and_json_left_to_right() {
+        let specs = vec![
+            "name=First".into(),
+            r#"{"name":"Second","description":"d","extra":true}"#.into(),
+            "description=overridden".into(),
+        ];
+        let v = parse_metadata_specs(&specs).unwrap();
+        assert_eq!(v["name"], "Second");
+        assert_eq!(v["description"], "overridden");
+        assert_eq!(v["extra"], true);
+    }
+
+    #[test]
+    fn rejects_non_object_json() {
+        let err = parse_metadata_specs(&[r#""just a string""#.into()]).unwrap_err();
+        assert!(err.contains("key=value") || err.contains("JSON"), "{err}");
     }
 }
