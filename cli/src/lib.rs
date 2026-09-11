@@ -845,6 +845,7 @@ mod crop_command_tests {
             HarnessId::ChatGpt,
             HarnessId::Hermes,
             HarnessId::Amp,
+            HarnessId::GrokBot,
             HarnessId::Simple,
         ] {
             let error = ensure_crop_target(target).unwrap_err();
@@ -1069,6 +1070,7 @@ mod style {
             HarnessId::Cursor => "\x1b[34m",           // blue
             HarnessId::CursorDesktop => "\x1b[96m",    // bright cyan
             HarnessId::Grok => "\x1b[37m",             // white
+            HarnessId::GrokBot => "\x1b[97m",          // bright white
             HarnessId::Fx => "\x1b[38;5;39m",          // azure
             HarnessId::Hermes => "\x1b[93m",           // bright yellow
             HarnessId::Amp => "\x1b[95m",              // bright magenta
@@ -1589,6 +1591,7 @@ fn ensure_crop_target(target: HarnessId) -> Result<(), String> {
             | HarnessId::ChatGpt
             | HarnessId::Hermes
             | HarnessId::Amp
+            | HarnessId::GrokBot
             | HarnessId::Simple
     ) {
         Err(format!(

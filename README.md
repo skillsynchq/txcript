@@ -47,7 +47,7 @@ txcript maps each harness's native transcript format through a typed common mode
 
 ## Highlights
 
-- **16 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
+- **17 harnesses, one model**: every format converts through `Transcript<Common>`, so adding a harness connects it to all the others.
 - **A format for everyone else**: agents txcript has never heard of emit the documented [Simple](docs/formats/simple.md) interchange JSON — a file or a stream, handed to txcript directly — and their transcripts continue in any supported harness.
 - **Byte-lossless round-trips**: loading and saving a session in its own format reproduces it exactly.
 - **Continue anywhere**: `txcript continue <id> --with <harness>` rewrites a session into another harness's native format and launches it. The original is never modified.
@@ -71,6 +71,7 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
+    grokbot["Grok Bot"] --> common
     common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
     simple["Simple (any agent)"] --> common
@@ -93,6 +94,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | JSON session dir | ⇄ | ✓ | [spec](docs/formats/grok.md) |
+| Grok Bot | `grok_bot` | `$TXCRIPT_GROK_BOT_ROOT` / `~/agent-data/agent-transcripts/` | agent JSONL | → | — <sup>6</sup> | [spec](docs/formats/grok-bot.md) |
 | [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | event-log session dir | ⇄ | ✓ | [spec](docs/formats/fx.md) |
 | Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](docs/formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | thread JSON | → | — <sup>1</sup> | [spec](docs/formats/amp.md) |
@@ -108,6 +110,8 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 <sup>4</sup> Claude Chat is a live, pull-only source. On macOS, explicitly selecting `--from claude_chat` reuses the signed-in Claude Desktop session automatically; aggregate discovery does not contact Claude Chat. Credentials passed through environment variables are not accepted. An optional `TXCRIPT_CLAUDE_CHAT_ORGANIZATION_UUID` restricts discovery to one organization; otherwise the app's active organization is used. Claude Chat has no supported conversation API: txcript reads a private endpoint that Anthropic can observe or restrict, and the Rust crate warns at build time wherever discovery is called directly. txcript only reads: it refuses save, delete, same-harness continue, and `--with claude_chat`. Files Claude generated in the conversation come along; continued into Claude Code, they are written beside the new session and appear as Claude Code artifacts. Claude's data-export ZIP and `conversations.json` are not supported.
 
 <sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. txcript only reads: it refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT has no supported conversation API, so this access may change or be restricted. ChatGPT data-export archives are not supported.
+
+<sup>6</sup> Grok Bot sessions convert *from* `grok_bot` via the on-disk agent-transcripts JSONL. Continuing *into* Grok Bot is refused: UI history is gated behind a live local-gateway mint (`duplicateAgent` + restoring `store.db` / `conversation-blobs.db` with `blobEncryptionKey` preserved). File-only JSONL writes do not appear in the product. The store still load/saves JSONL for conversion and tests.
 
 ## Install
 
@@ -343,7 +347,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","claude_chat","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","fx","hermes","amp","antigravity","simple","cowork"]
+harnesses(); // ["claude_code","claude_chat","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","fx","hermes","amp","antigravity","simple","cowork"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -371,6 +375,7 @@ const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" }))
 | `cursor` | JSON export of the session's `store.db` |
 | `cursor_desktop` | JSON dump of the session's `state.vscdb` rows |
 | `grok` | JSON bundle of the session directory's files |
+| `grok_bot` | agent-transcript JSONL (`role`/`message` envelopes) |
 | `fx` | JSON bundle of the session directory's files |
 | `hermes` | `hermes sessions export` JSON object |
 | `amp` | `amp threads export` JSON |

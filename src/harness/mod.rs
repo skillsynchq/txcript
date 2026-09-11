@@ -17,6 +17,7 @@ pub mod cursor;
 pub mod cursor_desktop;
 pub mod fx;
 pub mod grok;
+pub mod grok_bot;
 pub mod hermes;
 pub mod opencode;
 pub mod pi;

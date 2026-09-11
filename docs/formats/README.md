@@ -49,6 +49,7 @@ than none.
 | [cursor-desktop.md](cursor-desktop.md) | Cursor desktop (IDE app) | `src/harness/cursor_desktop.rs` |
 | [amp.md](amp.md) | Amp (Sourcegraph) | `src/harness/amp.rs` |
 | [grok.md](grok.md) | Grok CLI (xAI) | `src/harness/grok.rs` |
+| [grok-bot.md](grok-bot.md) | Grok Bot (desktop assistant) | `src/harness/grok_bot.rs` |
 | [fx.md](fx.md) | fx (Vercel) | `src/harness/fx.rs` |
 | [hermes.md](hermes.md) | Hermes Agent | `src/harness/hermes.rs` |
 | [antigravity.md](antigravity.md) | Antigravity (Google) | `src/harness/antigravity.rs` |

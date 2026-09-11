@@ -18,6 +18,7 @@ mod cursor;
 mod cursor_desktop;
 mod fx;
 mod grok;
+mod grok_bot;
 mod hermes;
 mod opencode;
 mod path_safety;

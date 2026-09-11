@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use crate::common;
 use crate::harness::{
     amp, antigravity, campfire, chatgpt, claude_chat, claude_code, codex, cowork, cursor,
-    cursor_desktop, fx, grok, hermes, opencode, pi, simple,
+    cursor_desktop, fx, grok, grok_bot, hermes, opencode, pi, simple,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
@@ -25,14 +25,15 @@ use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 /// one live conversation detail object for `claude_chat` or `chatgpt`,
 /// the Cursor JSON DB export for cursor, the JSON dump of the session's
 /// database rows for `cursor_desktop`, the `opencode export` JSON for
-/// opencode, the JSON bundle of the session directory for grok, the JSON bundle of the
+/// opencode, the JSON bundle of the session directory for grok, the agent
+/// transcript JSONL for `grok_bot`, the JSON bundle of the
 /// session directory for fx, the
 /// `hermes sessions export` JSON object for hermes, the thread JSON document
 /// for amp, the JSON dump of the conversation database for antigravity, the
 /// interchange JSON document for simple, the JSON bundle of the session
 /// record, transcript and audit log for cowork); `from`/`to` are harness
 /// names (`"claude_code"`, `"claude_chat"`, `"chatgpt"`, `"codex"`, `"opencode"`, `"pi"`, `"campfire"`,
-/// `"cursor"`, `"cursor_desktop"`, `"grok"`, `"fx"`, `"hermes"`, `"amp"`,
+/// `"cursor"`, `"cursor_desktop"`, `"grok"`, `"grok_bot"`, `"fx"`, `"hermes"`, `"amp"`,
 /// `"antigravity"`, `"simple"`, `"cowork"`). Returns the target harness's
 /// native text.
 #[wasm_bindgen]
@@ -207,6 +208,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Cursor => go::<cursor::Cursor>(text),
         HarnessId::CursorDesktop => go::<cursor_desktop::CursorDesktop>(text),
         HarnessId::Grok => go::<grok::Grok>(text),
+        HarnessId::GrokBot => go::<grok_bot::GrokBot>(text),
         HarnessId::Fx => go::<fx::Fx>(text),
         HarnessId::Hermes => go::<hermes::Hermes>(text),
         HarnessId::Amp => go::<amp::Amp>(text),
@@ -231,6 +233,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Cursor => go::<cursor::Cursor>(common),
         HarnessId::CursorDesktop => go::<cursor_desktop::CursorDesktop>(common),
         HarnessId::Grok => go::<grok::Grok>(common),
+        HarnessId::GrokBot => go::<grok_bot::GrokBot>(common),
         HarnessId::Fx => go::<fx::Fx>(common),
         HarnessId::Hermes => go::<hermes::Hermes>(common),
         HarnessId::Amp => go::<amp::Amp>(common),
