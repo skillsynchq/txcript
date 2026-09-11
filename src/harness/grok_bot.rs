@@ -783,6 +783,9 @@ impl GrokBotStore {
         Ok(Some(transcript))
     }
 
+    // Under `--no-default-features` only the stub body is compiled, which
+    // trips unused_self / unnecessary_wraps; the featured path uses both.
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn load_from_store_db(&self, id: &str) -> Result<Option<Transcript<GrokBot>>> {
         #[cfg(any(feature = "opencode", feature = "hermes"))]
         {
@@ -806,11 +809,12 @@ impl GrokBotStore {
         }
         #[cfg(not(any(feature = "opencode", feature = "hermes")))]
         {
-            let _ = id;
+            let _ = (self, id);
             Ok(None)
         }
     }
 
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn load_from_gateway(&self, id: &str) -> Result<Option<Transcript<GrokBot>>> {
         #[cfg(any(feature = "opencode", feature = "hermes"))]
         {
@@ -847,7 +851,7 @@ impl GrokBotStore {
         }
         #[cfg(not(any(feature = "opencode", feature = "hermes")))]
         {
-            let _ = id;
+            let _ = (self, id);
             Ok(None)
         }
     }
