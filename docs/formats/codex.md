@@ -87,6 +87,10 @@ the form `["bash"|"sh"|"zsh", "-lc"|"-c", cmd]` collapse to the inner command.
 - **Resume is picky.** `from_common` must emit `model_provider: "openai"` in `session_meta` —
   current Codex resolves a null provider to the empty name and fails resume with
   ``Model provider `` not found``. `base_instructions` may be null (defaults substitute).
+- **`call_id` is at most 64.** Codex resume sends rollout `function_call` items to the
+  Responses API, which rejects `call_id` longer than 64 (`string_above_max_length`). Cursor
+  (and other) native ids can be longer; `from_common` clamps them with
+  [`sanitize_tool_id`](../../src/common.rs) so the call and its output keep the same id.
 - **Version drift.** Newer rollouts add fields (`ordinal`, `session_id`, `parent_thread_id`,
   structured `source`) and kinds (`world_state`, `compacted`, `inter_agent_communication`).
   Unknown envelope fields land in a flattened `extra` map and unknown kinds are carried

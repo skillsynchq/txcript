@@ -276,3 +276,51 @@ fn codec_fixpoint_through_common_loses_nothing() {
     let back = codex::Codex::to_common(&native).unwrap();
     assert_eq!(common, back);
 }
+
+/// Cursor-length ids (85) must not reach Codex Responses; the call and its
+/// output have to share the clamped id or resume 400s on pairing.
+#[test]
+fn from_common_clamps_call_id_to_codex_max() {
+    let long_id = format!("call-{}", "x".repeat(80));
+    assert_eq!(long_id.len(), 85);
+    let mut common = sample_common();
+    for msg in &mut common.body {
+        for block in &mut msg.content {
+            match block {
+                common::Block::ToolUse { id, .. } => *id = long_id.clone(),
+                common::Block::ToolResult { tool_use_id, .. } => {
+                    *tool_use_id = long_id.clone();
+                }
+                _ => {}
+            }
+        }
+    }
+    let native = codex::Codex::from_common(&common).unwrap();
+    let mut call_ids = Vec::new();
+    let mut output_ids = Vec::new();
+    for line in &native.body {
+        if line.kind != "response_item" {
+            continue;
+        }
+        let Some(call_id) = line
+            .payload
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        assert!(
+            call_id.len() <= common::TOOL_ID_MAX_LEN,
+            "call_id len {} > {}: {call_id}",
+            call_id.len(),
+            common::TOOL_ID_MAX_LEN
+        );
+        match line.payload.get("type").and_then(serde_json::Value::as_str) {
+            Some("function_call") => call_ids.push(call_id.to_string()),
+            Some("function_call_output") => output_ids.push(call_id.to_string()),
+            _ => {}
+        }
+    }
+    assert_eq!(call_ids.len(), 1);
+    assert_eq!(call_ids, output_ids);
+}

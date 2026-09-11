@@ -13,6 +13,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// Session-level metadata, common to every harness.
 ///
@@ -101,6 +102,63 @@ pub enum Block {
     /// a named file so target harnesses can expose it through their native
     /// file or artifact mechanism.
     Artifact { artifact: Artifact },
+}
+
+/// Codex Responses `call_id` max (`string_above_max_length`). Anthropic's
+/// `tool_use.id` charset is the other half of this grammar; length is the
+/// tighter of the two writers that share Common.
+pub const TOOL_ID_MAX_LEN: usize = 64;
+
+/// Fold a native tool-call id onto the grammar every writer can emit:
+/// ASCII `[A-Za-z0-9_-]` and at most [`TOOL_ID_MAX_LEN`] characters. Overlong
+/// ids keep a stable prefix and a UUID-v5 suffix of the folded value so a
+/// `ToolUse` and its `ToolResult` still share one id after the hop.
+#[must_use]
+pub fn sanitize_tool_id(raw: &str) -> String {
+    let folded: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    clamp_tool_id_len(&folded)
+}
+
+fn clamp_tool_id_len(id: &str) -> String {
+    if id.len() <= TOOL_ID_MAX_LEN {
+        return id.to_string();
+    }
+    // Namespace is fixed: changing it rewrites every clamped hop id.
+    const NS: Uuid = Uuid::from_bytes([
+        0xb4, 0x70, 0x11, 0x64, 0xca, 0x11, 0x4d, 0x40, 0x88, 0x64, 0x00, 0x64, 0x00, 0x00, 0x00,
+        0x40,
+    ]);
+    let hash = Uuid::new_v5(&NS, id.as_bytes()).simple().to_string();
+    let keep = TOOL_ID_MAX_LEN.saturating_sub(hash.len().saturating_add(1));
+    let mut out = String::with_capacity(TOOL_ID_MAX_LEN);
+    out.extend(id.chars().take(keep));
+    out.push('_');
+    out.push_str(&hash);
+    out
+}
+
+/// Rewrite tool-call ids on a message so use/result pairs stay linked.
+#[must_use]
+pub fn sanitize_message_tool_ids(message: &Message) -> Message {
+    let mut message = message.clone();
+    for block in &mut message.content {
+        match block {
+            Block::ToolUse { id, .. } => *id = sanitize_tool_id(id),
+            Block::ToolResult { tool_use_id, .. } => *tool_use_id = sanitize_tool_id(tool_use_id),
+            Block::Artifact { artifact } => artifact.id = sanitize_tool_id(&artifact.id),
+            Block::Text { .. } | Block::Thinking { .. } | Block::Image { .. } => {}
+        }
+    }
+    message
 }
 
 /// Why an assistant turn ended. `Other` keeps any harness-specific reason
@@ -496,6 +554,40 @@ struct BashArgs<S = String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Cursor embeds a newline between the call and function-call halves.
+    #[test]
+    fn sanitize_tool_id_folds_foreign_charset() {
+        let raw = "call-abc-12\nfc_def_4";
+        assert_eq!(sanitize_tool_id(raw), "call-abc-12_fc_def_4");
+        assert_eq!(
+            sanitize_tool_id("toolu_01Fr4RzrGVoJBMVCyX6X4dMw"),
+            "toolu_01Fr4RzrGVoJBMVCyX6X4dMw"
+        );
+    }
+
+    /// Codex Responses rejects `call_id` over 64. Cursor ids can be longer;
+    /// use/result pairs must hash to the same clamped value.
+    #[test]
+    fn sanitize_tool_id_clamps_codex_call_id_limit() {
+        let raw = format!("call-{}", "x".repeat(80));
+        assert_eq!(raw.len(), 85);
+        let out = sanitize_tool_id(&raw);
+        assert!(out.len() <= TOOL_ID_MAX_LEN, "{out}");
+        assert_eq!(out, sanitize_tool_id(&raw));
+        assert_eq!(sanitize_tool_id(&out), out);
+        let other = format!("call-{}y", "x".repeat(79));
+        assert_eq!(other.len(), 85);
+        assert_ne!(sanitize_tool_id(&raw), sanitize_tool_id(&other));
+        // Live Cursor toolCallId from the 2026-09-10 one-mcp hop: two UUIDs
+        // joined by a newline, 85 bytes. Codex 400'd on this exact string.
+        let cursor = "call-373bdab5-8d27-48f2-b656-b24f2a48fe3e-0\nfc_64275aa7-deb0-9662-8c56-93498915a3e7_0";
+        assert_eq!(cursor.len(), 85);
+        let clamped = sanitize_tool_id(cursor);
+        assert!(clamped.len() <= TOOL_ID_MAX_LEN, "{clamped}");
+        assert!(!clamped.contains('\n'), "{clamped}");
+        assert_eq!(sanitize_tool_id(cursor), sanitize_tool_id(cursor));
+    }
 
     /// A known tool with a known schema becomes the typed variant, and round
     /// trips back to the same canonical name and input.

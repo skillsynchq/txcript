@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::common::{Block, Message, Meta, Role, Tool, ToolOutput, Usage};
+use crate::common::{Block, Message, Meta, Role, Tool, ToolOutput, Usage, sanitize_tool_id};
 use crate::error::{Error, Result};
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
 
@@ -371,7 +371,7 @@ fn push_tool_call(
     let id = tool_call
         .get("toolCallId")
         .and_then(Value::as_str)
-        .map(sanitize_call_id)
+        .map(sanitize_tool_id)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| deterministic_id(&meta.id, messages.len(), "call"));
     assistant
@@ -424,20 +424,6 @@ fn push_tool_call(
         stop_reason: None,
         usage: None,
     });
-}
-
-/// Map a native call id onto `[A-Za-z0-9_-]`, the strictest id grammar any
-/// target harness enforces (Anthropic's `tool_use` pattern).
-fn sanitize_call_id(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 // -- tool mapping --------------------------------------------------------

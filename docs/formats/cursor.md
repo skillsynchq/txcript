@@ -56,7 +56,7 @@ graph state and carry no messages.
 | `createdAt` | per-message ms epoch | `Message.timestamp` |
 | `providerOptions.cursor.modelName` | model per assistant message | `Message.model`, seeds `Meta.model` |
 | `Shell`, `StrReplace`, `Read`, … | Cursor's tool vocabulary | `Tool::Bash`, `Tool::Edit`, `Tool::Read`, … (`path`→`file_path`, `cwd`→`workdir`) |
-| protobuf blobs | turn graph: user message, assistant/thinking/tool steps, turn structure, root state | not converted; regenerated from scratch by `from_common` |
+| protobuf blobs | turn graph: user message, assistant/thinking/tool steps, turn structure, root state (`turns` + `root_prompt_messages_json`) | not converted; regenerated from scratch by `from_common` |
 | `meta` key `"0"` | agent record (`agentId`, `name`, `createdAt`, `workspacePath`, `lastUsedModel`, `latestRootBlobId`, `mode`, `approvalMode`), hex-encoded or plain JSON | fallbacks for `Meta` id/title/timestamp/cwd/model |
 | `meta.json` | `schemaVersion`, `title`, `createdAtMs`, `updatedAtMs`, `hasConversation` | primary source of `Meta.title` and `Meta.timestamp` |
 | `prompt_history.json` | user prompt strings | not read; regenerated on save |
@@ -93,8 +93,11 @@ A synthetic assistant blob, shaped like the real thing:
   every blob byte-for-byte, so a same-harness round-trip is lossless. Coming
   *from* Common, the graph must be synthesized: txcript hand-encodes protobuf
   for shell, read, and edit/write tool steps; other tools degrade to
-  plain-text steps. The result resumes in `cursor-agent`, but the graph is an
-  approximation, not what Cursor itself would have written.
+  plain-text steps. `from_common` also writes `ConversationStateStructure`
+  field 1 (`root_prompt_messages_json`) as blob-ids of the JSON message
+  blobs — that is the array `cursor-agent` sends as the model prompt. Turns
+  (field 8) alone resume the session id but leave the prompt empty. The graph
+  is still an approximation, not what Cursor itself would have written.
 - Conversion to Common is lossy by design: system-prompt blobs, unknown roles,
   editor-injected context, and all graph blobs carry no `Message`.
 - The `meta` table value has been observed hex-encoded; the parser also
@@ -117,6 +120,6 @@ content-addressed checkpoint blobs and a `latestCheckpoint.rootBlobId`
 pointer — consistent with what is on disk — but documents no schema, table,
 or path. This document is reverse-engineered.
 
-Last verified: 2026-08-10, against src/harness/cursor.rs and real local
-sessions. The authoritative mapping is `src/harness/cursor.rs`; shape examples
-live in `tests/integration/cursor.rs`.
+Last verified: 2026-09-08, against src/harness/cursor.rs, `agent.v1.ConversationStateStructure`
+in cursor-agent 2026.09.02, and real local sessions. The authoritative mapping is
+`src/harness/cursor.rs`; shape examples live in `tests/integration/cursor.rs`.
