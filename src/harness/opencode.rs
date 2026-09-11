@@ -595,7 +595,7 @@ fn normalize_tool(tool: &str, input: Value) -> (String, Value) {
         "webfetch" => ("WebFetch".to_string(), input),
         "task" => ("Task".to_string(), input),
         "question" => ("Question".to_string(), input),
-        other => (title_case(other), input),
+        other => (other.to_string(), input),
     }
 }
 
@@ -630,7 +630,7 @@ fn denormalize_tool(name: &str, input: Value) -> (String, Value) {
         "WebFetch" => ("webfetch".to_string(), input),
         "Task" => ("task".to_string(), input),
         "Question" => ("question".to_string(), input),
-        other => (other.to_ascii_lowercase(), input),
+        other => (other.to_string(), input),
     }
 }
 
@@ -753,14 +753,6 @@ fn rename_keys(input: Value, renames: &[(&str, &str)]) -> Value {
         }
         // A non-object input has no keys to rename; pass it through untouched.
         other => other,
-    }
-}
-
-fn title_case(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
     }
 }
 

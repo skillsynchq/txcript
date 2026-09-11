@@ -70,8 +70,8 @@ order, which is correct for the common single-branch session. Tool calls
 pair with results by `toolCallId`. Tool names normalize both ways: `bash` ↔
 `Bash`, `read`/`write` ↔ `Read`/`Write` (`path` ↔ `file_path`), `edit` ↔
 `Edit`/`MultiEdit` (`oldText`/`newText` ↔ `old_string`/`new_string`, one
-edit vs many), `find` ↔ `Glob`, `ls` ↔ `LS`, `grep` ↔ `Grep`; `mcp__*` names
-pass through untouched. `stopReason` maps `stop`/`length`/`toolUse`/`error`/
+edit vs many), `find` ↔ `Glob`, `ls` ↔ `LS`, `grep` ↔ `Grep`; unknown and MCP
+tool names pass through untouched. `stopReason` maps `stop`/`length`/`toolUse`/`error`/
 `aborted` onto the Common `StopReason` set; `usage` fields are `input`,
 `output`, `cacheRead`, `cacheWrite`.
 
