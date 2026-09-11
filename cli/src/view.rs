@@ -35,6 +35,16 @@ pub fn load_source(
     source: &str,
     from: Option<HarnessId>,
 ) -> Result<(Transcript<Common>, Option<fragment::SpanReq>), String> {
+    if let Some((input, request)) = super::document_source(source) {
+        if from.is_some() {
+            return Err(
+                "--from scopes the search for a local session; a Simple document is its own input"
+                    .to_string(),
+            );
+        }
+        let common = super::read_document_input(&input)?;
+        return Ok((common, request));
+    }
     if let Some(loaded) = super::load_direct_claude_chat(source, from) {
         return loaded;
     }
@@ -1147,5 +1157,43 @@ mod tests {
             std::fs::read_to_string(destination).unwrap(),
             "rendered session\n"
         );
+    }
+
+    #[test]
+    fn load_source_reads_simple_document_file_with_optional_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc_path = dir.path().join("transcript.json");
+        std::fs::write(
+            &doc_path,
+            r#"{
+                "id": "my-doc",
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "two"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let (transcript, req) = load_source(doc_path.to_str().unwrap(), None).unwrap();
+        assert_eq!(transcript.meta.id, "my-doc");
+        assert_eq!(transcript.body.len(), 2);
+        assert!(req.is_none());
+
+        let ranged = format!("{}#1", doc_path.display());
+        let (transcript, req) = load_source(&ranged, None).unwrap();
+        assert_eq!(transcript.meta.id, "my-doc");
+        assert!(req.is_some());
+    }
+
+    #[test]
+    fn load_source_rejects_from_scoping_on_simple_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc_path = dir.path().join("transcript.json");
+        std::fs::write(&doc_path, "{}").unwrap();
+
+        let err =
+            load_source(doc_path.to_str().unwrap(), Some(txcript::HarnessId::Codex)).unwrap_err();
+        assert!(err.contains("--from scopes the search for a local session"));
     }
 }

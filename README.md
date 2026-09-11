@@ -147,18 +147,18 @@ txcript continue <id>[#range]            # continue <id>, then launch its harnes
     [--no-resume]                         #   write the session but don't launch
 txcript continue <file|->[#range]        # continue a Simple document instead:
     --with <harness> [...]                #   a file, or stdin (`-`), from any agent
-txcript crop <id>[#range]                # interactively cut messages and save a copy
+txcript crop <id|file>[#range]           # interactively cut messages and save a copy
     [--with <harness>]                    #   optionally convert the cropped copy
     [--from <harness>]                    #   scope the source lookup
-txcript view <id>[#range]                # view a session; compact text when piped
+txcript view <id|file|->[#range]         # view a session; compact text when piped
     [--from <harness>]                    #   scope the id lookup to one harness
     [--no-pager]                          #   print the terminal view directly
-txcript export <id>[#range]              # write a session as a Simple document
+txcript export <id|file|->[#range]       # write a session as a Simple document
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <file>]                        #   write to <file> instead of stdout
 ```
 
-A session id is any unambiguous prefix of the full id, or the session's exact title. `txcript resume` is an alias for `continue`. `--since` and `--until` take RFC 3339 timestamps or bare `YYYY-MM-DD` dates.
+A session id is any unambiguous prefix of the full id, or the session's exact title. `txcript resume` is an alias for `continue`. `--since` and `--until` take RFC 3339 timestamps or bare `YYYY-MM-DD` dates. `view`, `export`, and `crop` accept Simple document files directly (and `view`/`export` accept stdin `-`), resolving `#range` fragments identically to local sessions.
 
 `continue` writes the session where the target harness keeps its sessions, then launches that harness on it, handing over the terminal:
 
@@ -174,9 +174,9 @@ A session id is any unambiguous prefix of the full id, or the session's exact ti
 - `abc#5-`: message 5 to the end
 - `abc#-10`: start through message 10
 
-`continue` accepts the same suffix and continues just those messages as a new session. `crop` opens an interactive editor over the session, in the spirit of a video editor's timeline: every message starts out kept, and you remove the ones you don't want from anywhere in the conversation, not just the ends. Move with `j`/`k` or the arrow keys and press Space to remove the message under the cursor (or restore it). To work on a stretch at once, press `v`, move to the other end, then `x` to remove it, `r` to restore it, or `t` to keep only that stretch; `:3-10` selects a range by number and `:42` jumps to a message. `e` opens the message under the cursor in your editor (`$VISUAL`, `$EDITOR`, or `vi`) as plain text, one heading per block: change the text, trim a tool result, or empty a block to drop it, then save and quit to apply. A terminal editor runs in a pane beside or under the transcript; `E` gives it the whole terminal instead, and an editor that opens its own window is waited for. `u` undoes, `U` redoes, `?` lists every key. Removed messages collapse to their header, edited ones say so, and an overview of the whole session, one cell per message, runs down the right edge or along the bottom depending on the window's shape. Enter saves the kept messages, edits included, as a new session; `q` leaves without saving. A `#range` is optional and opens the editor with only that range kept. The copy defaults to the source harness unless `--with` selects another one, and the source is never modified. A tool call and its result are always removed or restored together, so the saved copy never splits them.
+`continue` accepts the same suffix and continues just those messages as a new session. `crop` opens an interactive editor over the session, in the spirit of a video editor's timeline: every message starts out kept, and you remove the ones you don't want from anywhere in the conversation, not just the ends. Move with `j`/`k` or the arrow keys and press Space to remove the message under the cursor (or restore it). To work on a stretch at once, press `v`, move to the other end, then `x` to remove it, `r` to restore it, or `t` to keep only that stretch; `:3-10` selects a range by number and `:42` jumps to a message. `e` opens the message under the cursor in your editor (`$VISUAL`, `$EDITOR`, or `vi`) as plain text, one heading per block: change the text, trim a tool result, or empty a block to drop it, then save and quit to apply. A terminal editor runs in a pane beside or under the transcript; `E` gives it the whole terminal instead, and an editor that opens its own window is waited for. `u` undoes, `U` redoes, `?` lists every key. Removed messages collapse to their header, edited ones say so, and an overview of the whole session, one cell per message, runs down the right edge or along the bottom depending on the window's shape. Enter saves the kept messages, edits included, as a new session; `q` leaves without saving. A `#range` is optional and opens the editor with only that range kept. The copy defaults to the source harness unless `--with` selects another one (required when cropping a Simple document), and the source is never modified. A tool call and its result are always removed or restored together, so the saved copy never splits them.
 
-`export` writes the session as a [Simple](docs/formats/simple.md) document, to stdout or `--out <file>`. The document is the full rendering of the canonical model — everything `continue` carries between harnesses — detached from any harness's store, so it moves between machines as a file:
+`export` writes the session as a [Simple](docs/formats/simple.md) document, to stdout or `--out <file>` (and can re-slice or re-format an existing document). The document is the full rendering of the canonical model — everything `continue` carries between harnesses — detached from any harness's store, so it moves between machines as a file:
 
 ```sh
 txcript export 0dc114bf --out session.json       # on this machine
