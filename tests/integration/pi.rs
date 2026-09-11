@@ -268,3 +268,80 @@ fn codec_fixpoint_through_common_loses_nothing() {
     let back = pi::Pi::to_common(&native).unwrap();
     assert_eq!(common, back);
 }
+
+#[test]
+fn custom_and_mcp_tool_names_preserve_exact_casing() {
+    let cases = [
+        "WebSearch",
+        "custom_linter",
+        "mcp__calc__add",
+        "camelCaseTool",
+    ];
+    for tool_name in cases {
+        let meta = common::Meta {
+            id: "pi-casing".into(),
+            timestamp: ts("2026-01-02T03:04:05.000Z"),
+            cwd: Some("/repo".into()),
+            git_branch: None,
+            title: Some("Casing".into()),
+            cli_version: None,
+            model: Some("claude-opus-4-8".into()),
+        };
+        let common = Transcript::new(
+            meta,
+            vec![
+                common::Message {
+                    role: common::Role::User,
+                    content: vec![common::Block::Text {
+                        text: "run tool".into(),
+                    }],
+                    timestamp: ts("2026-01-02T03:04:05.000Z"),
+                    model: None,
+                    stop_reason: None,
+                    usage: None,
+                },
+                common::Message {
+                    role: common::Role::Assistant,
+                    content: vec![common::Block::ToolUse {
+                        id: "call-1".into(),
+                        tool: common::Tool::Raw {
+                            tool_name: tool_name.into(),
+                            input: serde_json::json!({ "arg": 42 }),
+                        },
+                    }],
+                    timestamp: ts("2026-01-02T03:04:06.000Z"),
+                    model: Some("claude-opus-4-8".into()),
+                    stop_reason: Some(common::StopReason::ToolUse),
+                    usage: None,
+                },
+                common::Message {
+                    role: common::Role::User,
+                    content: vec![common::Block::ToolResult {
+                        tool_use_id: "call-1".into(),
+                        content: common::ToolOutput::Text("success".into()),
+                        is_error: false,
+                    }],
+                    timestamp: ts("2026-01-02T03:04:07.000Z"),
+                    model: None,
+                    stop_reason: None,
+                    usage: None,
+                },
+            ],
+        );
+        let native = pi::Pi::from_common(&common).unwrap();
+        let back = pi::Pi::to_common(&native).unwrap();
+        match &back.body[1].content[0] {
+            common::Block::ToolUse {
+                tool:
+                    common::Tool::Raw {
+                        tool_name: back_name,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(back_name, tool_name, "pi must preserve tool name casing");
+            }
+            other => panic!("expected Tool::Raw, got {other:?}"),
+        }
+    }
+}
