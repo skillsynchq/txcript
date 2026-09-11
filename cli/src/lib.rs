@@ -845,7 +845,6 @@ mod crop_command_tests {
             HarnessId::ChatGpt,
             HarnessId::Hermes,
             HarnessId::Amp,
-            HarnessId::GrokBot,
             HarnessId::Simple,
         ] {
             let error = ensure_crop_target(target).unwrap_err();
@@ -1591,7 +1590,6 @@ fn ensure_crop_target(target: HarnessId) -> Result<(), String> {
             | HarnessId::ChatGpt
             | HarnessId::Hermes
             | HarnessId::Amp
-            | HarnessId::GrokBot
             | HarnessId::Simple
     ) {
         Err(format!(

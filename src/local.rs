@@ -72,7 +72,10 @@ pub fn discover() -> Vec<Session> {
 
 /// [`discover`], reporting progress: `on_store(harness, sessions_so_far)` is
 /// called before each store is scanned.
+///
+/// One dispatch arm per harness; length grows with the harness count.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session> {
     fn scan<S>(harness: HarnessId, store: Option<S>, out: &mut Vec<Session>)
     where
@@ -721,17 +724,27 @@ pub fn write(
             common,
             |s| s.sessions_dir,
         ),
-        // Grok Bot UI history lives in encrypted agent DBs minted through the
-        // live local gateway (duplicateAgent + DB restore). Writing JSONL alone
-        // does not surface chat in the product, and synthesizing store.db /
-        // conversation-blobs.db from Common is not cleanly possible without a
-        // live gateway. Store load/save of agent-transcripts JSONL still works
-        // for conversion and tests; continue-into is refused like Hermes/Amp.
-        HarnessId::GrokBot => Err(Error::Unconvertible {
-            harness: "grok_bot",
-            detail: "Grok Bot has no public session import; UI history requires                      a live local gateway mint (duplicateAgent + store.db /                      conversation-blobs.db restore). Sessions convert from                      grok_bot, but cannot be continued into it"
-                .to_string(),
-        }),
+        // Live continue-into mints a box-harness agent via the local gateway
+        // and seeds `store.db` transcript_entries (plus agent-transcripts
+        // JSONL). A root override writes JSONL only — useful for tests and
+        // offline conversion, but the UI will not show that history.
+        HarnessId::GrokBot => {
+            if let Some(dir) = root {
+                let store = grok_bot::GrokBotStore::new(dir);
+                let native = grok_bot::GrokBot::from_common(common)?;
+                let saved = store.save(&native)?;
+                Ok(Written {
+                    id: saved.id,
+                    location: saved.reference.display().to_string(),
+                })
+            } else {
+                let saved = grok_bot::mint_with_history(common)?;
+                Ok(Written {
+                    id: saved.id,
+                    location: saved.reference.display().to_string(),
+                })
+            }
+        }
         HarnessId::Fx => go(
             fx::FxStore::default_root(),
             fx::FxStore::new,
@@ -971,8 +984,8 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             // the session is in the Agents sidebar.
             HarnessId::CursorDesktop => ("cursor".into(), Vec::new()),
             HarnessId::Grok => ("grok".into(), vec!["--resume".into(), id]),
-            // Source-only: the CLI refuses before this fallback.
-            HarnessId::GrokBot => ("txcript".into(), Vec::new()),
+            // Mint opens the agent via the local gateway; no CLI resume binary.
+            HarnessId::GrokBot => ("true".into(), Vec::new()),
             HarnessId::Fx => ("fx".into(), vec!["--resume".into(), id]),
             HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),

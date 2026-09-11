@@ -71,7 +71,7 @@ flowchart LR
     common <--> cursor["Cursor CLI"]
     common <--> cursordesktop["Cursor desktop"]
     common <--> grok["Grok CLI"]
-    grokbot["Grok Bot"] --> common
+    common <--> grokbot["Grok Bot"]
     common <--> fx["fx"]
     common <--> antigravity["Antigravity"]
     simple["Simple (any agent)"] --> common
@@ -94,7 +94,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 | [Cursor CLI](https://cursor.com/cli) | `cursor` | `~/.cursor/chats/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor.md) |
 | [Cursor desktop](https://cursor.com) | `cursor_desktop` | `<Cursor User dir>/globalStorage/` | SQLite | ⇄ | ✓ | [spec](docs/formats/cursor-desktop.md) |
 | [Grok CLI](https://github.com/xai-org/grok-build) | `grok` | `~/.grok/sessions/` | JSON session dir | ⇄ | ✓ | [spec](docs/formats/grok.md) |
-| Grok Bot | `grok_bot` | `$TXCRIPT_GROK_BOT_ROOT` / `~/agent-data/agent-transcripts/` | agent JSONL | → | — <sup>6</sup> | [spec](docs/formats/grok-bot.md) |
+| Grok Bot | `grok_bot` | `$TXCRIPT_GROK_BOT_ROOT` / `~/agent-data/agent-transcripts/` | agent JSONL + gateway mint | ⇄ <sup>6</sup> | — | [spec](docs/formats/grok-bot.md) |
 | [fx](https://fx.sh) | `fx` | `~/.fx/sessions/` | event-log session dir | ⇄ | ✓ | [spec](docs/formats/fx.md) |
 | Hermes Agent | `hermes` | `~/.hermes/state.db` | SQLite | → | — <sup>3</sup> | [spec](docs/formats/hermes.md) |
 | [Amp](https://ampcode.com) | `amp` | `~/.local/share/amp/threads/` | thread JSON | → | — <sup>1</sup> | [spec](docs/formats/amp.md) |
@@ -111,7 +111,7 @@ Discovery, listing, search, and `view` work for every harness with a backing sto
 
 <sup>5</sup> ChatGPT is a live, pull-only source. Like Claude Chat reuses Claude Desktop, explicitly selecting `--from chatgpt` automatically reuses the ChatGPT login managed by Codex at `CODEX_HOME/auth.json` or `~/.codex/auth.json`; the account may differ from the one signed in through a browser. txcript only reads that credential file and never refreshes or rewrites it. Aggregate discovery does not contact ChatGPT, while an exact conversation UUID can be read directly without enumerating the account. txcript only reads: it refuses save, delete, same-harness continue, and `--with chatgpt`. ChatGPT has no supported conversation API, so this access may change or be restricted. ChatGPT data-export archives are not supported.
 
-<sup>6</sup> Grok Bot sessions convert *from* `grok_bot` via the on-disk agent-transcripts JSONL. Continuing *into* Grok Bot is refused: UI history is gated behind a live local-gateway mint (`duplicateAgent` + restoring `store.db` / `conversation-blobs.db` with `blobEncryptionKey` preserved). File-only JSONL writes do not appear in the product. The store still load/saves JSONL for conversion and tests.
+<sup>6</sup> Continue-into mints a new box-harness agent via the local gateway (`createAgent` + seeding `store.db` transcript_entries + agent-transcripts JSONL + `openAgent`). Requires a reachable gateway (`~/agent-data/gateway.json`) and SQLite features. A root override writes JSONL only (no UI history).
 
 ## Install
 

@@ -27,13 +27,13 @@
 //! through as [`Tool::Raw`](crate::common::Tool::Raw). A `toolCallId` inside
 //! tool input becomes the Common tool-use id and is re-inserted on write.
 //!
-//! Continue-into is source-only (like Hermes / Amp): UI history requires a
-//! live local-gateway mint (`duplicateAgent` + restoring `store.db` /
-//! `conversation-blobs.db` while keeping `blobEncryptionKey` /
-//! `latestRootBlobId`). JSONL-only writes do not appear in the product, and
-//! those DBs cannot be synthesized cleanly from Common, so `local::write`
-//! refuses `--with grok_bot`. The store still load/saves agent-transcripts
-//! JSONL for conversion and tests.
+//! Continue-into mints a new box-harness agent through the live local gateway
+//! (`POST /api/createAgent` with `harness: "box"`), seeds `store.db`
+//! `transcript_entries` from Common, writes agent-transcripts JSONL, and
+//! `openAgent`s so the UI shows history. A root override to `local::write`
+//! still writes JSONL only (tests / offline). Cloning an existing agent with
+//! full blob history is the separate `duplicateAgent` + DB-restore path
+//! documented in `docs/formats/grok-bot.md`.
 //!
 //! Known representational losses through Common:
 //! - address prefixes (`[t0u]`) on user text;
@@ -46,6 +46,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+use std::io::{Read, Write};
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+use std::net::TcpStream;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
@@ -707,4 +712,374 @@ fn file_fingerprint(path: &Path) -> String {
         }
         Err(_) => String::new(),
     }
+}
+
+// ── Continue-into / gateway mint ───────────────────────────────────────
+
+/// Mint a new Grok Bot agent whose UI transcript matches `common`.
+///
+/// Requires a reachable local gateway (`$HOME/agent-data/gateway.json` or
+/// `TXCRIPT_GROK_BOT_GATEWAY` / `TXCRIPT_GROK_BOT_TOKEN`) and `SQLite` support
+/// (the `opencode` or `hermes` feature). Seeds `agents/<id>/store.db`
+/// `transcript_entries`, writes agent-transcripts JSONL, then `openAgent`.
+///
+/// # Errors
+/// When the gateway is unreachable, `SQLite` support is missing, or agent
+/// creation / seeding fails.
+pub fn mint_with_history(common: &Transcript<Common>) -> Result<Saved<PathBuf>> {
+    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    {
+        mint_with_history_inner(common)
+    }
+    #[cfg(not(any(feature = "opencode", feature = "hermes")))]
+    {
+        let _ = common;
+        Err(Error::Unconvertible {
+            harness: GrokBot::NAME,
+            detail: "continuing into grok_bot requires the opencode or hermes \
+                     feature (SQLite) plus a live local gateway"
+                .to_string(),
+        })
+    }
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn mint_with_history_inner(common: &Transcript<Common>) -> Result<Saved<PathBuf>> {
+    let gateway = Gateway::discover().ok_or_else(|| Error::Unconvertible {
+        harness: GrokBot::NAME,
+        detail: "no local Grok Bot gateway (expected $HOME/agent-data/gateway.json \
+                 or TXCRIPT_GROK_BOT_GATEWAY + TXCRIPT_GROK_BOT_TOKEN)"
+            .to_string(),
+    })?;
+    let agents_root = agents_root().ok_or_else(|| Error::Unconvertible {
+        harness: GrokBot::NAME,
+        detail: "cannot resolve $HOME/agent-data/agents for grok_bot mint".to_string(),
+    })?;
+    let transcripts = GrokBotStore::default_root().ok_or_else(|| Error::Unconvertible {
+        harness: GrokBot::NAME,
+        detail: "cannot resolve agent-transcripts root for grok_bot mint".to_string(),
+    })?;
+
+    let name = common
+        .meta
+        .title
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("txcript session")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    let description = "Continued into Grok Bot by txcript".to_string();
+
+    let id = gateway.create_agent(&name, &description)?;
+    super::checked_id_component(GrokBot::NAME, &id)?;
+
+    let agent_dir = agents_root.join(&id);
+    let store_db = agent_dir.join("store.db");
+    if !store_db.is_file() {
+        return Err(Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!("createAgent did not create {}", store_db.display()),
+        });
+    }
+
+    // createAgent leaves the new agent active and locks store.db. Open a
+    // different agent (if any) so we can seed transcript_entries.
+    gateway.unlock_agent_db(&id)?;
+
+    let entries = common_to_transcript_entries(common);
+    write_transcript_entries(&store_db, &entries)?;
+
+    let mut native = GrokBot::from_common(common)?;
+    native.meta.id.clone_from(&id);
+    let saved = transcripts.save(&native)?;
+
+    // Load UI history for the minted agent.
+    let _ = gateway.open_agent(&id)?;
+
+    Ok(Saved {
+        id,
+        reference: saved.reference,
+    })
+}
+
+/// Project Common messages into the UI ledger shape used by `store.db`.
+#[must_use]
+pub fn common_to_transcript_entries(common: &Transcript<Common>) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut user_i = 0u32;
+    let mut asst_turn = 0u32;
+    for message in &common.body {
+        let ts = u64::try_from(message.timestamp.timestamp_millis().max(0)).unwrap_or(0);
+        match message.role {
+            Role::User => {
+                let mut texts = Vec::new();
+                for block in &message.content {
+                    if let Block::Text { text } = block
+                        && !text.trim().is_empty()
+                    {
+                        texts.push(text.as_str());
+                    }
+                }
+                if texts.is_empty() {
+                    continue;
+                }
+                let id = format!("t{user_i}u");
+                user_i += 1;
+                asst_turn = user_i.saturating_sub(1);
+                out.push(json!({
+                    "kind": "message",
+                    "id": id,
+                    "role": "user",
+                    "content": texts.join("\n"),
+                    "timestampMs": ts,
+                    "isStreaming": false,
+                }));
+            }
+            Role::Assistant => {
+                let mut part = 0u32;
+                for block in &message.content {
+                    let Block::Text { text } = block else {
+                        continue;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let id = format!("t{asst_turn}a{part}");
+                    part += 1;
+                    out.push(json!({
+                        "kind": "send-message",
+                        "id": id,
+                        "message": {"type": "text", "content": text},
+                        "timestampMs": ts,
+                    }));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn write_transcript_entries(store_db: &Path, entries: &[Value]) -> Result<()> {
+    use rusqlite::Connection;
+    let conn = Connection::open(store_db).map_err(|e| Error::Malformed {
+        harness: GrokBot::NAME,
+        detail: format!("open store.db: {e}"),
+    })?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS transcript_entries (
+            seq INTEGER PRIMARY KEY,
+            id TEXT NOT NULL,
+            entry TEXT NOT NULL
+        );",
+    )
+    .map_err(|e| Error::Malformed {
+        harness: GrokBot::NAME,
+        detail: format!("ensure transcript_entries: {e}"),
+    })?;
+    conn.execute("DELETE FROM transcript_entries", [])
+        .map_err(|e| Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!("clear transcript_entries: {e}"),
+        })?;
+    let mut insert = conn
+        .prepare("INSERT INTO transcript_entries(seq, id, entry) VALUES (?1, ?2, ?3)")
+        .map_err(|e| Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!("prepare insert: {e}"),
+        })?;
+    for (i, entry) in entries.iter().enumerate() {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("entry")
+            .to_string();
+        let body = serde_json::to_string(entry)?;
+        insert
+            .execute(rusqlite::params![
+                i64::try_from(i + 1).unwrap_or(i64::MAX),
+                id,
+                body
+            ])
+            .map_err(|e| Error::Malformed {
+                harness: GrokBot::NAME,
+                detail: format!("insert transcript entry: {e}"),
+            })?;
+    }
+    // Bump unread so the sidebar notices.
+    if let Some(last) = entries.last() {
+        let ts = last.get("timestampMs").and_then(Value::as_u64).unwrap_or(0);
+        let unread = json!({
+            "lastActivityAt": ts,
+            "lastViewedAt": 0,
+            "isManuallyUnread": false,
+            "unreadCount": entries.len(),
+        });
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO kv(key, value) VALUES ('unreadState', ?1)",
+            [unread.to_string()],
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn agents_root() -> Option<PathBuf> {
+    std::env::var_os("TXCRIPT_GROK_BOT_AGENTS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| super::home_dir().map(|h| h.join("agent-data").join("agents")))
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+#[derive(Debug, Clone)]
+struct Gateway {
+    host: String,
+    port: u16,
+    token: String,
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+impl Gateway {
+    fn discover() -> Option<Self> {
+        if let (Ok(hostport), Ok(token)) = (
+            std::env::var("TXCRIPT_GROK_BOT_GATEWAY"),
+            std::env::var("TXCRIPT_GROK_BOT_TOKEN"),
+        ) && !hostport.is_empty()
+            && !token.is_empty()
+        {
+            let (host, port) = split_host_port(&hostport)?;
+            return Some(Self { host, port, token });
+        }
+        let path = super::home_dir()?.join("agent-data").join("gateway.json");
+        let raw = fs::read_to_string(path).ok()?;
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        let host = v.get("host").and_then(Value::as_str).unwrap_or("127.0.0.1");
+        let port = u16::try_from(v.get("port").and_then(Value::as_u64)?).ok()?;
+        let token = v.get("token").and_then(Value::as_str)?.to_string();
+        if token.is_empty() {
+            return None;
+        }
+        Some(Self {
+            host: host.to_string(),
+            port,
+            token,
+        })
+    }
+
+    fn create_agent(&self, name: &str, description: &str) -> Result<String> {
+        let body = json!({
+            "name": name,
+            "description": description,
+            "harness": "box",
+        });
+        let resp = self.post("/api/createAgent", &body)?;
+        resp.pointer("/agent/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Error::Malformed {
+                harness: GrokBot::NAME,
+                detail: format!("createAgent missing agent.id: {resp}"),
+            })
+    }
+
+    fn open_agent(&self, id: &str) -> Result<Value> {
+        self.post("/api/openAgent", &json!({"id": id}))
+    }
+
+    fn unlock_agent_db(&self, keep_locked: &str) -> Result<()> {
+        let agents = self.list_agents().unwrap_or_default();
+        if let Some(other) = agents.into_iter().find(|a| a != keep_locked) {
+            let _ = self.open_agent(&other)?;
+        }
+        Ok(())
+    }
+
+    fn list_agents(&self) -> Result<Vec<String>> {
+        let resp = self.post("/api/listAgents", &json!({}))?;
+        let Some(arr) = resp.as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(arr
+            .iter()
+            .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect())
+    }
+
+    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        let payload = serde_json::to_vec(body)?;
+        let mut stream = TcpStream::connect((self.host.as_str(), self.port)).map_err(|e| {
+            Error::Unconvertible {
+                harness: GrokBot::NAME,
+                detail: format!(
+                    "cannot reach Grok Bot gateway {}:{}: {e}",
+                    self.host, self.port
+                ),
+            }
+        })?;
+        let request = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}:{port}\r\n\
+             Authorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            host = self.host,
+            port = self.port,
+            token = self.token,
+            len = payload.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(&payload))
+            .map_err(|e| Error::Malformed {
+                harness: GrokBot::NAME,
+                detail: format!("gateway write failed: {e}"),
+            })?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).map_err(|e| Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!("gateway read failed: {e}"),
+        })?;
+        let text = String::from_utf8_lossy(&buf);
+        let Some(idx) = text.find("\r\n\r\n") else {
+            return Err(Error::Malformed {
+                harness: GrokBot::NAME,
+                detail: "gateway response missing header terminator".to_string(),
+            });
+        };
+        let (header, body) = text.split_at(idx + 4);
+        let status = header
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("0");
+        let value: Value =
+            serde_json::from_str(body.trim()).unwrap_or_else(|_| json!({"raw": body}));
+        if !status.starts_with('2') {
+            return Err(Error::Unconvertible {
+                harness: GrokBot::NAME,
+                detail: format!("gateway {path} HTTP {status}: {value}"),
+            });
+        }
+        if value.get("error").is_some() {
+            return Err(Error::Unconvertible {
+                harness: GrokBot::NAME,
+                detail: format!("gateway {path}: {value}"),
+            });
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn split_host_port(hostport: &str) -> Option<(String, u16)> {
+    let hostport = hostport
+        .strip_prefix("http://")
+        .or_else(|| hostport.strip_prefix("https://"))
+        .unwrap_or(hostport);
+    let (host, port) = hostport.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
 }

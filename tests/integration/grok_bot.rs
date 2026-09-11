@@ -315,19 +315,34 @@ fn sand_subagent_dirs_are_discovered() {
 }
 
 #[test]
-fn grok_bot_is_source_only_for_every_write_root() {
+fn write_with_root_override_saves_jsonl_only() {
     let common = fixpoint_common();
     let dir = tempfile::tempdir().unwrap();
-    for root in [None, Some(dir.path())] {
-        let error = txcript::local::write(HarnessId::GrokBot, &common, root)
-            .err()
-            .unwrap_or_else(|| panic!("grok_bot write should be refused"));
-        let msg = error.to_string();
-        assert!(
-            msg.contains("cannot be continued into it") || msg.contains("not continued into"),
-            "unexpected error: {msg}"
-        );
-    }
+    let written = txcript::local::write(HarnessId::GrokBot, &common, Some(dir.path())).unwrap();
+    assert_eq!(written.id, "fixpoint-session");
+    let path = dir
+        .path()
+        .join(&written.id)
+        .join(format!("{}.jsonl", written.id));
+    assert!(path.is_file(), "expected {}", path.display());
+}
+
+#[test]
+fn common_to_transcript_entries_maps_user_and_assistant_text() {
+    let entries = grok_bot::common_to_transcript_entries(&fixpoint_common());
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.get("kind") == Some(&json!("message"))
+                && e.get("role") == Some(&json!("user"))),
+        "{entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.get("kind") == Some(&json!("send-message"))),
+        "{entries:?}"
+    );
 }
 
 #[test]

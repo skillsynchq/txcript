@@ -64,32 +64,32 @@ A minimal synthetic session:
 
 ## Continue-into / write
 
-**Refused by `local::write`.** There is no public session-import or resume
-CLI. Writing agent-transcripts JSONL alone does **not** make history appear
-in the Grok Bot UI.
+`local::write` / `txcript continue --with grok_bot` mints a **new** box-harness
+agent on the live local gateway and seeds UI history:
 
-Verified mint-with-history sequence on a live local gateway
-(`http://127.0.0.1:1340`, Bearer token from `$HOME/agent-data/gateway.json`):
+1. `POST /api/createAgent` with `{name, description, harness: "box"}`
+   (Bearer token from `$HOME/agent-data/gateway.json`, or
+   `TXCRIPT_GROK_BOT_GATEWAY` + `TXCRIPT_GROK_BOT_TOKEN`).
+2. Unlock the new agent's `store.db` by opening another agent (createAgent
+   leaves the new one active and locks the DB).
+3. Write Common text turns into `agents/<id>/store.db` `transcript_entries`
+   (`kind: message` / `send-message`).
+4. Write agent-transcripts JSONL for the read path.
+5. `POST /api/openAgent` with the new id — history appears in the product.
 
-1. `POST /api/duplicateAgent` with body `{"id":"<source>"}` — clones the agent.
-2. `POST /api/openAgent` with the **source** id (unlocks / materializes copy DB paths).
-3. Restore the source `store.db` + `conversation-blobs.db` onto the new agent
-   directory; remap `agentId` in store metadata; keep `blobEncryptionKey` and
-   `latestRootBlobId`; do **not** `clearConversation`.
-4. `POST /api/openAgent` with the **new** id — UI history appears.
+A `--root` override writes JSONL only (no gateway); that path is for tests and
+offline conversion and does **not** surface chat in the UI.
 
-`CreateAgent` / host-official clone paths clear chat
-(`includesChatHistory=false`). The restore above is the
-`includesChatHistory=true` equivalent. Because that path needs a live gateway,
-encrypted blob keys, and a source agent DB — and cannot be synthesized cleanly
-from `Transcript<Common>` — txcript keeps continue-into source-only (like
-Hermes / Amp). `GrokBotStore::save` still writes JSONL for conversion and
-tests.
+Cloning an existing agent while preserving its encrypted blob history is a
+separate verified sequence (`duplicateAgent` + restore `store.db` /
+`conversation-blobs.db` with `blobEncryptionKey` / `latestRootBlobId` kept).
+txcript's continue-into path does not need that for Common→UI text history.
+
 
 ## Caveats
 
-- No public import / resume CLI: convert *from* `grok_bot`, not into it
-  (store load/save still works for conversion and tests).
+- Continue-into needs a live local gateway and SQLite (`opencode`/`hermes`
+  feature). Without them, `local::write` errors clearly.
 - No native per-record timestamps, model, usage, or stop reasons.
 - Address prefixes are stripped in Common and not regenerated.
 - Rich shell bookkeeping keys survive native round trips; through Common they
@@ -106,4 +106,4 @@ tests.
   `127.0.0.1:1340`, 2026-09-11.
 - Parser: `src/harness/grok_bot.rs`.
 
-Last verified: 2026-09-11.
+Last verified: 2026-09-11 (mint via createAgent+transcript_entries).
