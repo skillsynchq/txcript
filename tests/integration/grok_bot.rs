@@ -1,0 +1,372 @@
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
+//! Integration tests for the Grok Bot codec and store — JSONL envelopes with
+//! `role: tool` results, shell/read normalization, address-prefix stripping,
+//! and the codec fixpoint through Common.
+
+use chrono::{TimeZone, Utc};
+use serde_json::json;
+use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
+use txcript::harness::grok_bot;
+use txcript::{Codec, Common, Store, TextCodec, Transcript};
+
+fn ts() -> chrono::DateTime<Utc> {
+    Utc.timestamp_opt(1_780_000_000, 0)
+        .single()
+        .unwrap_or_default()
+}
+
+/// Anonymized native fixture modeled on observed Grok Bot JSONL shapes.
+fn native_fixture_lines() -> String {
+    let records = vec![
+        json!({"role":"user","message":{"content":[{"type":"text","text":"[t0u]\nList the project root"}]}}),
+        json!({"role":"assistant","message":{"content":[{"type":"text","text":"Checking."}]}}),
+        json!({"role":"assistant","message":{"content":[{"type":"tool_use","name":"send_message","input":{"text":{"content":"Checking."}}}]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool_result","name":"send_message","result":{"success":{"messageId":"t0s0"}}}]}}),
+        json!({"role":"assistant","message":{"content":[{
+            "type":"tool_use","name":"shell",
+            "input":{"command":"ls -la","timeout":30000,"description":"list root",
+                     "toolCallId":"call-shell-1"}
+        }]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool_result","name":"shell","result":{
+            "success":{"stdout":"README.md\n","exitCode":0},"isBackground":false
+        }}]}}),
+        json!({"role":"assistant","message":{"content":[{
+            "type":"tool_use","name":"read","input":{"path":"/tmp/README.md","limit":20}
+        }]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool_result","name":"read","result":{
+            "failure":{"message":"not found"}
+        }}]}}),
+        json!({"role":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}),
+        // Unmodeled role: must survive disk round trips.
+        json!({"role":"supervisor","note":"bookkeeping the codec does not model"}),
+    ];
+    records
+        .into_iter()
+        .map(|v| serde_json::to_string(&v).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn write_session(root: &std::path::Path, id: &str, body: &str) {
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+    std::fs::write(dir.join(format!("{id}.journal-mode")), "2").unwrap();
+}
+
+#[test]
+fn store_round_trip_is_lossless_on_disk() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let id = "11111111-2222-4333-8444-555555555555";
+    write_session(src.path(), id, &native_fixture_lines());
+
+    let loaded = grok_bot::GrokBotStore::new(src.path())
+        .load(&src.path().join(id))
+        .unwrap();
+    let saved = grok_bot::GrokBotStore::new(dst.path())
+        .save(&loaded)
+        .unwrap();
+    assert_eq!(saved.reference, dst.path().join(id));
+    assert_eq!(saved.id, id);
+
+    let reloaded = grok_bot::GrokBotStore::new(dst.path())
+        .load(&saved.reference)
+        .unwrap();
+    assert_eq!(loaded.body.records, reloaded.body.records);
+    assert_eq!(
+        reloaded.body.records.last().unwrap().get("role").unwrap(),
+        "supervisor"
+    );
+}
+
+#[test]
+fn discover_extracts_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    write_session(dir.path(), id, &native_fixture_lines());
+    // Stray non-session directory must be skipped.
+    std::fs::create_dir_all(dir.path().join("not-a-session")).unwrap();
+    std::fs::write(dir.path().join("not-a-session/notes.txt"), "hi").unwrap();
+
+    let found = grok_bot::GrokBotStore::new(dir.path()).discover().unwrap();
+    assert_eq!(found.len(), 1);
+    let meta = &found[0].meta;
+    assert_eq!(meta.id, id);
+    assert_eq!(meta.title.as_deref(), Some("List the project root"));
+}
+
+#[test]
+fn to_common_strips_address_prefixes_and_types_shell_read() {
+    let text = native_fixture_lines();
+    let common =
+        grok_bot::GrokBot::to_common(&grok_bot::GrokBot::from_text(&text).unwrap()).unwrap();
+    let msgs = &common.body;
+
+    // user, assistant(text), assistant(send_message), user(result),
+    // assistant(shell), user(shell result), assistant(read), user(read err),
+    // assistant(Done) — supervisor skipped.
+    assert_eq!(msgs.len(), 9);
+
+    assert_eq!(msgs[0].role, Role::User);
+    assert!(matches!(&msgs[0].content[0], Block::Text { text } if text == "List the project root"));
+
+    assert!(matches!(
+        &msgs[2].content[0],
+        Block::ToolUse { tool: Tool::Raw { tool_name, .. }, .. } if tool_name == "send_message"
+    ));
+
+    assert!(matches!(
+        &msgs[4].content[0],
+        Block::ToolUse {
+            id,
+            tool: Tool::Bash {
+                command,
+                timeout_ms,
+                description,
+                ..
+            }
+        } if id == "call-shell-1"
+            && command == "ls -la"
+            && *timeout_ms == Some(30_000)
+            && description.as_deref() == Some("list root")
+    ));
+
+    assert!(matches!(
+        &msgs[5].content[0],
+        Block::ToolResult { tool_use_id, is_error, .. }
+            if tool_use_id == "call-shell-1" && !*is_error
+    ));
+
+    assert!(matches!(
+        &msgs[6].content[0],
+        Block::ToolUse {
+            tool: Tool::Read { file_path, limit, .. },
+            ..
+        } if file_path == "/tmp/README.md" && *limit == Some(20)
+    ));
+
+    assert!(matches!(
+        &msgs[7].content[0],
+        Block::ToolResult { is_error, .. } if *is_error
+    ));
+}
+
+#[test]
+fn orphan_results_do_not_steal_unrelated_pending_calls() {
+    let text = [
+        json!({"role":"assistant","message":{"content":[
+            {"type":"tool_use","name":"shell","input":{"command":"pwd","toolCallId":"shell-1"}},
+            {"type":"tool_use","name":"read","input":{"path":"/tmp/a","toolCallId":"read-1"}}
+        ]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool_result","name":"other","result":{"success":"orphan"}}]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool_result","name":"shell","result":{"success":"ok"}}]}}),
+        json!({"role":"tool","message":{"content":[{"type":"tool_result","name":"read","result":{"success":"ok"}}]}}),
+    ]
+    .into_iter()
+    .map(|record| serde_json::to_string(&record).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    let common =
+        grok_bot::GrokBot::to_common(&grok_bot::GrokBot::from_text(&text).unwrap()).unwrap();
+    let result_ids: Vec<_> = common
+        .body
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(result_ids, ["orphan:other", "shell-1", "read-1"]);
+}
+
+fn msg(role: Role, content: Vec<Block>) -> Message {
+    Message {
+        role,
+        content,
+        timestamp: ts(),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    }
+}
+
+fn fixpoint_common() -> Transcript<Common> {
+    Transcript::new(
+        Meta {
+            id: "fixpoint-session".into(),
+            timestamp: ts(),
+            cwd: None,
+            git_branch: None,
+            title: Some("fixpoint".into()),
+            cli_version: None,
+            model: None,
+        },
+        vec![
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "run ls".into(),
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                vec![
+                    Block::Text {
+                        text: "Running.".into(),
+                    },
+                    Block::ToolUse {
+                        id: "call-1".into(),
+                        tool: Tool::Bash {
+                            command: "ls".into(),
+                            workdir: None,
+                            timeout_ms: Some(5_000),
+                            description: Some("list".into()),
+                            run_in_background: false,
+                        },
+                    },
+                    Block::ToolUse {
+                        id: "call-2".into(),
+                        tool: Tool::Raw {
+                            tool_name: "send_message".into(),
+                            input: json!({"text":{"content":"Running."}}),
+                        },
+                    },
+                ],
+            ),
+            msg(
+                Role::User,
+                vec![Block::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: ToolOutput::Json(json!({"stdout":"a\n","exitCode":0})),
+                    is_error: false,
+                }],
+            ),
+            msg(
+                Role::User,
+                vec![Block::ToolResult {
+                    tool_use_id: "call-2".into(),
+                    content: ToolOutput::Json(json!({"messageId":"t0s0"})),
+                    is_error: false,
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                vec![Block::ToolUse {
+                    id: "call-3".into(),
+                    tool: Tool::Read {
+                        file_path: "/tmp/a".into(),
+                        offset: None,
+                        limit: Some(10),
+                    },
+                }],
+            ),
+            msg(
+                Role::User,
+                vec![Block::ToolResult {
+                    tool_use_id: "call-3".into(),
+                    content: ToolOutput::Text("missing".into()),
+                    is_error: true,
+                }],
+            ),
+        ],
+    )
+}
+
+#[test]
+fn codec_fixpoint_through_common_loses_nothing() {
+    let common = fixpoint_common();
+    let native = grok_bot::GrokBot::from_common(&common).unwrap();
+    let back = grok_bot::GrokBot::to_common(&native).unwrap();
+    assert_eq!(back.body, common.body);
+}
+
+#[test]
+fn from_common_is_deterministic() {
+    let common = Transcript::new(
+        Meta {
+            id: "det-id".into(),
+            timestamp: ts(),
+            cwd: None,
+            git_branch: None,
+            title: None,
+            cli_version: None,
+            model: None,
+        },
+        vec![Message {
+            role: Role::User,
+            content: vec![Block::Text { text: "hi".into() }],
+            timestamp: ts(),
+            model: None,
+            stop_reason: None,
+            usage: None,
+        }],
+    );
+    let a = grok_bot::GrokBot::to_text(&grok_bot::GrokBot::from_common(&common).unwrap()).unwrap();
+    let b = grok_bot::GrokBot::to_text(&grok_bot::GrokBot::from_common(&common).unwrap()).unwrap();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn sniff_skips_non_envelope_jsonl() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    let bad_dir = dir.path().join(id);
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(
+        bad_dir.join(format!("{id}.jsonl")),
+        "{\"type\":\"session_meta\",\"id\":\"x\"}\n",
+    )
+    .unwrap();
+    let found = grok_bot::GrokBotStore::new(dir.path()).discover().unwrap();
+    assert!(found.is_empty());
+}
+
+#[test]
+fn text_codec_rejects_empty_non_envelope_and_malformed_jsonl() {
+    for text in [
+        "",
+        "{\"role\":\"supervisor\",\"message\":{}}\n",
+        "{\"role\":\"user\",\"message\":{\"content\":[]}}\nnot-json\n",
+    ] {
+        assert!(
+            grok_bot::GrokBot::from_text(text).is_err(),
+            "accepted {text:?}"
+        );
+    }
+}
+
+#[test]
+fn discovery_skips_a_session_with_a_malformed_later_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "cccccccc-dddd-4eee-8fff-000000000000";
+    write_session(
+        dir.path(),
+        id,
+        "{\"role\":\"user\",\"message\":{\"content\":[]}}\nnot-json\n",
+    );
+    let found = grok_bot::GrokBotStore::new(dir.path()).discover().unwrap();
+    assert!(found.is_empty());
+}
+
+#[test]
+fn sand_subagent_dirs_are_discovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "sand-subagent-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    write_session(
+        dir.path(),
+        id,
+        &format!(
+            "{}\n",
+            json!({"role":"user","message":{"content":[{"type":"text","text":"[t0u]\nsubtask"}]}})
+        ),
+    );
+    let found = grok_bot::GrokBotStore::new(dir.path()).discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].meta.id, id);
+    assert_eq!(found[0].meta.title.as_deref(), Some("subtask"));
+}

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
-use txcript::harness::{amp, antigravity, campfire, claude_code, codex, cursor, grok, pi};
+use txcript::harness::{
+    amp, antigravity, campfire, claude_code, codex, cursor, grok, grok_bot, pi,
+};
 use txcript::{Codec, Common, Store, Transcript};
 
 fn small_common(id: &str) -> Transcript<Common> {
@@ -80,6 +82,7 @@ fn hostile_ids_cannot_escape_any_file_backed_store() {
     assert_save_confined(&campfire::CampfireStore::new(root.to_path_buf()), root);
     assert_save_confined(&cursor::CursorStore::new(root.to_path_buf()), root);
     assert_save_confined(&grok::GrokStore::new(root.to_path_buf()), root);
+    assert_save_confined(&grok_bot::GrokBotStore::new(root.to_path_buf()), root);
     assert_save_confined(&amp::AmpStore::new(root.to_path_buf()), root);
     assert_save_confined(
         &antigravity::AntigravityStore::new(root.to_path_buf()),
@@ -116,6 +119,97 @@ fn cursor_delete_refuses_paths_outside_the_chats_root() {
     // about its parent being a session; refuse it too.
     let phantom = chats.path().join("w").join("id").join("store.db");
     assert!(store.delete(&phantom).is_err());
+}
+
+#[test]
+fn grok_bot_delete_refuses_paths_outside_the_transcript_root() {
+    let root = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let id = victim.path().file_name().unwrap().to_string_lossy();
+    std::fs::write(
+        victim.path().join(format!("{id}.jsonl")),
+        b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
+    )
+    .unwrap();
+
+    let store = grok_bot::GrokBotStore::new(root.path().to_path_buf());
+    assert!(
+        store.delete(&victim.path().to_path_buf()).is_err(),
+        "a session-shaped directory outside the root must be refused"
+    );
+    assert!(victim.path().is_dir(), "the foreign directory must survive");
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_bot_delete_refuses_a_symlink_outside_the_transcript_root() {
+    let root = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let id = "linked-session";
+    std::fs::write(
+        victim.path().join(format!("{id}.jsonl")),
+        b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
+    )
+    .unwrap();
+    let link = root.path().join(id);
+    std::os::unix::fs::symlink(victim.path(), &link).unwrap();
+
+    let store = grok_bot::GrokBotStore::new(root.path().to_path_buf());
+    assert!(
+        store.delete(&link).is_err(),
+        "a symlink resolving outside the root must be refused"
+    );
+    assert!(
+        victim.path().join(format!("{id}.jsonl")).is_file(),
+        "the symlink target must survive"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_bot_rejects_symlinked_sessions_inside_the_transcript_root() {
+    let root = tempfile::tempdir().unwrap();
+    let victim_id = "victim-session";
+    let victim = root.path().join(victim_id);
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::write(
+        victim.join(format!("{victim_id}.jsonl")),
+        b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
+    )
+    .unwrap();
+    let link = root.path().join("linked-session");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+    let store = grok_bot::GrokBotStore::new(root.path().to_path_buf());
+    assert!(store.load(&link).is_err());
+    assert!(store.delete(&link).is_err());
+    assert!(victim.is_dir(), "the in-root symlink target must survive");
+    let found = store.discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].meta.id, victim_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_bot_save_refuses_symlinked_session_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let id = "linked-session";
+    let native = grok_bot::GrokBot::from_common(&small_common(id)).unwrap();
+    let store = grok_bot::GrokBotStore::new(root.path().to_path_buf());
+
+    let linked_dir = root.path().join(id);
+    std::os::unix::fs::symlink(victim.path(), &linked_dir).unwrap();
+    assert!(store.save(&native).is_err());
+    assert!(!victim.path().join(format!("{id}.jsonl")).exists());
+    std::fs::remove_file(&linked_dir).unwrap();
+
+    std::fs::create_dir(&linked_dir).unwrap();
+    let victim_file = victim.path().join("outside.jsonl");
+    std::fs::write(&victim_file, b"keep me").unwrap();
+    std::os::unix::fs::symlink(&victim_file, linked_dir.join(format!("{id}.jsonl"))).unwrap();
+    assert!(store.save(&native).is_err());
+    assert_eq!(std::fs::read(&victim_file).unwrap(), b"keep me");
 }
 
 #[test]

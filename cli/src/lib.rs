@@ -64,7 +64,7 @@ pub mod mcp;
 mod pager;
 mod view;
 
-pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
+pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, grok_bot, fx, hermes, \
      amp, antigravity, simple, cowork";
 
 /// The `txcript` binary's command line.
@@ -845,6 +845,7 @@ mod crop_command_tests {
             HarnessId::ChatGpt,
             HarnessId::Hermes,
             HarnessId::Amp,
+            HarnessId::GrokBot,
             HarnessId::Simple,
         ] {
             let error = ensure_crop_target(target).unwrap_err();
@@ -858,7 +859,9 @@ mod crop_command_tests {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{Common, HarnessId, Transcript, ensure_resumable_source, fresh_identity};
+    use super::{
+        Common, HARNESSES, HarnessId, Transcript, ensure_resumable_source, fresh_identity,
+    };
     use txcript::common::Meta;
 
     pub(crate) fn transcript() -> Transcript<Common> {
@@ -925,6 +928,19 @@ mod identity_tests {
     fn chatgpt_is_refused_even_for_an_in_place_continue() {
         let error = ensure_resumable_source(HarnessId::ChatGpt, HarnessId::ChatGpt).unwrap_err();
         assert!(error.contains("pull-only"));
+    }
+
+    #[test]
+    fn grok_bot_is_refused_even_for_an_in_place_continue() {
+        let error = ensure_resumable_source(HarnessId::GrokBot, HarnessId::GrokBot).unwrap_err();
+        assert!(error.contains("no session import or resume CLI"));
+    }
+
+    #[test]
+    fn help_lists_every_harness() {
+        for harness in HarnessId::ALL {
+            assert!(HARNESSES.contains(harness.as_str()), "missing {harness}");
+        }
     }
 
     #[test]
@@ -1069,6 +1085,7 @@ mod style {
             HarnessId::Cursor => "\x1b[34m",           // blue
             HarnessId::CursorDesktop => "\x1b[96m",    // bright cyan
             HarnessId::Grok => "\x1b[37m",             // white
+            HarnessId::GrokBot => "\x1b[97m",          // bright white
             HarnessId::Fx => "\x1b[38;5;39m",          // azure
             HarnessId::Hermes => "\x1b[93m",           // bright yellow
             HarnessId::Amp => "\x1b[95m",              // bright magenta
@@ -1589,6 +1606,7 @@ fn ensure_crop_target(target: HarnessId) -> Result<(), String> {
             | HarnessId::ChatGpt
             | HarnessId::Hermes
             | HarnessId::Amp
+            | HarnessId::GrokBot
             | HarnessId::Simple
     ) {
         Err(format!(
@@ -1608,6 +1626,11 @@ fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), S
     } else if source == HarnessId::ChatGpt && target == HarnessId::ChatGpt {
         Err(
             "ChatGPT is pull-only: choose another --with harness; txcript never continues conversations in ChatGPT"
+                .to_string(),
+        )
+    } else if source == HarnessId::GrokBot && target == HarnessId::GrokBot {
+        Err(
+            "Grok Bot has no session import or resume CLI: choose another --with harness"
                 .to_string(),
         )
     } else {
