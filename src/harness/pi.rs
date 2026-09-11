@@ -871,7 +871,7 @@ fn normalize_tool(tool: &str, input: Value) -> (String, Value) {
         "grep" => ("Grep".to_string(), input),
         "find" => ("Glob".to_string(), input),
         "ls" => ("LS".to_string(), input),
-        other => (title_case(other), input),
+        other => (other.to_string(), input),
     }
 }
 
@@ -979,7 +979,7 @@ fn denormalize_tool(tool: &Tool) -> (String, Value) {
         "Grep" => ("grep".to_string(), input),
         "Glob" => ("find".to_string(), input),
         "LS" => ("ls".to_string(), input),
-        other => (other.to_ascii_lowercase(), input),
+        other => (other.to_string(), input),
     }
 }
 
@@ -1044,14 +1044,6 @@ fn rename_keys(input: Value, renames: &[(&str, &str)]) -> Value {
         }
         // Non-object inputs have no keys to rename.
         other => other,
-    }
-}
-
-fn title_case(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
     }
 }
 
