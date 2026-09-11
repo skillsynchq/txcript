@@ -99,6 +99,12 @@ live local gateway and seeds UI history. It never launches a CLI resume
 5. Write agent-transcripts JSONL for the read path.
 6. `POST /api/openAgent` with the new id — history appears in the product.
 
+If any step after `createAgent` fails (for example a SQLite `UNIQUE`
+constraint while seeding `transcript_entries`), mint best-effort rolls back
+with `POST /api/deleteAgent` `{id}` so half-created bots are not left in the
+sidebar. Delete errors are logged and ignored; the original mint error is
+returned. Successful mints do not delete.
+
 ### `--metadata`
 
 Repeatable `key=value` or a JSON object, merged left-to-right. `grok_bot`

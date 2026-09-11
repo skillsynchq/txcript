@@ -34,10 +34,12 @@
 //! Continue-into mints a new box-harness agent through the live local gateway
 //! (`POST /api/createAgent` with `harness: "box"`), seeds `store.db`
 //! `transcript_entries` from Common, writes agent-transcripts JSONL, and
-//! `openAgent`s so the UI shows history. A root override to `local::write`
-//! still writes JSONL only (tests / offline). Cloning an existing agent with
-//! full blob history is the separate `duplicateAgent` + DB-restore path
-//! documented in `docs/formats/grok-bot.md`.
+//! `openAgent`s so the UI shows history. If seeding fails after `createAgent`,
+//! mint best-effort rolls back via `POST /api/deleteAgent` so half-created
+//! bots are not left in the sidebar. A root override to `local::write` still
+//! writes JSONL only (tests / offline). Cloning an existing agent with full
+//! blob history is the separate `duplicateAgent` + DB-restore path documented
+//! in `docs/formats/grok-bot.md`.
 //!
 //! Known representational losses through Common:
 //! - address prefixes (`[t0u]`) on user text;
@@ -1179,9 +1181,27 @@ fn mint_with_history_inner(
     let (name, description) = agent_profile_from(common, metadata);
 
     let id = gateway.create_agent(&name, &description)?;
-    super::checked_id_component(GrokBot::NAME, &id)?;
+    // Anything after createAgent must roll back on failure so the sidebar does
+    // not keep a half-minted bot (e.g. UNIQUE failures while seeding).
+    with_mint_rollback(
+        &id,
+        || seed_created_agent(&gateway, &agents_root, &transcripts, common, &id),
+        |minted_id| cleanup_minted_agent(&gateway, minted_id),
+    )
+}
 
-    let agent_dir = agents_root.join(&id);
+/// Post-`createAgent` mint steps (id check → unlock → seed → JSONL → open).
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn seed_created_agent(
+    gateway: &Gateway,
+    agents_root: &Path,
+    transcripts: &GrokBotStore,
+    common: &Transcript<Common>,
+    id: &str,
+) -> Result<Saved<PathBuf>> {
+    super::checked_id_component(GrokBot::NAME, id)?;
+
+    let agent_dir = agents_root.join(id);
     let store_db = agent_dir.join("store.db");
     if !store_db.is_file() {
         return Err(Error::Malformed {
@@ -1192,22 +1212,52 @@ fn mint_with_history_inner(
 
     // createAgent leaves the new agent active and locks store.db. Open a
     // different agent (if any) so we can seed transcript_entries.
-    gateway.unlock_agent_db(&id)?;
+    gateway.unlock_agent_db(id)?;
 
     let entries = common_to_transcript_entries(common);
     write_transcript_entries(&store_db, &entries)?;
 
     let mut native = GrokBot::from_common(common)?;
-    native.meta.id.clone_from(&id);
+    id.clone_into(&mut native.meta.id);
     let saved = transcripts.save(&native)?;
 
     // Load UI history for the minted agent.
-    let _ = gateway.open_agent(&id)?;
+    let _ = gateway.open_agent(id)?;
 
     Ok(Saved {
-        id,
+        id: id.to_string(),
         reference: saved.reference,
     })
+}
+
+/// Run post-create mint work; on `Err`, invoke `cleanup` with the minted id.
+///
+/// Success must not clean up. Used so unit tests can assert the failure path
+/// without a live gateway.
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn with_mint_rollback<T>(
+    id: &str,
+    work: impl FnOnce() -> Result<T>,
+    cleanup: impl FnOnce(&str),
+) -> Result<T> {
+    match work() {
+        Ok(ok) => Ok(ok),
+        Err(err) => {
+            cleanup(id);
+            Err(err)
+        }
+    }
+}
+
+/// Best-effort `deleteAgent` after a failed mint. Delete errors are logged and
+/// ignored so the original mint error remains the returned failure.
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+fn cleanup_minted_agent(gateway: &Gateway, id: &str) {
+    if let Err(err) = gateway.delete_agent(id) {
+        eprintln!(
+            "warning: grok_bot mint failed; best-effort deleteAgent({id}) also failed: {err}"
+        );
+    }
 }
 
 /// Resolve createAgent name/description from `--metadata` and transcript meta.
@@ -1508,6 +1558,11 @@ impl Gateway {
             })
     }
 
+    fn delete_agent(&self, id: &str) -> Result<()> {
+        let _ = self.post("/api/deleteAgent", &json!({"id": id}))?;
+        Ok(())
+    }
+
     fn open_agent(&self, id: &str) -> Result<Value> {
         self.post("/api/openAgent", &json!({"id": id}))
     }
@@ -1606,4 +1661,148 @@ fn split_host_port(hostport: &str) -> Option<(String, u16)> {
         .unwrap_or(hostport);
     let (host, port) = hostport.rsplit_once(':')?;
     Some((host.to_string(), port.parse().ok()?))
+}
+
+#[cfg(all(test, any(feature = "opencode", feature = "hermes")))]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod mint_cleanup_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn serve_json_once(listener: &TcpListener, seen: Option<Arc<Mutex<Vec<String>>>>, body: &str) {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).expect("read");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = find_header_end(&buf) {
+                let headers = std::str::from_utf8(&buf[..header_end]).unwrap_or("");
+                let content_length = headers.lines().find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                });
+                let total = header_end + content_length.unwrap_or(0);
+                if buf.len() >= total {
+                    buf.truncate(total);
+                    break;
+                }
+            }
+        }
+        if let Some(seen) = seen {
+            seen.lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&buf).into_owned());
+        }
+        // Keep status/header bytes on one line so rustfmt cannot turn `\r\n` into bare LFs.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    }
+
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    }
+
+    #[test]
+    fn with_mint_rollback_cleans_up_only_on_err() {
+        let cleaned = AtomicBool::new(false);
+        let ok = with_mint_rollback(
+            "keep-me",
+            || Ok::<_, Error>(7_u8),
+            |_| cleaned.store(true, Ordering::SeqCst),
+        );
+        assert_eq!(ok.expect("ok path"), 7);
+        assert!(
+            !cleaned.load(Ordering::SeqCst),
+            "success must not delete the minted agent"
+        );
+
+        let cleaned = AtomicBool::new(false);
+        let err: Result<u8> = with_mint_rollback(
+            "drop-me",
+            || {
+                Err(Error::Malformed {
+                    harness: GrokBot::NAME,
+                    detail: "seed failed".into(),
+                })
+            },
+            |id| {
+                assert_eq!(id, "drop-me");
+                cleaned.store(true, Ordering::SeqCst);
+            },
+        );
+        assert!(err.is_err(), "{err:?}");
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "failure path must invoke cleanup with the minted id"
+        );
+    }
+
+    #[test]
+    fn delete_agent_posts_id_to_delete_agent_api() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            serve_json_once(&listener, Some(server_seen), r#"{"ok":true}"#);
+        });
+
+        let gateway = Gateway {
+            host: "127.0.0.1".into(),
+            port: address.port(),
+            token: "test-token".into(),
+        };
+        gateway
+            .delete_agent("11111111-2222-4333-8444-555555555555")
+            .expect("delete_agent");
+        server.join().expect("server");
+
+        let requests = seen.lock().expect("lock");
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let req = &requests[0];
+        assert!(req.starts_with("POST /api/deleteAgent HTTP/1.1"), "{req}");
+        assert!(
+            req.to_ascii_lowercase()
+                .contains("authorization: bearer test-token"),
+            "{req}"
+        );
+        let expected = json!({"id": "11111111-2222-4333-8444-555555555555"}).to_string();
+        assert!(req.contains(&expected), "expected body {expected} in {req}");
+    }
+
+    #[test]
+    fn cleanup_minted_agent_ignores_delete_errors() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            serve_json_once(&listener, None, r#"{"error":"no such agent"}"#);
+        });
+
+        let gateway = Gateway {
+            host: "127.0.0.1".into(),
+            port: address.port(),
+            token: "test-token".into(),
+        };
+        // Must not panic; delete errors are best-effort.
+        cleanup_minted_agent(&gateway, "fake-id-does-not-exist");
+        server.join().expect("server");
+    }
 }
