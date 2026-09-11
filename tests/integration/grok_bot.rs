@@ -395,3 +395,248 @@ fn preflight_accepts_existing_writable_dirs() {
     std::fs::create_dir_all(&transcripts).unwrap();
     grok_bot::preflight_live_roots(&agents, &transcripts).unwrap();
 }
+
+#[test]
+fn discover_unions_agents_profile_and_transcripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    let transcripts = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::create_dir_all(&transcripts).unwrap();
+
+    // Live agent with profile, no JSONL.
+    let marcus = "5a1951b5-c513-43dd-92ea-85679adc4a6d";
+    let marcus_dir = agents.join(marcus);
+    std::fs::create_dir_all(&marcus_dir).unwrap();
+    std::fs::write(
+        marcus_dir.join("profile.json"),
+        r#"{"name":"Marcus","description":"","harness":"temporal"}"#,
+    )
+    .unwrap();
+
+    // Minted agent with profile + JSONL — title must be profile name, not snippet.
+    let minted = "11111111-2222-4333-8444-555555555555";
+    let minted_agent = agents.join(minted);
+    std::fs::create_dir_all(&minted_agent).unwrap();
+    std::fs::write(
+        minted_agent.join("profile.json"),
+        r#"{"name":"Relay bot","description":"from Simple"}"#,
+    )
+    .unwrap();
+    write_session(
+        &transcripts,
+        minted,
+        &format!(
+            "{}\n",
+            json!({"role":"user","message":{"content":[{"type":"text","text":"[t0u]\nfirst message snippet"}]}})
+        ),
+    );
+
+    // Subagent JSONL only (no profile).
+    let sub = "sand-subagent-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    write_session(
+        &transcripts,
+        sub,
+        &format!(
+            "{}\n",
+            json!({"role":"user","message":{"content":[{"type":"text","text":"[t0u]\nsubtask work"}]}})
+        ),
+    );
+
+    let found = grok_bot::GrokBotStore::new(&transcripts)
+        .with_agents(&agents)
+        .discover()
+        .unwrap();
+    let by_id: std::collections::HashMap<_, _> =
+        found.iter().map(|d| (d.meta.id.as_str(), d)).collect();
+    assert_eq!(by_id.len(), 3, "{by_id:?}");
+    assert_eq!(by_id[marcus].meta.title.as_deref(), Some("Marcus"));
+    assert_eq!(by_id[minted].meta.title.as_deref(), Some("Relay bot"));
+    assert_eq!(by_id[sub].meta.title.as_deref(), Some("subtask work"));
+}
+
+#[test]
+fn ui_entries_to_common_maps_message_and_send_message() {
+    let entries = vec![
+        json!({
+            "kind":"send-message",
+            "id":"tbs0",
+            "message":{"type":"text","content":"Hello from bot"},
+            "timestampMs": 1_780_000_000_000i64
+        }),
+        json!({
+            "kind":"send-message",
+            "id":"tbs1",
+            "message":{"type":"widget","widget":{"prompt":"skip me"}},
+            "timestampMs": 1_780_000_000_100i64
+        }),
+        json!({
+            "kind":"message",
+            "id":"t0u",
+            "role":"user",
+            "content":"Hi Marcus",
+            "timestampMs": 1_780_000_001_000i64
+        }),
+        json!({
+            "kind":"message",
+            "id":"agent-out",
+            "role":"assistant",
+            "content":"Noted.",
+            "timestampMs": 1_780_000_002_000i64
+        }),
+        json!({
+            "kind":"user-attachment",
+            "id":"t0ua0",
+            "file_name":"x.json",
+            "timestampMs": 1_780_000_003_000i64
+        }),
+    ];
+    let common = grok_bot::ui_entries_to_common("agent-1", &entries, Some("Marcus".into()));
+    assert_eq!(common.meta.title.as_deref(), Some("Marcus"));
+    assert_eq!(common.body.len(), 3);
+    assert!(matches!(&common.body[0].content[0], Block::Text { text } if text == "Hello from bot"));
+    assert_eq!(common.body[0].role, Role::Assistant);
+    assert_eq!(common.body[1].role, Role::User);
+    assert!(matches!(&common.body[1].content[0], Block::Text { text } if text == "Hi Marcus"));
+    assert_eq!(common.body[2].role, Role::Assistant);
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+#[test]
+fn load_reconstructs_from_store_db_when_jsonl_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    let transcripts = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let agent_dir = agents.join(id);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("profile.json"),
+        r#"{"name":"Ledger Bot","description":""}"#,
+    )
+    .unwrap();
+
+    let db = agent_dir.join("store.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transcript_entries (
+                seq INTEGER PRIMARY KEY,
+                id TEXT NOT NULL,
+                entry TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let entries = [
+            json!({
+                "kind":"message","id":"t0u","role":"user","content":"ping",
+                "timestampMs": 1_780_000_100_000i64
+            }),
+            json!({
+                "kind":"send-message","id":"t0s0",
+                "message":{"type":"text","content":"pong"},
+                "timestampMs": 1_780_000_100_500i64
+            }),
+        ];
+        for (i, e) in entries.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO transcript_entries(seq, id, entry) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i64::try_from(i + 1).unwrap_or(i64::MAX),
+                    e.get("id").and_then(|v| v.as_str()).unwrap(),
+                    e.to_string()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    let store = grok_bot::GrokBotStore::new(&transcripts).with_agents(&agents);
+    let loaded = store.load(&agent_dir).unwrap();
+    assert_eq!(loaded.meta.id, id);
+    assert_eq!(loaded.meta.title.as_deref(), Some("Ledger Bot"));
+    let common = grok_bot::GrokBot::to_common(&loaded).unwrap();
+    assert_eq!(common.body.len(), 2);
+    assert!(matches!(&common.body[0].content[0], Block::Text { text } if text == "ping"));
+    assert!(matches!(&common.body[1].content[0], Block::Text { text } if text == "pong"));
+}
+
+#[cfg(any(feature = "opencode", feature = "hermes"))]
+#[test]
+fn load_prefers_jsonl_over_store_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    let transcripts = tmp.path().join("transcripts");
+    let id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    let agent_dir = agents.join(id);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("profile.json"),
+        r#"{"name":"Jsonl Wins","description":""}"#,
+    )
+    .unwrap();
+    let db = agent_dir.join("store.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transcript_entries (
+                seq INTEGER PRIMARY KEY,
+                id TEXT NOT NULL,
+                entry TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcript_entries(seq, id, entry) VALUES (1, 't0u', ?1)",
+            [
+                json!({"kind":"message","id":"t0u","role":"user","content":"from-store"})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+    }
+    write_session(
+        &transcripts,
+        id,
+        &format!(
+            "{}\n{}\n",
+            json!({"role":"user","message":{"content":[{"type":"text","text":"[t0u]\nfrom-jsonl"}]}}),
+            json!({"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}),
+        ),
+    );
+
+    let store = grok_bot::GrokBotStore::new(&transcripts).with_agents(&agents);
+    let loaded = store.load(&agent_dir).unwrap();
+    assert_eq!(loaded.meta.title.as_deref(), Some("Jsonl Wins"));
+    let common = grok_bot::GrokBot::to_common(&loaded).unwrap();
+    assert!(
+        matches!(&common.body[0].content[0], Block::Text { text } if text == "from-jsonl"),
+        "{:?}",
+        common.body
+    );
+}
+
+#[test]
+fn load_errors_clearly_when_no_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    let transcripts = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let id = "cccccccc-dddd-4eee-8fff-000000000000";
+    let agent_dir = agents.join(id);
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("profile.json"),
+        r#"{"name":"Empty Bot","description":""}"#,
+    )
+    .unwrap();
+
+    let err = grok_bot::GrokBotStore::new(&transcripts)
+        .with_agents(&agents)
+        .load(&agent_dir)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("no conversation"), "{msg}");
+    assert!(msg.contains(id), "{msg}");
+}

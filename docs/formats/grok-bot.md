@@ -20,19 +20,38 @@ agents/<agent-uuid>/
 
 ## On disk
 
-Session id = directory name = JSONL basename. The default root is
-`$TXCRIPT_GROK_BOT_ROOT` or `$GROK_BOT_TRANSCRIPTS`, falling back to
-`$HOME/agent-data/agent-transcripts`. Discovery lists immediate child
-directories that contain `<dirname>.jsonl` whose first record is a
-`role`/`message` envelope (`user` / `assistant` / `tool`); the journal-mode
-sidecar is ignored. Unreadable directories are skipped. `sand-subagent-*`
-directories use the same layout and are included.
+Session id = agent / directory uuid. Roots:
 
-txcript's harness loads and saves the **JSONL** under `agent-transcripts/`.
-Per-agent SQLite under `agents/<uuid>/` (`store.db` with
-`transcript_entries`, plus `conversation-blobs.db`) is what the product UI
-actually renders; those DBs are documented under Continue-into below and are
-not parsed by the current codec.
+| Path | Env override | Role |
+|---|---|---|
+| `$HOME/agent-data/agent-transcripts` | `TXCRIPT_GROK_BOT_ROOT` / `GROK_BOT_TRANSCRIPTS` | JSONL codec (preferred read/write) |
+| `$HOME/agent-data/agents` | `TXCRIPT_GROK_BOT_AGENTS` | `profile.json` + `store.db` UI ledger |
+
+**Discovery** unions:
+
+1. Every `agents/<uuid>/` that has `profile.json` (title = profile `name`).
+2. Every `agent-transcripts/<id>/` with `<id>.jsonl` whose first record is a
+   `role`/`message` envelope (`user` / `assistant` / `tool`) — including
+   `sand-subagent-*` dirs that have no profile. Journal-mode sidecars are
+   ignored. Unreadable dirs are skipped.
+
+When both sources exist for the same id, the profile `name` wins as the list
+title; the transcripts path is preferred as the locator (safe JSONL delete).
+
+**Load** cascade (first hit wins):
+
+1. `agent-transcripts/<id>/<id>.jsonl` — full codec fidelity.
+2. Non-empty `agents/<id>/store.db` `transcript_entries` — reconstructed into
+   Common via `ui_entries_to_common` (text turns only), then `from_common`.
+3. Local gateway `POST /api/openAgent` with `{id}` (Bearer from
+   `gateway.json` / `TXCRIPT_GROK_BOT_GATEWAY`+`TOKEN`) — same UI ledger shape
+   as `transcript_entries`. Used when the on-disk ledger is empty (common for
+   long-lived temporal bots).
+4. Otherwise a clear error.
+
+Minted bots usually have JSONL + seeded `transcript_entries`. Live bots such
+as Marcus may have profile + empty ledger + no JSONL; conversation content is
+only available through `openAgent`.
 
 ## Dissection of a transcript
 
@@ -104,6 +123,12 @@ txcript continue ./run.json --with grok_bot \
 
 ## Caveats
 
+- List titles come from `profile.json` `name` when the agent exists under
+  `agents/`; JSONL-only subagents still fall back to the first user text.
+- Store/gateway reconstruction keeps user/assistant text turns only (widgets,
+  attachments, spend events, and native tool JSONL detail are not recovered
+  from the UI ledger). Prefer JSONL when present.
+- Gateway `openAgent` is a read fallback and may focus that agent in the UI.
 - Continue-into needs a live local gateway and SQLite (`opencode`/`hermes`
   feature). Without them, `local::write` errors clearly.
 - No native per-record timestamps, model, usage, or stop reasons.
@@ -122,4 +147,4 @@ txcript continue ./run.json --with grok_bot \
   `127.0.0.1:1340`, 2026-09-11.
 - Parser: `src/harness/grok_bot.rs`.
 
-Last verified: 2026-09-11 (mint via createAgent+transcript_entries).
+Last verified: 2026-09-11 (discover all agents + JSONL/store/gateway load).

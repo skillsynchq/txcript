@@ -2,7 +2,11 @@
 //! `agent-transcripts/<agent-uuid>/<agent-uuid>.jsonl`.
 //!
 //! Distinct from the existing [`grok`](crate::harness::grok) harness (Grok
-//! CLI / Grok Build at `~/.grok/sessions`). Grok Bot writes one JSON object
+//! CLI / Grok Build at `~/.grok/sessions`). Discovery unions
+//! `agents/<uuid>/profile.json` (title = profile `name`) with
+//! `agent-transcripts` JSONL dirs (including `sand-subagent-*`). Load prefers
+//! JSONL, then non-empty `store.db` `transcript_entries`, then the local
+//! gateway `openAgent` when reachable. Grok Bot writes one JSON object
 //! per line with no session header:
 //!
 //! ```json
@@ -52,7 +56,7 @@ use std::io::{Read, Write};
 #[cfg(any(feature = "opencode", feature = "hermes"))]
 use std::net::TcpStream;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -565,19 +569,38 @@ fn meta_from_records(records: &[Value]) -> Meta {
 
 // ── Store ──────────────────────────────────────────────────────────────
 
-/// File-backed access to Grok Bot `agent-transcripts` directories.
+/// File-backed access to Grok Bot transcripts and agent profiles.
+///
+/// `root` is the `agent-transcripts` directory. Optional `agents` points at
+/// `agents/` (profile.json + store.db). Discovery unions both; load prefers
+/// JSONL, then `store.db` `transcript_entries`, then gateway `openAgent`.
 #[derive(Debug, Clone)]
 pub struct GrokBotStore {
     pub root: PathBuf,
+    /// Live agents directory (`TXCRIPT_GROK_BOT_AGENTS` / `~/agent-data/agents`).
+    pub agents: Option<PathBuf>,
 }
 
 impl GrokBotStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        // Transcripts-only; attach agents via [`Self::with_agents`] or
+        // [`Self::default_root`] so temp-dir tests do not scan the live box.
+        Self {
+            root: root.into(),
+            agents: None,
+        }
+    }
+
+    /// Override the agents directory (tests / fixtures).
+    #[must_use]
+    pub fn with_agents(mut self, agents: impl Into<PathBuf>) -> Self {
+        self.agents = Some(agents.into());
+        self
     }
 
     /// Resolve `TXCRIPT_GROK_BOT_ROOT` / `GROK_BOT_TRANSCRIPTS`, then
-    /// `$HOME/agent-data/agent-transcripts`.
+    /// `$HOME/agent-data/agent-transcripts`. Agents root is resolved from
+    /// `TXCRIPT_GROK_BOT_AGENTS` / `$HOME/agent-data/agents` when present.
     #[must_use]
     pub fn default_root() -> Option<Self> {
         std::env::var_os("TXCRIPT_GROK_BOT_ROOT")
@@ -587,13 +610,246 @@ impl GrokBotStore {
             .or_else(|| {
                 super::home_dir().map(|home| home.join("agent-data").join("agent-transcripts"))
             })
-            .map(Self::new)
+            .map(|root| Self {
+                root,
+                agents: agents_root(),
+            })
     }
 
     fn session_jsonl(dir: &Path) -> Option<PathBuf> {
         let name = dir.file_name()?.to_str()?;
         let path = dir.join(format!("{name}.jsonl"));
         path.is_file().then_some(path)
+    }
+
+    fn session_id(reference: &Path) -> Option<String> {
+        reference
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn jsonl_path_for(&self, id: &str) -> Option<PathBuf> {
+        let dir = self.root.join(id);
+        Self::session_jsonl(&dir)
+    }
+
+    fn agent_dir_for(&self, id: &str) -> Option<PathBuf> {
+        let agents = self.agents.as_ref()?;
+        let dir = agents.join(id);
+        dir.is_dir().then_some(dir)
+    }
+
+    fn profile_path(agent_dir: &Path) -> PathBuf {
+        agent_dir.join("profile.json")
+    }
+
+    fn store_db_path(agent_dir: &Path) -> PathBuf {
+        agent_dir.join("store.db")
+    }
+
+    /// Read display name from `agents/<id>/profile.json` when present.
+    fn profile_name(agent_dir: &Path) -> Option<String> {
+        let raw = fs::read_to_string(Self::profile_path(agent_dir)).ok()?;
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        v.get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    fn discover_from_agents(&self, out: &mut HashMap<String, Discovered<PathBuf>>) {
+        let Some(agents) = self.agents.as_ref() else {
+            return;
+        };
+        if !agents.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(agents) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(id) = dir.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if !Self::profile_path(&dir).is_file() {
+                continue;
+            }
+            let title = Self::profile_name(&dir);
+            let mut timestamp = Utc::now();
+            for candidate in [
+                Self::store_db_path(&dir),
+                Self::profile_path(&dir),
+                dir.clone(),
+            ] {
+                if let Ok(modified) = fs::metadata(&candidate).and_then(|s| s.modified()) {
+                    timestamp = DateTime::<Utc>::from(modified);
+                    break;
+                }
+            }
+            out.insert(
+                id.clone(),
+                Discovered {
+                    meta: Meta {
+                        id: id.clone(),
+                        timestamp,
+                        cwd: None,
+                        git_branch: None,
+                        title,
+                        cli_version: None,
+                        model: None,
+                    },
+                    // Prefer the agent directory as the list locator so mtime
+                    // reflects the live bot; load still resolves JSONL by id.
+                    reference: dir,
+                },
+            );
+        }
+    }
+
+    fn discover_from_transcripts(&self, out: &mut HashMap<String, Discovered<PathBuf>>) {
+        if !self.root.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(jsonl_path) = Self::session_jsonl(&dir) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(&jsonl_path) else {
+                continue;
+            };
+            if !sniff_grok_bot(&text) {
+                continue;
+            }
+            let Some(id) = dir.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let mut meta = meta_from_records(&jsonl::parse::<Value>(&text));
+            meta.id.clone_from(&id);
+            if let Ok(modified) = fs::metadata(&jsonl_path).and_then(|s| s.modified()) {
+                meta.timestamp = DateTime::<Utc>::from(modified);
+            }
+            match out.get_mut(&id) {
+                Some(existing) => {
+                    // Keep profile title when present; refresh mtime from JSONL.
+                    if existing.meta.title.is_none() {
+                        existing.meta.title = meta.title.take();
+                    }
+                    existing.meta.timestamp = meta.timestamp;
+                    // Prefer transcripts path when JSONL exists (safe delete).
+                    existing.reference = dir;
+                }
+                None => {
+                    out.insert(
+                        id,
+                        Discovered {
+                            meta,
+                            reference: dir,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn load_from_jsonl(&self, id: &str) -> Result<Option<Transcript<GrokBot>>> {
+        let Some(jsonl_path) = self.jsonl_path_for(id) else {
+            return Ok(None);
+        };
+        let mut transcript = GrokBot::from_text(&fs::read_to_string(&jsonl_path)?)?;
+        if transcript.meta.id.is_empty() {
+            transcript.meta.id = id.to_string();
+        }
+        if let Some(agent_dir) = self.agent_dir_for(id)
+            && let Some(name) = Self::profile_name(&agent_dir)
+        {
+            transcript.meta.title = Some(name);
+        }
+        if let Ok(modified) = fs::metadata(&jsonl_path).and_then(|s| s.modified()) {
+            transcript.meta.timestamp = DateTime::<Utc>::from(modified);
+        }
+        Ok(Some(transcript))
+    }
+
+    fn load_from_store_db(&self, id: &str) -> Result<Option<Transcript<GrokBot>>> {
+        #[cfg(any(feature = "opencode", feature = "hermes"))]
+        {
+            let Some(agent_dir) = self.agent_dir_for(id) else {
+                return Ok(None);
+            };
+            let store_db = Self::store_db_path(&agent_dir);
+            if !store_db.is_file() {
+                return Ok(None);
+            }
+            let entries = read_transcript_entries(&store_db)?;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            let title = Self::profile_name(&agent_dir);
+            let common = ui_entries_to_common(id, &entries, title);
+            let mut native = GrokBot::from_common(&common)?;
+            native.meta.title = common.meta.title;
+            native.meta.timestamp = common.meta.timestamp;
+            Ok(Some(native))
+        }
+        #[cfg(not(any(feature = "opencode", feature = "hermes")))]
+        {
+            let _ = id;
+            Ok(None)
+        }
+    }
+
+    fn load_from_gateway(&self, id: &str) -> Result<Option<Transcript<GrokBot>>> {
+        #[cfg(any(feature = "opencode", feature = "hermes"))]
+        {
+            let Some(gateway) = Gateway::discover() else {
+                return Ok(None);
+            };
+            let resp = match gateway.open_agent(id) {
+                Ok(v) => v,
+                Err(Error::Unconvertible { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let entries = match resp {
+                Value::Array(items) => items,
+                other => other
+                    .get("entries")
+                    .or_else(|| other.get("messages"))
+                    .or_else(|| other.get("transcript"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            let title = self
+                .agent_dir_for(id)
+                .as_ref()
+                .and_then(|d| Self::profile_name(d));
+            let common = ui_entries_to_common(id, &entries, title);
+            let mut native = GrokBot::from_common(&common)?;
+            native.meta.title = common.meta.title;
+            native.meta.timestamp = common.meta.timestamp;
+            Ok(Some(native))
+        }
+        #[cfg(not(any(feature = "opencode", feature = "hermes")))]
+        {
+            let _ = id;
+            Ok(None)
+        }
     }
 }
 
@@ -602,54 +858,38 @@ impl Store for GrokBotStore {
     type Ref = PathBuf;
 
     fn discover(&self) -> Result<Vec<Discovered<PathBuf>>> {
-        if !self.root.is_dir() {
-            return Ok(Vec::new());
-        }
-        let entries = fs::read_dir(&self.root).into_iter().flatten();
-        Ok(entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .filter_map(|dir| {
-                let jsonl_path = Self::session_jsonl(&dir)?;
-                let text = fs::read_to_string(&jsonl_path).ok()?;
-                if !sniff_grok_bot(&text) {
-                    return None;
-                }
-                let mut meta = meta_from_records(&jsonl::parse::<Value>(&text));
-                if meta.id.is_empty() {
-                    meta.id = dir
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                }
-                if let Ok(modified) = fs::metadata(&jsonl_path).and_then(|s| s.modified()) {
-                    meta.timestamp = DateTime::<Utc>::from(modified);
-                }
-                Some(Discovered {
-                    meta,
-                    reference: dir,
-                })
-            })
-            .collect())
+        let mut by_id: HashMap<String, Discovered<PathBuf>> = HashMap::new();
+        self.discover_from_agents(&mut by_id);
+        self.discover_from_transcripts(&mut by_id);
+        let mut out: Vec<_> = by_id.into_values().collect();
+        out.sort_by(|a, b| a.meta.id.cmp(&b.meta.id));
+        Ok(out)
     }
 
     fn load(&self, reference: &PathBuf) -> Result<Transcript<GrokBot>> {
-        let jsonl_path = Self::session_jsonl(reference).ok_or_else(|| Error::Malformed {
+        let id = Self::session_id(reference).ok_or_else(|| Error::Malformed {
             harness: GrokBot::NAME,
-            detail: format!("no `<id>/<id>.jsonl` under {}", reference.display()),
+            detail: format!("cannot derive agent id from {}", reference.display()),
         })?;
-        let mut transcript = GrokBot::from_text(&fs::read_to_string(&jsonl_path)?)?;
-        if transcript.meta.id.is_empty() {
-            transcript.meta.id = reference.file_name().map_or_else(
-                || jsonl::file_id(&jsonl_path),
-                |s| s.to_string_lossy().into_owned(),
-            );
+
+        if let Some(transcript) = self.load_from_jsonl(&id)? {
+            return Ok(transcript);
         }
-        if let Ok(modified) = fs::metadata(&jsonl_path).and_then(|s| s.modified()) {
-            transcript.meta.timestamp = DateTime::<Utc>::from(modified);
+        if let Some(transcript) = self.load_from_store_db(&id)? {
+            return Ok(transcript);
         }
-        Ok(transcript)
+        if let Some(transcript) = self.load_from_gateway(&id)? {
+            return Ok(transcript);
+        }
+
+        Err(Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!(
+                "no conversation for agent `{id}`: missing \
+                 agent-transcripts/{id}/{id}.jsonl, empty store.db \
+                 transcript_entries, and gateway openAgent unavailable or empty"
+            ),
+        })
     }
 
     fn save(&self, transcript: &Transcript<GrokBot>) -> Result<Saved<PathBuf>> {
@@ -667,6 +907,23 @@ impl Store for GrokBotStore {
     }
 
     fn delete(&self, reference: &PathBuf) -> Result<()> {
+        // Never wipe live `agents/<id>` trees — only remove JSONL transcripts.
+        if let Some(id) = Self::session_id(reference) {
+            let transcript_dir = self.root.join(&id);
+            if transcript_dir.is_dir() {
+                return Ok(fs::remove_dir_all(transcript_dir)?);
+            }
+            if let Some(agents) = &self.agents
+                && reference.starts_with(agents)
+            {
+                // Profile-only agent with no JSONL: nothing safe to delete.
+                return Ok(());
+            }
+            // Fall through so a missing transcript dir errors like before.
+            if reference == &transcript_dir || reference.starts_with(&self.root) {
+                return Ok(fs::remove_dir_all(transcript_dir)?);
+            }
+        }
         if reference.is_dir() {
             Ok(fs::remove_dir_all(reference)?)
         } else {
@@ -678,10 +935,20 @@ impl Store for GrokBotStore {
         Ok(refs
             .iter()
             .map(|dir| {
-                let fp = Self::session_jsonl(dir)
-                    .map(|p| file_fingerprint(&p))
-                    .unwrap_or_default();
-                (dir.to_string_lossy().into_owned(), fp)
+                let key = dir.to_string_lossy().into_owned();
+                let id = Self::session_id(dir).unwrap_or_default();
+                let mut parts = Vec::new();
+                if let Some(jsonl) = self.jsonl_path_for(&id) {
+                    parts.push(file_fingerprint(&jsonl));
+                }
+                if let Some(agent_dir) = self.agent_dir_for(&id) {
+                    parts.push(file_fingerprint(&Self::store_db_path(&agent_dir)));
+                    parts.push(file_fingerprint(&Self::profile_path(&agent_dir)));
+                }
+                if parts.is_empty() {
+                    parts.push(file_fingerprint(dir));
+                }
+                (key, parts.join("|"))
             })
             .collect())
     }
@@ -711,6 +978,113 @@ fn file_fingerprint(path: &Path) -> String {
             format!("{mtime}:{}", meta.len())
         }
         Err(_) => String::new(),
+    }
+}
+
+/// Project UI ledger entries (`store.db` / gateway `openAgent`) into Common.
+///
+/// Recognizes `kind: "message"` (user/assistant text) and
+/// `kind: "send-message"` with `message.type == "text"`. Widgets, attachments,
+/// spend events, and other kinds are skipped.
+#[must_use]
+pub fn ui_entries_to_common(
+    id: &str,
+    entries: &[Value],
+    title: Option<String>,
+) -> Transcript<Common> {
+    let mut messages = Vec::new();
+    let mut last_ts = Utc::now();
+    for entry in entries {
+        let ts = entry
+            .get("timestampMs")
+            .and_then(Value::as_i64)
+            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+            .unwrap_or(last_ts);
+        last_ts = ts;
+        match entry.get("kind").and_then(Value::as_str) {
+            Some("message") => {
+                let role = match entry.get("role").and_then(Value::as_str) {
+                    Some("assistant") => Role::Assistant,
+                    _ => Role::User,
+                };
+                let Some(text) = ui_entry_text(entry.get("content")) else {
+                    continue;
+                };
+                messages.push(Message {
+                    role,
+                    content: vec![Block::Text { text }],
+                    timestamp: ts,
+                    model: None,
+                    stop_reason: None,
+                    usage: None,
+                });
+            }
+            Some("send-message") => {
+                let Some(message) = entry.get("message") else {
+                    continue;
+                };
+                if message.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                let Some(text) = ui_entry_text(message.get("content")) else {
+                    continue;
+                };
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: vec![Block::Text { text }],
+                    timestamp: ts,
+                    model: None,
+                    stop_reason: None,
+                    usage: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    Transcript::new(
+        Meta {
+            id: id.to_string(),
+            timestamp: last_ts,
+            cwd: None,
+            git_branch: None,
+            title,
+            cli_version: None,
+            model: None,
+        },
+        messages,
+    )
+}
+
+fn ui_entry_text(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+    match content {
+        Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| s.clone())
+        }
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(t);
+                    }
+                } else if let Some(t) = block.get("content").and_then(Value::as_str) {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(t);
+                    }
+                }
+            }
+            let joined = parts.join("\n");
+            (!joined.trim().is_empty()).then_some(joined)
+        }
+        other => {
+            let s = other.to_string();
+            let t = s.trim();
+            (!t.is_empty() && t != "null").then_some(s)
+        }
     }
 }
 
@@ -1023,7 +1397,51 @@ fn write_transcript_entries(store_db: &Path, entries: &[Value]) -> Result<()> {
 }
 
 #[cfg(any(feature = "opencode", feature = "hermes"))]
-fn agents_root() -> Option<PathBuf> {
+fn read_transcript_entries(store_db: &Path) -> Result<Vec<Value>> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn =
+        Connection::open_with_flags(store_db, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+            Error::Malformed {
+                harness: GrokBot::NAME,
+                detail: format!("open store.db: {e}"),
+            }
+        })?;
+    let mut stmt = match conn.prepare("SELECT entry FROM transcript_entries ORDER BY seq ASC") {
+        Ok(s) => s,
+        Err(e) => {
+            // Missing table => treat as empty ledger.
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                return Ok(Vec::new());
+            }
+            return Err(Error::Malformed {
+                harness: GrokBot::NAME,
+                detail: format!("query transcript_entries: {e}"),
+            });
+        }
+    };
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!("read transcript_entries: {e}"),
+        })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let raw = row.map_err(|e| Error::Malformed {
+            harness: GrokBot::NAME,
+            detail: format!("transcript_entries row: {e}"),
+        })?;
+        if let Ok(v) = serde_json::from_str(&raw) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve `TXCRIPT_GROK_BOT_AGENTS`, then `$HOME/agent-data/agents`.
+#[must_use]
+pub fn agents_root() -> Option<PathBuf> {
     std::env::var_os("TXCRIPT_GROK_BOT_AGENTS")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
