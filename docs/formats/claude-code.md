@@ -105,6 +105,12 @@ A synthetic assistant line (real files add more envelope keys — `isSidechain`,
   types are gone after a cross-model trip (same-harness native trips keep everything).
   Rewritten `tool_result.content` must be a string or block array — anything else
   fails a `claude --resume` load — so bare JSON is flattened to its compact text.
+- **Tool inputs.** The Messages API requires `tool_use.input` to be an object,
+  including calls already in the conversation history. Common → Claude Code
+  wraps non-object inputs, such as Codex freeform tool text, as
+  `{"input": <original value>}`. Existing objects keep their shape. Reading that
+  export into Common retains the wrapper; native load/save keeps the original
+  records untouched.
 - **Resume anchoring.** A leading `summary` line's `leafUuid` must name a real
   user/assistant line in the file, or Claude Code reports the whole session missing;
   txcript anchors generated summaries to the last real turn.

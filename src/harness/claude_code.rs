@@ -1013,6 +1013,15 @@ fn serialize_block(block: &Block) -> Value {
         }
         Block::ToolUse { id, tool } => {
             let (name, input) = tool.to_canonical();
+            // Codex freeform calls and other Raw tools can carry any JSON
+            // value; Anthropic requires an object even for historical calls.
+            // Keep the payload inside an object instead of losing it or
+            // emitting a session that fails with "Input should be an object".
+            let input = if input.is_object() {
+                input
+            } else {
+                serde_json::json!({"input": input})
+            };
             serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
         }
         Block::ToolResult {

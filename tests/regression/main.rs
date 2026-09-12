@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
-use txcript::harness::{claude_code, grok};
+use txcript::harness::{claude_code, codex, grok};
 use txcript::{Codec, HarnessId, Store, TextCodec, Transcript};
 
 #[cfg(feature = "search")]
@@ -136,6 +136,106 @@ fn claude_summary_leaf_uuid_names_the_last_written_turn() {
         .find(|line| line["type"] == "user" || line["type"] == "assistant")
         .unwrap();
     assert_eq!(last_turn["uuid"].as_str().unwrap(), leaf);
+}
+
+/// Codex freeform tools such as `exec` reached Claude Code as a string in
+/// `tool_use.input`. Resuming then failed with HTTP 400, "Input should be
+/// an object". Wrap non-object inputs at the Claude export boundary while
+/// keeping the payload, tool name, and call/result pairing.
+#[test]
+fn codex_freeform_tool_inputs_export_as_claude_objects() {
+    use serde_json::{Value, json};
+
+    let cases = [
+        ("custom_tool_call", "exec", json!("const n = 1;\ntext(n);")),
+        (
+            "custom_tool_call",
+            "functions.apply_patch",
+            json!("*** Begin Patch\n*** Delete File: old.txt\n*** End Patch"),
+        ),
+        ("custom_tool_call", "custom_tool", json!("")),
+        ("function_call", "custom_tool", json!("{incomplete")),
+        ("function_call", "custom_tool", json!(["a", {"b": 1}])),
+        ("function_call", "custom_tool", Value::Null),
+        ("function_call", "custom_tool", json!(42)),
+        ("function_call", "custom_tool", json!(false)),
+        ("function_call", "Read", json!({"file_path": "/work/a.rs"})),
+        // An existing input key must not get another wrapper.
+        ("function_call", "custom_tool", json!({"input": "original"})),
+        ("function_call", "custom_tool", json!({})),
+    ];
+
+    for (kind, name, input) in cases {
+        let mut call = json!({"type": kind, "name": name, "call_id": "call-1"});
+        let result_kind = if kind == "function_call" {
+            call["arguments"] = json!(
+                input
+                    .as_str()
+                    .map_or_else(|| input.to_string(), str::to_owned)
+            );
+            "function_call_output"
+        } else {
+            call["input"] = input.clone();
+            "custom_tool_call_output"
+        };
+        let source = [
+            json!({"type": "session_meta", "payload": {"id": "raw-input", "cwd": "/work/repo"}}),
+            json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "inspect this"}]}}),
+            json!({"type": "response_item", "payload": call}),
+            json!({"type": "response_item", "payload": {"type": result_kind, "call_id": "call-1", "output": "done"}}),
+        ]
+        .map(|mut line| {
+            line["timestamp"] = json!("2026-01-02T03:04:05.000Z");
+            line.to_string()
+        })
+        .join("\n");
+        let codex = codex::Codex::from_text(&source).unwrap();
+        let common = codex::Codex::to_common(&codex).unwrap();
+        assert_eq!(common.body.len(), 3);
+        assert_eq!(
+            common.body[1].content,
+            vec![Block::ToolUse {
+                id: "call-1".into(),
+                tool: Tool::from_canonical(name, input.clone()),
+            }]
+        );
+
+        let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+        let encoded = claude_code::ClaudeCode::to_text(&native).unwrap();
+        let lines: Vec<Value> = encoded
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let call = &lines
+            .iter()
+            .find(|line| line["type"] == "assistant")
+            .unwrap()["message"]["content"][0];
+        assert!(call["input"].is_object(), "{name}: {call}");
+        let expected_input = if input.is_object() {
+            input
+        } else {
+            json!({"input": input})
+        };
+        assert_eq!(call["input"], expected_input);
+        assert_eq!(call["name"], name);
+        assert_eq!(call["id"], "call-1");
+
+        let mut expected = common.clone();
+        expected.body[1].content = vec![Block::ToolUse {
+            id: "call-1".into(),
+            tool: Tool::from_canonical(name, expected_input),
+        }];
+        let reloaded = claude_code::ClaudeCode::from_text(&encoded).unwrap();
+        let back = claude_code::ClaudeCode::to_common(&reloaded).unwrap();
+        // This also checks the tool result and its pairing survive.
+        assert_eq!(back.body, expected.body);
+        assert_eq!(
+            claude_code::ClaudeCode::to_text(&claude_code::ClaudeCode::from_common(&back).unwrap())
+                .unwrap(),
+            encoded,
+        );
+        assert_eq!(codex::Codex::to_common(&codex).unwrap(), common);
+    }
 }
 
 /// Fixed in 9c64b83 ("Harden stores and CLI against hostile session files").
