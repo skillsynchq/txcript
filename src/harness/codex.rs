@@ -1154,14 +1154,23 @@ fn parse_content_blocks(content: &Value) -> Vec<Block> {
 
 fn parse_data_url_image(image_url: &str) -> Option<ImageSource> {
     let (header, data) = image_url.split_once(',')?;
-    let media_type = header
-        .strip_prefix("data:")?
-        .strip_suffix(";base64")?
-        .to_string();
+    let header = header.trim();
+    if !header.to_ascii_lowercase().starts_with("data:") {
+        return None;
+    }
+    let rest = &header[5..];
+    let (mime_part, encoding) = rest.rsplit_once(';')?;
+    if !encoding.trim().eq_ignore_ascii_case("base64") {
+        return None;
+    }
+    let media_type = mime_part.split(';').next()?.trim().to_ascii_lowercase();
+    if media_type.is_empty() {
+        return None;
+    }
     Some(ImageSource {
         source_type: "base64".to_string(),
         media_type,
-        data: data.to_string(),
+        data: data.trim().to_string(),
     })
 }
 

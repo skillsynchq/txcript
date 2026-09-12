@@ -326,3 +326,148 @@ fn custom_tool_casing_survives_every_hop() {
         assert_cycle(&sample_with_raw_tool(tool_name), tool_name);
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn multimodal_artifacts_and_images_survive_conversions() {
+    let t0 = ts("2026-08-18T10:00:00Z");
+    let artifact = common::Artifact {
+        id: "art-1".into(),
+        name: "plan.md".into(),
+        source: common::ArtifactSource::Text {
+            text: "# My Plan\nDo stuff.".into(),
+            media_type: Some("text/markdown".into()),
+        },
+    };
+    let image = common::ImageSource {
+        source_type: "base64".into(),
+        media_type: "image/png".into(),
+        data: "iVBORw0KGgo=".into(),
+    };
+    let common = Transcript::new(
+        common::Meta {
+            id: "multi-hop-1".into(),
+            timestamp: t0,
+            cwd: Some("/work".into()),
+            git_branch: None,
+            title: Some("multimodal".into()),
+            cli_version: None,
+            model: None,
+        },
+        vec![
+            common::Message {
+                role: common::Role::User,
+                content: vec![
+                    common::Block::Text {
+                        text: "hello".into(),
+                    },
+                    common::Block::Artifact {
+                        artifact: artifact.clone(),
+                    },
+                    common::Block::Image {
+                        source: image.clone(),
+                    },
+                ],
+                timestamp: t0,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+            common::Message {
+                role: common::Role::Assistant,
+                content: vec![
+                    common::Block::Text {
+                        text: "output".into(),
+                    },
+                    common::Block::Artifact { artifact },
+                    common::Block::Image { source: image },
+                ],
+                timestamp: t0,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+        ],
+    );
+
+    // Verify Cursor Desktop from_common preserves both user and assistant artifact and image text
+    let cd = cursor_desktop::CursorDesktop::from_common(&common).unwrap();
+    let cd_common = cursor_desktop::CursorDesktop::to_common(&cd).unwrap();
+    assert!(cd_common.body.iter().any(|m| m.content.iter().any(|b| {
+        match b {
+            common::Block::Text { text } => {
+                text.contains("[artifact: plan.md]") || text.contains("My Plan")
+            }
+            _ => false,
+        }
+    })));
+    assert!(cd_common.body.iter().any(|m| m.content.iter().any(|b| {
+        match b {
+            common::Block::Text { text } => text.contains("[image: image/png]"),
+            _ => false,
+        }
+    })));
+
+    // Verify GrokBot from_common preserves artifact and image content
+    let gb = grok_bot::GrokBot::from_common(&common).unwrap();
+    let gb_common = grok_bot::GrokBot::to_common(&gb).unwrap();
+    assert!(gb_common.body.iter().any(|m| m.content.iter().any(|b| {
+        match b {
+            common::Block::Text { text } => {
+                text.contains("[artifact: plan.md]") || text.contains("My Plan")
+            }
+            _ => false,
+        }
+    })));
+
+    // Verify Hermes from_common preserves artifact
+    let h = hermes::Hermes::from_common(&common).unwrap();
+    let h_common = hermes::Hermes::to_common(&h).unwrap();
+    assert!(h_common.body.iter().any(|m| m.content.iter().any(|b| {
+        match b {
+            common::Block::Text { text } => {
+                text.contains("[artifact: plan.md]") || text.contains("My Plan")
+            }
+            _ => false,
+        }
+    })));
+
+    // Verify Pi from_common preserves assistant image
+    let p = pi::Pi::from_common(&common).unwrap();
+    let p_common = pi::Pi::to_common(&p).unwrap();
+    assert!(p_common.body.iter().any(|m| m.content.iter().any(|b| {
+        match b {
+            common::Block::Text { text } => text.contains("[image: image/png]"),
+            _ => false,
+        }
+    })));
+
+    // Verify Grok from_common preserves assistant image
+    let g = grok::Grok::from_common(&common).unwrap();
+    let g_common = grok::Grok::to_common(&g).unwrap();
+    assert!(g_common.body.iter().any(|m| m.content.iter().any(|b| {
+        match b {
+            common::Block::Text { text } => text.contains("[image: image/png]"),
+            _ => false,
+        }
+    })));
+}
+
+#[test]
+fn codex_data_url_parsing_robustness() {
+    use txcript::TextCodec;
+    let jsonl = concat!(
+        "{\"timestamp\":\"2026-08-18T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-1\",\"cwd\":\"/work\"}}\n",
+        "{\"timestamp\":\"2026-08-18T10:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:IMAGE/PNG;name=photo.png;base64, iVBORw0KGgo= \\n\"}]}}\n"
+    );
+    let loaded = codex::Codex::from_text(jsonl).unwrap();
+    let common = codex::Codex::to_common(&loaded).unwrap();
+    let img = common.body[0].content.iter().find_map(|b| match b {
+        common::Block::Image { source } => Some(source),
+        _ => None,
+    });
+    assert!(img.is_some());
+    let source = img.unwrap();
+    assert_eq!(source.media_type, "image/png");
+    assert_eq!(source.data, "iVBORw0KGgo=");
+}

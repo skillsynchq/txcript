@@ -713,6 +713,7 @@ fn session_from_messages(meta: &Meta, messages: &[Message]) -> DesktopSession {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn bubbles_from_messages(cid: &str, messages: &[Message]) -> Vec<Map<String, Value>> {
     let mut bubbles: Vec<Map<String, Value>> = Vec::new();
     // tool_use_id -> bubble index, for pairing results back onto the call.
@@ -724,7 +725,11 @@ fn bubbles_from_messages(cid: &str, messages: &[Message]) -> Vec<Map<String, Val
                 let mut texts = Vec::new();
                 for block in &msg.content {
                     match block {
-                        Block::Text { text } => texts.push(text.as_str()),
+                        Block::Text { text } => texts.push(text.clone()),
+                        Block::Artifact { artifact } => texts.push(artifact.display_text()),
+                        Block::Image { source } => {
+                            texts.push(format!("[image: {}]", source.media_type));
+                        }
                         Block::ToolResult {
                             tool_use_id,
                             content,
@@ -791,8 +796,16 @@ fn bubbles_from_messages(cid: &str, messages: &[Message]) -> Vec<Map<String, Val
                             b.insert("toolFormerData".into(), Value::Object(call));
                             pending.insert(id.clone(), bubbles.len());
                         }
-                        // No native slot: images and unknown blocks drop.
-                        _ => continue,
+                        Block::Artifact { artifact } => {
+                            b.insert("text".into(), Value::from(artifact.display_text()));
+                        }
+                        Block::Image { source } => {
+                            b.insert(
+                                "text".into(),
+                                Value::from(format!("[image: {}]", source.media_type)),
+                            );
+                        }
+                        Block::ToolResult { .. } => continue,
                     }
                     if let Some(usage) = msg.usage {
                         b.insert(
