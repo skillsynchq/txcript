@@ -319,3 +319,34 @@ fn custom_and_mcp_tool_names_preserve_exact_casing() {
         }
     }
 }
+
+#[test]
+fn opencode_preserves_stop_reasons_and_abort() {
+    for (stop_reason, expected_finish) in [
+        (common::StopReason::EndTurn, "stop"),
+        (common::StopReason::ToolUse, "tool_use"),
+        (common::StopReason::MaxTokens, "length"),
+        (common::StopReason::Aborted, "abort"),
+        (common::StopReason::Error, "error"),
+    ] {
+        let mut common = sample_common();
+        let last_idx = common.body.len() - 1;
+        common.body[last_idx].stop_reason = Some(stop_reason.clone());
+        let native = opencode::OpenCode::from_common(&common).unwrap();
+        let last_msg = native.body.messages.last().unwrap();
+        assert_eq!(
+            last_msg
+                .info
+                .get("finish")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_finish),
+            "OpenCode finish should match expected_finish for {stop_reason:?}"
+        );
+        let back = opencode::OpenCode::to_common(&native).unwrap();
+        assert_eq!(
+            back.body[last_idx].stop_reason,
+            Some(stop_reason),
+            "OpenCode roundtrip should preserve stop_reason"
+        );
+    }
+}

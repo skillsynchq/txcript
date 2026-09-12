@@ -591,15 +591,7 @@ fn value_text(value: &Value) -> String {
 }
 
 fn parse_finish_reason(reason: &str) -> StopReason {
-    match reason {
-        "stop" | "end_turn" => StopReason::EndTurn,
-        "tool_calls" | "tool_use" => StopReason::ToolUse,
-        "length" | "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "aborted" | "cancelled" => StopReason::Aborted,
-        "error" => StopReason::Error,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(reason)
 }
 
 fn finish_reason(reason: Option<&StopReason>, has_tools: bool) -> &'static str {

@@ -326,3 +326,76 @@ fn custom_tool_casing_survives_every_hop() {
         assert_cycle(&sample_with_raw_tool(tool_name), tool_name);
     }
 }
+
+#[test]
+fn stop_reasons_survive_conversions() {
+    for expected_reason in [
+        common::StopReason::EndTurn,
+        common::StopReason::ToolUse,
+        common::StopReason::MaxTokens,
+        common::StopReason::Aborted,
+        common::StopReason::Error,
+    ] {
+        let mut t = sample();
+        let last_idx = t.body.len() - 1;
+        t.body[last_idx].stop_reason = Some(expected_reason.clone());
+
+        // Roundtrip through Claude Code
+        let claude = claude_code::ClaudeCode::from_common(&t).unwrap();
+        let back_claude = claude_code::ClaudeCode::to_common(&claude).unwrap();
+        assert_eq!(
+            back_claude.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "ClaudeCode failed for {expected_reason:?}"
+        );
+
+        // Convert Claude Code -> Hermes -> Amp -> Grok -> OpenCode -> Pi -> Antigravity
+        let hermes = convert::<claude_code::ClaudeCode, hermes::Hermes>(&claude).unwrap();
+        let back_hermes = hermes::Hermes::to_common(&hermes).unwrap();
+        assert_eq!(
+            back_hermes.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "Hermes failed for {expected_reason:?}"
+        );
+
+        let amp = convert::<hermes::Hermes, amp::Amp>(&hermes).unwrap();
+        let back_amp = amp::Amp::to_common(&amp).unwrap();
+        assert_eq!(
+            back_amp.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "Amp failed for {expected_reason:?}"
+        );
+
+        let grok = convert::<amp::Amp, grok::Grok>(&amp).unwrap();
+        let back_grok = grok::Grok::to_common(&grok).unwrap();
+        assert_eq!(
+            back_grok.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "Grok failed for {expected_reason:?}"
+        );
+
+        let opencode = convert::<grok::Grok, opencode::OpenCode>(&grok).unwrap();
+        let back_opencode = opencode::OpenCode::to_common(&opencode).unwrap();
+        assert_eq!(
+            back_opencode.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "OpenCode failed for {expected_reason:?}"
+        );
+
+        let pi = convert::<opencode::OpenCode, pi::Pi>(&opencode).unwrap();
+        let back_pi = pi::Pi::to_common(&pi).unwrap();
+        assert_eq!(
+            back_pi.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "Pi failed for {expected_reason:?}"
+        );
+
+        let antigravity = convert::<pi::Pi, antigravity::Antigravity>(&pi).unwrap();
+        let back_antigravity = antigravity::Antigravity::to_common(&antigravity).unwrap();
+        assert_eq!(
+            back_antigravity.body[last_idx].stop_reason,
+            Some(expected_reason.clone()),
+            "Antigravity failed for {expected_reason:?}"
+        );
+    }
+}

@@ -699,29 +699,17 @@ fn tokens_value(usage: Option<&Usage>) -> Value {
 }
 
 fn parse_finish(s: &str) -> StopReason {
-    match s {
-        "stop" => StopReason::EndTurn,
-        "length" => StopReason::MaxTokens,
-        "tool_use" | "tool-calls" | "tool_calls" => StopReason::ToolUse,
-        "error" => StopReason::Error,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(s)
 }
 
-fn finish_str(r: Option<&StopReason>) -> &'static str {
+fn finish_str(r: Option<&StopReason>) -> &str {
     match r {
         Some(StopReason::MaxTokens) => "length",
         Some(StopReason::ToolUse) => "tool_use",
         Some(StopReason::Error) => "error",
-        // OpenCode requires a finish and has no spelling for these; they all
-        // collapse to "stop".
-        Some(
-            StopReason::EndTurn
-            | StopReason::StopSequence
-            | StopReason::Aborted
-            | StopReason::Other(_),
-        )
-        | None => "stop",
+        Some(StopReason::Aborted) => "abort",
+        Some(StopReason::EndTurn | StopReason::StopSequence) | None => "stop",
+        Some(StopReason::Other(s)) => s.as_str(),
     }
 }
 

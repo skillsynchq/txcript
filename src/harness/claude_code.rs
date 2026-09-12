@@ -1146,25 +1146,11 @@ fn serialize_usage(u: &Usage) -> Value {
 
 // Claude's stop_reason strings are the canonical Anthropic set.
 fn parse_stop_reason(s: &str) -> StopReason {
-    match s {
-        "end_turn" => StopReason::EndTurn,
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(s)
 }
 
 fn stop_reason_str(r: &StopReason) -> String {
-    match r {
-        StopReason::EndTurn => "end_turn".into(),
-        StopReason::ToolUse => "tool_use".into(),
-        StopReason::MaxTokens => "max_tokens".into(),
-        StopReason::StopSequence => "stop_sequence".into(),
-        StopReason::Aborted => "aborted".into(),
-        StopReason::Error => "error".into(),
-        StopReason::Other(s) => s.clone(),
-    }
+    r.as_str().to_string()
 }
 
 // ── helpers ────────────────────────────────────────────────────────────

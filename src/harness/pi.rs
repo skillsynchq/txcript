@@ -986,14 +986,7 @@ fn denormalize_tool(tool: &Tool) -> (String, Value) {
 // ── small helpers ──────────────────────────────────────────────────────
 
 fn parse_stop_reason(s: &str) -> StopReason {
-    match s {
-        "stop" => StopReason::EndTurn,
-        "length" => StopReason::MaxTokens,
-        "toolUse" => StopReason::ToolUse,
-        "error" => StopReason::Error,
-        "aborted" => StopReason::Aborted,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(s)
 }
 
 fn stop_reason_str(r: Option<&StopReason>) -> &'static str {

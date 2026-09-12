@@ -653,15 +653,7 @@ fn parse_arguments(arguments: Option<&Value>) -> Value {
 }
 
 fn parse_stop_reason(s: &str) -> StopReason {
-    match s {
-        "end_turn" => StopReason::EndTurn,
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "cancelled" => StopReason::Aborted,
-        "error" => StopReason::Error,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(s)
 }
 
 fn stop_reason_str(r: &StopReason) -> String {
