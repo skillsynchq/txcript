@@ -659,11 +659,12 @@ fn user_state_text(blocks: &[Block]) -> String {
             Block::Text { text } => Some(text.trim().to_string()),
             Block::Image { source } => Some(format!("[image: {}]", source.media_type)),
             Block::Artifact { artifact } => Some(artifact.display_text()),
+            Block::ToolUse { tool, .. } => tool.command_display(),
             Block::Thinking { text, .. } if !text.trim().is_empty() => {
                 Some(text.trim().to_string())
             }
-            // Empty thinking, tool uses, and results have no user-side text.
-            Block::Thinking { .. } | Block::ToolUse { .. } | Block::ToolResult { .. } => None,
+            // Empty thinking and results have no user-side text.
+            Block::Thinking { .. } | Block::ToolResult { .. } => None,
         })
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -1354,13 +1355,19 @@ fn serialize_user_block(block: &Block) -> Value {
     match block {
         Block::Text { text } => json!({"type": "text", "text": wrap_user_query(text)}),
         Block::Image { source } => serialize_image(source),
+        Block::ToolUse { tool, .. } => {
+            if let Some(cmd) = tool.command_display() {
+                json!({"type": "text", "text": wrap_user_query(&cmd)})
+            } else {
+                json!({"type": "text", "text": format!("{tool:?}")})
+            }
+        }
         other => {
             let text = match other {
                 Block::Thinking { text, .. } => text.clone(),
-                Block::ToolUse { tool, .. } => format!("{tool:?}"),
                 Block::ToolResult { content, .. } => tool_output_text(content),
                 Block::Artifact { artifact } => artifact.display_text(),
-                Block::Text { .. } | Block::Image { .. } => String::new(),
+                Block::Text { .. } | Block::Image { .. } | Block::ToolUse { .. } => String::new(),
             };
             json!({"type": "text", "text": text})
         }

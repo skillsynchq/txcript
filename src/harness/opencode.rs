@@ -481,10 +481,18 @@ fn user_part(
             p.insert("time".into(), json!({ "start": ms, "end": ms }));
             Some(base(p))
         }
-        // Thinking and ToolUse never occur on user turns; a ToolResult is
+        Block::ToolUse { tool, .. } => {
+            let text = tool.command_display()?;
+            let mut p = Map::new();
+            p.insert("type".into(), json!("text"));
+            p.insert("text".into(), json!(text));
+            p.insert("time".into(), json!({ "start": ms, "end": ms }));
+            Some(base(p))
+        }
+        // Thinking never occurs on user turns; a ToolResult is
         // folded into the preceding tool part by `assistant_part` and has no
         // user-part shape of its own.
-        Block::Thinking { .. } | Block::ToolUse { .. } | Block::ToolResult { .. } => None,
+        Block::Thinking { .. } | Block::ToolResult { .. } => None,
     }
 }
 

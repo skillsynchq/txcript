@@ -544,6 +544,7 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
 }
 
 /// Emit the `response_item` (and paired display `event_msg`) lines for one message.
+#[allow(clippy::too_many_lines)]
 fn push_message_lines(lines: &mut Vec<Line>, msg: &Message, ts: &str) {
     let role_str = match msg.role {
         Role::User => "user",
@@ -594,17 +595,24 @@ fn push_message_lines(lines: &mut Vec<Line>, msg: &Message, ts: &str) {
                 ));
             }
             Block::ToolUse { id, tool } => {
-                let (name, input) = tool.to_canonical();
-                lines.push(meta_line_str(
-                    ts,
-                    "response_item",
-                    json!({
-                        "type": "function_call",
-                        "name": name,
-                        "arguments": input.to_string(),
-                        "call_id": id,
-                    }),
-                ));
+                if msg.role == Role::User
+                    && let Some(cmd) = tool.command_display()
+                {
+                    message_content.push(json!({ "type": "input_text", "text": cmd }));
+                    text_chunks.push(cmd);
+                } else {
+                    let (name, input) = tool.to_canonical();
+                    lines.push(meta_line_str(
+                        ts,
+                        "response_item",
+                        json!({
+                            "type": "function_call",
+                            "name": name,
+                            "arguments": input.to_string(),
+                            "call_id": id,
+                        }),
+                    ));
+                }
             }
             Block::ToolResult {
                 tool_use_id,

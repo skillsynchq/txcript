@@ -748,7 +748,8 @@ fn native_content(blocks: &[Block]) -> Value {
         let text = blocks
             .iter()
             .filter_map(|block| match block {
-                Block::Text { text } => Some(text.as_str()),
+                Block::Text { text } => Some(text.clone()),
+                Block::ToolUse { tool, .. } => tool.command_display(),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -764,6 +765,9 @@ fn native_content(blocks: &[Block]) -> Value {
             .iter()
             .filter_map(|block| match block {
                 Block::Text { text } => Some(json!({"type": "text", "text": text})),
+                Block::ToolUse { tool, .. } => tool
+                    .command_display()
+                    .map(|cmd| json!({"type": "text", "text": cmd})),
                 Block::Image { source } => Some(json!({
                     "type": "image_url",
                     "image_url": {

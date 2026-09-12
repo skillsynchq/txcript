@@ -326,3 +326,146 @@ fn custom_tool_casing_survives_every_hop() {
         assert_cycle(&sample_with_raw_tool(tool_name), tool_name);
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn slash_commands_survive_conversions() {
+    let t0 = ts("2026-08-18T10:00:00Z");
+    let common = Transcript::new(
+        common::Meta {
+            id: "cmd-session-123".into(),
+            timestamp: t0,
+            cwd: Some("/repo".into()),
+            git_branch: None,
+            title: Some("Slash Command Test".into()),
+            cli_version: Some("1.0.0".into()),
+            model: Some("claude-sonnet".into()),
+        },
+        vec![
+            common::Message {
+                role: common::Role::User,
+                content: vec![
+                    common::Block::ToolUse {
+                        id: "cmd_1".into(),
+                        tool: common::Tool::Command {
+                            command: "/commit".into(),
+                            args: Some("-m \"Initial commit\"".into()),
+                        },
+                    },
+                    common::Block::ToolResult {
+                        tool_use_id: "cmd_1".into(),
+                        content: common::ToolOutput::Text("Committed 1 file".into()),
+                        is_error: false,
+                    },
+                ],
+                timestamp: t0,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+            common::Message {
+                role: common::Role::Assistant,
+                content: vec![common::Block::Text {
+                    text: "Commit completed successfully.".into(),
+                }],
+                timestamp: t0 + chrono::Duration::seconds(5),
+                model: Some("claude-sonnet".into()),
+                stop_reason: Some(common::StopReason::EndTurn),
+                usage: None,
+            },
+            common::Message {
+                role: common::Role::User,
+                content: vec![common::Block::ToolUse {
+                    id: "cmd_2".into(),
+                    tool: common::Tool::Command {
+                        command: "/compact".into(),
+                        args: None,
+                    },
+                }],
+                timestamp: t0 + chrono::Duration::seconds(10),
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+        ],
+    );
+
+    let has_text = |t: &Transcript<Common>, substr: &str| {
+        t.body.iter().any(|m| {
+            m.content.iter().any(|b| match b {
+                common::Block::Text { text } => text.contains(substr),
+                _ => false,
+            })
+        })
+    };
+
+    // CursorDesktop
+    let cd = cursor_desktop::CursorDesktop::from_common(&common).unwrap();
+    let cd_c = cursor_desktop::CursorDesktop::to_common(&cd).unwrap();
+    assert!(has_text(&cd_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&cd_c, "/compact"));
+
+    // Cursor
+    let cur = cursor::Cursor::from_common(&common).unwrap();
+    let cur_c = cursor::Cursor::to_common(&cur).unwrap();
+    assert!(has_text(&cur_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&cur_c, "/compact"));
+
+    // OpenCode
+    let oc = opencode::OpenCode::from_common(&common).unwrap();
+    let oc_c = opencode::OpenCode::to_common(&oc).unwrap();
+    assert!(has_text(&oc_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&oc_c, "/compact"));
+
+    // Grok
+    let grk = grok::Grok::from_common(&common).unwrap();
+    let grk_c = grok::Grok::to_common(&grk).unwrap();
+    assert!(has_text(&grk_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&grk_c, "/compact"));
+
+    // Fx
+    let f = fx::Fx::from_common(&common).unwrap();
+    let f_c = fx::Fx::to_common(&f).unwrap();
+    assert!(has_text(&f_c, "/commit -m \"Initial commit\""));
+
+    // Pi
+    let p = pi::Pi::from_common(&common).unwrap();
+    let p_c = pi::Pi::to_common(&p).unwrap();
+    assert!(has_text(&p_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&p_c, "/compact"));
+
+    // Codex
+    let cx = codex::Codex::from_common(&common).unwrap();
+    let cx_c = codex::Codex::to_common(&cx).unwrap();
+    assert!(has_text(&cx_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&cx_c, "/compact"));
+
+    // Hermes
+    let h = hermes::Hermes::from_common(&common).unwrap();
+    let h_c = hermes::Hermes::to_common(&h).unwrap();
+    assert!(has_text(&h_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&h_c, "/compact"));
+
+    // Amp
+    let a = amp::Amp::from_common(&common).unwrap();
+    let a_c = amp::Amp::to_common(&a).unwrap();
+    assert!(has_text(&a_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&a_c, "/compact"));
+
+    // GrokBot
+    let gb = grok_bot::GrokBot::from_common(&common).unwrap();
+    let gb_c = grok_bot::GrokBot::to_common(&gb).unwrap();
+    assert!(has_text(&gb_c, "/commit -m \"Initial commit\""));
+    assert!(has_text(&gb_c, "/compact"));
+
+    // Cowork
+    let cw = cowork::Cowork::from_common(&common).unwrap();
+    assert_eq!(
+        cw.body
+            .header
+            .extra
+            .get("initialMessage")
+            .and_then(serde_json::Value::as_str),
+        Some("/commit -m \"Initial commit\"")
+    );
+}

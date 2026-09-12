@@ -721,10 +721,15 @@ fn bubbles_from_messages(cid: &str, messages: &[Message]) -> Vec<Map<String, Val
     for (i, msg) in messages.iter().enumerate() {
         match msg.role {
             Role::User => {
-                let mut texts = Vec::new();
+                let mut texts: Vec<String> = Vec::new();
                 for block in &msg.content {
                     match block {
-                        Block::Text { text } => texts.push(text.as_str()),
+                        Block::Text { text } => texts.push(text.clone()),
+                        Block::ToolUse { tool, .. } => {
+                            if let Some(cmd) = tool.command_display() {
+                                texts.push(cmd);
+                            }
+                        }
                         Block::ToolResult {
                             tool_use_id,
                             content,
