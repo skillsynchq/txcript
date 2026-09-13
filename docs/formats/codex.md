@@ -86,7 +86,10 @@ the form `["bash"|"sh"|"zsh", "-lc"|"-c", cmd]` collapse to the inner command.
   with the touched paths listed.
 - **Resume is picky.** `from_common` must emit `model_provider: "openai"` in `session_meta` —
   current Codex resolves a null provider to the empty name and fails resume with
-  ``Model provider `` not found``. `base_instructions` may be null (defaults substitute).
+  ``Model provider `` not found``. `base_instructions` may be null (defaults substitute). Foreign
+  tool names are normalized to OpenAI's `[A-Za-z0-9_-]+` requirement when written: unsupported
+  characters become `_`, and an empty name becomes `tool`. This destination-only normalization is
+  not reversible, and distinct foreign names can converge (for example, `a.b` and `a/b`).
 - **Version drift.** Newer rollouts add fields (`ordinal`, `session_id`, `parent_thread_id`,
   structured `source`) and kinds (`world_state`, `compacted`, `inter_agent_communication`).
   Unknown envelope fields land in a flattened `extra` map and unknown kinds are carried
