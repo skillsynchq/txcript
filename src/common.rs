@@ -103,6 +103,37 @@ pub enum Block {
     Artifact { artifact: Artifact },
 }
 
+/// Fold a native tool-call id onto Anthropic's `tool_use.id` grammar
+/// (`^[a-zA-Z0-9_-]+$`). Common is the Anthropic-shaped hub; this is the
+/// charset every harness can round-trip through it.
+#[must_use]
+pub fn sanitize_tool_id(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Rewrite tool-call ids on a message so use/result pairs stay linked.
+#[must_use]
+pub fn sanitize_message_tool_ids(message: &Message) -> Message {
+    let mut message = message.clone();
+    for block in &mut message.content {
+        match block {
+            Block::ToolUse { id, .. } => *id = sanitize_tool_id(id),
+            Block::ToolResult { tool_use_id, .. } => *tool_use_id = sanitize_tool_id(tool_use_id),
+            Block::Artifact { artifact } => artifact.id = sanitize_tool_id(&artifact.id),
+            Block::Text { .. } | Block::Thinking { .. } | Block::Image { .. } => {}
+        }
+    }
+    message
+}
+
 /// Why an assistant turn ended. `Other` keeps any harness-specific reason
 /// round-trippable rather than collapsing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +527,17 @@ struct BashArgs<S = String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Cursor embeds a newline between the call and function-call halves.
+    #[test]
+    fn sanitize_tool_id_folds_foreign_charset() {
+        let raw = "call-abc-12\nfc_def_4";
+        assert_eq!(sanitize_tool_id(raw), "call-abc-12_fc_def_4");
+        assert_eq!(
+            sanitize_tool_id("toolu_01Fr4RzrGVoJBMVCyX6X4dMw"),
+            "toolu_01Fr4RzrGVoJBMVCyX6X4dMw"
+        );
+    }
 
     /// A known tool with a known schema becomes the typed variant, and round
     /// trips back to the same canonical name and input.
