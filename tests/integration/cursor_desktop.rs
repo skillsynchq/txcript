@@ -548,3 +548,179 @@ fn pending_tool_call_yields_no_result_message() {
         }]
     );
 }
+
+#[test]
+fn edit_tool_with_replace_all_survives_fixpoint() {
+    let mut common = fixpoint_common();
+    let t_user = ts("2026-08-17T06:30:47.800Z");
+    let t_tool = ts("2026-08-17T06:30:49.000Z");
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::Text {
+            text: "replace in file".into(),
+        }],
+        timestamp: t_user,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-edit-replace-all".into(),
+            tool: common::Tool::Edit {
+                file_path: "/repo/src/lib.rs".into(),
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: true,
+            },
+        }],
+        timestamp: t_tool,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-edit-replace-all".into(),
+            content: common::ToolOutput::Text("ok".into()),
+            is_error: false,
+        }],
+        timestamp: t_tool,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    let native = CursorDesktop::from_common(&common).unwrap();
+    let back = CursorDesktop::to_common(&native).unwrap();
+    assert_eq!(back.body, common.body);
+}
+
+#[test]
+fn edit_and_write_tools_normalize_and_denormalize_losslessly() {
+    let mut common = fixpoint_common();
+    let t_user = ts("2026-08-17T06:30:47.800Z");
+    let t_tool1 = ts("2026-08-17T06:30:49.000Z");
+    let t_tool2 = ts("2026-08-17T06:30:50.000Z");
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::Text {
+            text: "apply edits and writes".into(),
+        }],
+        timestamp: t_user,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-edit".into(),
+            tool: common::Tool::Edit {
+                file_path: "/repo/src/lib.rs".into(),
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            },
+        }],
+        timestamp: t_tool1,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-edit".into(),
+            content: common::ToolOutput::Text("applied".into()),
+            is_error: false,
+        }],
+        timestamp: t_tool1,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-write".into(),
+            tool: common::Tool::Write {
+                file_path: "/repo/src/main.rs".into(),
+                content: "fn main() {}".into(),
+            },
+        }],
+        timestamp: t_tool2,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-write".into(),
+            content: common::ToolOutput::Text("written".into()),
+            is_error: false,
+        }],
+        timestamp: t_tool2,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    let native = CursorDesktop::from_common(&common).unwrap();
+    let back = CursorDesktop::to_common(&native).unwrap();
+    assert_eq!(back.body, common.body);
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn store_resolves_workspace_id_with_percent_encoding_and_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CursorDesktopStore::new(dir.path());
+    let ws_root = dir.path().join("workspaceStorage");
+
+    #[cfg(not(windows))]
+    let test_cwd = "/Users/me/My Project";
+    #[cfg(windows)]
+    let test_cwd = r"C:\Users\me\My Project";
+
+    // Workspace with spaces (%20)
+    let ws_space = ws_root.join("ws-space");
+    std::fs::create_dir_all(&ws_space).unwrap();
+    #[cfg(not(windows))]
+    let ws_folder = "file:///Users/me/My%20Project";
+    #[cfg(windows)]
+    let ws_folder = "file:///c%3A/Users/me/My%20Project";
+    std::fs::write(
+        ws_space.join("workspace.json"),
+        json!({"folder": ws_folder}).to_string(),
+    )
+    .unwrap();
+
+    let mut t = sample_transcript();
+    t.body.workspace_id = None;
+    t.meta.id = "22222222-2222-4222-8222-222222222222".into();
+    t.meta.cwd = Some(test_cwd.into());
+    let saved = store.save(&t).unwrap();
+    let loaded = store.load(&saved.reference).unwrap();
+    assert_eq!(loaded.body.workspace_id.as_deref(), Some("ws-space"));
+
+    // Negative test: POSIX relative 'repo' does NOT match absolute '/repo'
+    let ws_posix = ws_root.join("ws-posix");
+    std::fs::create_dir_all(&ws_posix).unwrap();
+    std::fs::write(
+        ws_posix.join("workspace.json"),
+        json!({"folder": "file:///repo"}).to_string(),
+    )
+    .unwrap();
+
+    let mut t_rel = sample_transcript();
+    t_rel.body.workspace_id = None;
+    t_rel.meta.id = "33333333-3333-4333-8333-333333333333".into();
+    t_rel.meta.cwd = Some("repo".into());
+    let saved_rel = store.save(&t_rel).unwrap();
+    let loaded_rel = store.load(&saved_rel.reference).unwrap();
+    assert_ne!(loaded_rel.body.workspace_id.as_deref(), Some("ws-posix"));
+}
