@@ -19,10 +19,10 @@
 //!     --with <harness> [...]                #   for `-`) into <harness>; see
 //!                                           #   docs/formats/simple.md
 //!                                           #   --with grok_bot never launches a CLI
-//! txcript crop <id>[#range]             # interactively cut messages and save a copy
+//! txcript crop <id|file>[#range]         # interactively cut messages and save a copy
 //!     [--with <harness>]                    #   optionally convert the cropped copy
 //!     [--from <harness>]                    #   scope the source lookup
-//! txcript view <id>[#range]             # view a session; compact text when piped
+//! txcript view <id|file|->[#range]       # view a session; compact text when piped
 //!     [--from <harness>]                    #   scope the id lookup to one harness
 //!     [--no-pager]                          #   print the terminal view directly
 //! txcript query '<pattern>'             # one-shot literal search, ranked hits
@@ -161,7 +161,7 @@ pub enum SessionCommand {
         /// `#range` of 1-based inclusive message numbers (`abc#5-12`, `#7`,
         /// `#5-`, `#-10`)
         // Other: without a hint, generated completions fall back to filenames.
-        #[arg(value_hint = clap::ValueHint::Other)]
+        #[arg(value_hint = clap::ValueHint::Other, allow_hyphen_values = true)]
         id: String,
         /// Continue in this harness instead of the session's own
         #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
@@ -194,9 +194,10 @@ pub enum SessionCommand {
     /// The source is never modified. By default the cropped copy is written
     /// to the source harness; --with converts it to another harness instead.
     Crop {
-        /// Session id (any unambiguous prefix) or exact title, optionally with
-        /// an initial message range (`abc#5-12`, `abc#7`, `abc#5-`, `abc#-10`)
-        #[arg(value_hint = clap::ValueHint::Other)]
+        /// Session id (any unambiguous prefix) or exact title; or a Simple
+        /// document file. Optionally with an initial message range (`abc#5-12`,
+        /// `abc#7`, `abc#5-`, `abc#-10`)
+        #[arg(value_hint = clap::ValueHint::Other, allow_hyphen_values = true)]
         source: String,
         /// Write the cropped copy in this harness instead of the source harness
         #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
@@ -216,11 +217,12 @@ pub enum SessionCommand {
     /// number messages so a printed ordinal can be fed straight back as a
     /// `#range`.
     View {
-        /// Session id (any unambiguous prefix) or its exact title, with an
-        /// optional `#range` of 1-based inclusive message numbers
-        /// (`abc#5-12`, `#7`, `#5-`, `#-10`)
+        /// Session id (any unambiguous prefix) or its exact title; or a
+        /// Simple document (a file path, `-` for stdin). Takes an optional
+        /// `#range` of 1-based inclusive message numbers (`abc#5-12`, `#7`,
+        /// `#5-`, `#-10`)
         // Other: without a hint, generated completions fall back to filenames.
-        #[arg(value_hint = clap::ValueHint::Other)]
+        #[arg(value_hint = clap::ValueHint::Other, allow_hyphen_values = true)]
         source: String,
         /// Only look for the session in this harness
         #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
@@ -236,10 +238,11 @@ pub enum SessionCommand {
     /// Move it to another machine and `continue <file> --with <harness>`
     /// picks the session up there; a `#range` exports just those messages.
     Export {
-        /// Session id (any unambiguous prefix) or its exact title, with an
-        /// optional `#range` of 1-based inclusive message numbers
-        /// (`abc#5-12`, `#7`, `#5-`, `#-10`)
-        #[arg(value_hint = clap::ValueHint::Other)]
+        /// Session id (any unambiguous prefix) or its exact title; or a
+        /// Simple document (a file path, `-` for stdin). Takes an optional
+        /// `#range` of 1-based inclusive message numbers (`abc#5-12`, `#7`,
+        /// `#5-`, `#-10`)
+        #[arg(value_hint = clap::ValueHint::Other, allow_hyphen_values = true)]
         source: String,
         /// Only look for the session in this harness
         #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
@@ -951,6 +954,37 @@ mod identity_tests {
             crate::Command::Session(crate::SessionCommand::Continue { ref id, .. }) if id == "session-123"
         ));
     }
+
+    #[test]
+    fn hyphen_prefixed_source_arguments_parse_across_commands() {
+        use clap::Parser;
+
+        let cli =
+            crate::Cli::try_parse_from(["txcript", "continue", "-#1", "--with", "codex"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Session(crate::SessionCommand::Continue { ref id, .. }) if id == "-#1"
+        ));
+
+        let cli = crate::Cli::try_parse_from(["txcript", "view", "-#1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Session(crate::SessionCommand::View { ref source, .. }) if source == "-#1"
+        ));
+
+        let cli = crate::Cli::try_parse_from(["txcript", "export", "-#1-5"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Session(crate::SessionCommand::Export { ref source, .. }) if source == "-#1-5"
+        ));
+
+        let cli = crate::Cli::try_parse_from(["txcript", "crop", "-#1", "--with", "claude_code"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Session(crate::SessionCommand::Crop { ref source, .. }) if source == "-#1"
+        ));
+    }
 }
 
 fn cmd_list(
@@ -1109,6 +1143,29 @@ fn cmd_crop(
     }
     if let Some(target) = with {
         ensure_crop_target(target)?;
+    }
+
+    if let Some((input, request)) = document_source(source) {
+        if from.is_some() {
+            return Err(
+                "--from scopes the search for a local session; a Simple document is its own input"
+                    .to_string(),
+            );
+        }
+        let target = with.ok_or_else(|| {
+            "a Simple document has no harness of its own to crop into; \
+             pass --with <harness> (e.g. --with claude_code)"
+                .to_string()
+        })?;
+        ensure_crop_target(target)?;
+        if matches!(input, DocInput::Stdin) {
+            return Err(
+                "cannot crop a document from stdin because crop requires interactive terminal input"
+                    .to_string(),
+            );
+        }
+        let common = read_document_input(&input)?;
+        return crop_loaded(&common, HarnessId::Simple, target, request.as_ref());
     }
 
     if let Some(loaded) = load_direct_claude_chat(source, from) {
@@ -1365,9 +1422,9 @@ fn parse_metadata_specs(specs: &[String]) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Object(map))
 }
 
-/// What `continue` received when it wasn't a session id: a Simple document
-/// on stdin or in a file.
-enum DocInput {
+/// What `continue`, `view`, `export`, or `crop` received when it wasn't a
+/// session id: a Simple document on stdin or in a file.
+pub(crate) enum DocInput {
     Stdin,
     File(PathBuf),
 }
@@ -1377,7 +1434,7 @@ enum DocInput {
 /// document. A whole argument that names one wins over the range
 /// interpretation, so a filename containing `#` still opens. Everything
 /// else is a session reference for the discovery path.
-fn document_source(input: &str) -> Option<(DocInput, Option<fragment::SpanReq>)> {
+pub(crate) fn document_source(input: &str) -> Option<(DocInput, Option<fragment::SpanReq>)> {
     if input == "-" {
         return Some((DocInput::Stdin, None));
     }
@@ -1401,22 +1458,8 @@ fn readable_document(path: &str) -> bool {
     std::fs::metadata(path).is_ok_and(|m| !m.is_dir())
 }
 
-/// Continue a Simple document into `--with`: parse, convert, write into the
-/// target's store, launch. The document is read once and never modified;
-/// from here on the conversation lives in the target harness.
-fn continue_document(
-    input: &DocInput,
-    span_req: Option<&fragment::SpanReq>,
-    with: Option<HarnessId>,
-    out: Option<&std::path::Path>,
-    resume: bool,
-    metadata: Option<&serde_json::Value>,
-) -> Result<ExitCode, String> {
-    let target = with.ok_or_else(|| {
-        "a Simple document has no harness of its own to resume; \
-         pass --with <harness> (e.g. --with claude_code)"
-            .to_string()
-    })?;
+/// Read a Simple document input into the canonical Common model.
+pub(crate) fn read_document_input(input: &DocInput) -> Result<Transcript<Common>, String> {
     let text = match input {
         DocInput::Stdin => {
             let mut buffer = String::new();
@@ -1434,7 +1477,26 @@ fn continue_document(
         DocInput::Stdin => None,
         DocInput::File(path) => Some(path.as_path()).filter(|p| p.is_file()),
     };
-    let common = document_to_common(&text, origin)?;
+    document_to_common(&text, origin)
+}
+
+/// Continue a Simple document into `--with`: parse, convert, write into the
+/// target's store, launch. The document is read once and never modified;
+/// from here on the conversation lives in the target harness.
+fn continue_document(
+    input: &DocInput,
+    span_req: Option<&fragment::SpanReq>,
+    with: Option<HarnessId>,
+    out: Option<&std::path::Path>,
+    resume: bool,
+    metadata: Option<&serde_json::Value>,
+) -> Result<ExitCode, String> {
+    let target = with.ok_or_else(|| {
+        "a Simple document has no harness of its own to resume; \
+         pass --with <harness> (e.g. --with claude_code)"
+            .to_string()
+    })?;
+    let common = read_document_input(input)?;
 
     let mut copy = match span_req {
         Some(req) => fragment::sliced(&common, req)?,

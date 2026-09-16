@@ -1,11 +1,12 @@
 //! `txcript export` — write a session as a Simple interchange document.
 //!
-//! The source is resolved exactly like `view` (id or exact title, optional
-//! `#range`). The output is the full-fidelity Simple rendering of the
-//! canonical model — every `Transcript<Common>` field has a slot in Simple —
-//! so the document is the session as txcript sees it, detached from any
-//! harness's store. `txcript continue <file> --with <harness>` brings it
-//! back into a harness, on this machine or another.
+//! The source is resolved exactly like `view` (id, exact title, or an existing
+//! Simple document file or stdin `-`, with optional `#range`). The output is the
+//! full-fidelity Simple rendering of the canonical model — every
+//! `Transcript<Common>` field has a slot in Simple — so the document is the
+//! session as txcript sees it, detached from any harness's store.
+//! `txcript continue <file> --with <harness>` brings it back into a harness,
+//! on this machine or another.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -177,5 +178,33 @@ mod tests {
         let parsed = Simple::from_text(&text).unwrap();
         let back = Simple::to_common(&parsed).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn cmd_export_slices_existing_simple_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.json");
+        let output_path = dir.path().join("sliced.json");
+        std::fs::write(
+            &input_path,
+            r#"{
+                "id": "doc-export-test",
+                "messages": [
+                    {"role": "user", "content": "msg 1"},
+                    {"role": "assistant", "content": "msg 2"},
+                    {"role": "user", "content": "msg 3"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let source = format!("{}#1-2", input_path.display());
+        let status = super::cmd_export(&source, None, Some(&output_path)).unwrap();
+        assert_eq!(status, std::process::ExitCode::SUCCESS);
+
+        let out_text = std::fs::read_to_string(&output_path).unwrap();
+        let parsed = Simple::from_text(&out_text).unwrap();
+        let common = Simple::to_common(&parsed).unwrap();
+        assert_eq!(common.body.len(), 2);
     }
 }
