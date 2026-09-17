@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::common::{
     Artifact, ArtifactSource, Block, ImageSource, Message, Meta, Role, StopReason, Tool,
-    ToolOutput, Usage,
+    ToolOutput, Usage, sanitize_message_tool_ids,
 };
 use crate::error::{Error, Result};
 use crate::harness::jsonl;
@@ -224,6 +224,7 @@ pub(crate) fn records_to_messages(records: &[Record], fallback_ts: DateTime<Utc>
 /// with harnesses that embed Claude Code's JSONL (Cowork).
 pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Record> {
     let lowered = lower_artifact_messages(messages);
+    let lowered: Vec<Message> = lowered.iter().map(sanitize_message_tool_ids).collect();
     let messages = lowered.as_slice();
     let session_id = if meta.id.is_empty() {
         Uuid::new_v4().to_string()

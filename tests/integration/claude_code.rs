@@ -330,6 +330,53 @@ fn foreign_tool_result_blocks_flatten_to_text() {
     );
 }
 
+/// Cursor CLI toolCallIds embed a newline. Common is Anthropic-shaped, so
+/// `from_common` must emit ids the Messages API will accept, with use/result
+/// still paired. (Regression: cursor → `claude_code` hop, 400 on resume.)
+#[test]
+fn foreign_tool_ids_match_anthropic_grammar() {
+    let mut common = sample_common();
+    let raw = "call-abc-12\nfc_def_4";
+    match &mut common.body[1].content[2] {
+        common::Block::ToolUse { id, .. } => *id = raw.into(),
+        other => panic!("expected tool_use, got {other:?}"),
+    }
+    match &mut common.body[2].content[0] {
+        common::Block::ToolResult { tool_use_id, .. } => *tool_use_id = raw.into(),
+        other => panic!("expected tool_result, got {other:?}"),
+    }
+
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let text = claude_code::ClaudeCode::to_text(&native).unwrap();
+    let mut use_ids = Vec::new();
+    let mut result_ids = Vec::new();
+    for line in text.lines() {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
+            continue;
+        };
+        for block in content.as_array().cloned().unwrap_or_default() {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => use_ids.push(block["id"].as_str().unwrap().to_string()),
+                Some("tool_result") => {
+                    result_ids.push(block["tool_use_id"].as_str().unwrap().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(use_ids, vec!["call-abc-12_fc_def_4".to_string()]);
+    assert_eq!(result_ids, vec!["call-abc-12_fc_def_4".to_string()]);
+    for id in use_ids.iter().chain(result_ids.iter()) {
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "unsanitized id: {id:?}"
+        );
+        assert!(!id.contains('\n'));
+    }
+}
+
 /// `from_common` is a pure function: same input, identical output (deterministic
 /// uuids), so conversions are reproducible.
 #[test]

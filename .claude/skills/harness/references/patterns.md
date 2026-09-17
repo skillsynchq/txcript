@@ -133,10 +133,11 @@ blindly.
   your portable serialization, nothing Cursor emits.
 - `from_common` regenerates Cursor's *internal* structures or resume breaks:
   the hand-rolled protobuf turn graph (root state → turns → steps, tool-call
-  payloads with exact field numbers), `latestRootBlobId` pointing at the last
-  blob, the hex-encoded meta row `"0"`, and sidecar `meta.json` +
-  `prompt_history.json`. MD5/SHA-256/protobuf are hand-rolled in-file rather
-  than adding deps.
+  payloads with exact field numbers), `ConversationStateStructure` field 1
+  (`root_prompt_messages_json`) pointing at the JSON message blobs (the model
+  prompt), `latestRootBlobId` pointing at the last blob, the hex-encoded meta
+  row `"0"`, and sidecar `meta.json` + `prompt_history.json`. MD5/SHA-256/protobuf
+  are hand-rolled in-file rather than adding deps.
 - Native invariants forced: every turn needs a user message (assistant-first
   transcripts get a synthetic "Continue." turn); orphan tool results become
   text steps; `Tool::Raw` has no proto encoding → degraded to a plaintext
