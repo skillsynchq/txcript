@@ -366,8 +366,12 @@ fn pi_payloads_for(
                             json!({"type": "toolCall", "id": id, "name": pi_name, "arguments": pi_input}),
                         );
                     }
-                    // Not expressible in a pi assistant message.
-                    Block::Image { .. } | Block::ToolResult { .. } => {}
+                    Block::Image { source } => {
+                        content.push(
+                            json!({"type": "text", "text": format!("[image: {}]", source.media_type)}),
+                        );
+                    }
+                    Block::ToolResult { .. } => {}
                 }
             }
             // An assistant turn with no expressible blocks emits no record.
