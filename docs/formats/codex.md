@@ -32,6 +32,14 @@ are not followed, guarding against cycles; symlinked files still list). A file o
 session if it contains a `session_meta` line carrying an `id`; discovery parses just those lines
 and skips message payloads entirely. On load, a missing id falls back to the filename's uuid.
 
+Codex's own `/archive` (TUI) and `codex archive`/`codex unarchive` (CLI) move a rollout out of
+this dated tree into a flat sibling directory, `archived_sessions` (no `YYYY/MM/DD` sharding).
+`CodexStore::default_root` sets `archived_sessions_dir` to that sibling, and discovery walks it
+alongside `sessions_dir`, so an archived rollout is still listed — Codex's own session picker just
+won't show it until it's unarchived back into `sessions/`. A `CodexStore` built directly from a
+custom `sessions_dir` has no archived directory unless one is set with
+`with_archived_sessions_dir`.
+
 ## Dissection of a transcript
 
 Every line shares one envelope — upstream's `RolloutLine`: a `timestamp` (RFC 3339, millisecond
