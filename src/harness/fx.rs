@@ -784,6 +784,11 @@ impl TurnBuilder {
                 match block {
                     Block::Text { text } => text_parts.push(text.clone()),
                     Block::Artifact { artifact } => text_parts.push(artifact.display_text()),
+                    Block::ToolUse { tool, .. } => {
+                        if let Some(cmd) = tool.command_display() {
+                            text_parts.push(cmd);
+                        }
+                    }
                     Block::Image { source } => {
                         if let Some(entry) = self.push_image(images.len(), source) {
                             images.push(entry);
@@ -934,11 +939,10 @@ fn tool_output_string(content: &ToolOutput) -> String {
 
 fn is_prompt(msg: &Message) -> bool {
     msg.role == Role::User
-        && msg.content.iter().any(|b| {
-            matches!(
-                b,
-                Block::Text { .. } | Block::Image { .. } | Block::Artifact { .. }
-            )
+        && msg.content.iter().any(|b| match b {
+            Block::Text { .. } | Block::Image { .. } | Block::Artifact { .. } => true,
+            Block::ToolUse { tool, .. } => tool.command_display().is_some(),
+            _ => false,
         })
 }
 

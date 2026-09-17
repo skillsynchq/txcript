@@ -803,8 +803,13 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> GrokSession {
                             }));
                             updates.tool_result(msg.timestamp, tool_use_id, content, *is_error);
                         }
-                        // Assistant-side blocks have no slot in a user record.
-                        Block::Thinking { .. } | Block::ToolUse { .. } => {}
+                        Block::ToolUse { tool, .. } => {
+                            if let Some(cmd) = tool.command_display() {
+                                prompt_texts.push(cmd);
+                            }
+                        }
+                        // Assistant-side thinking has no slot in a user record.
+                        Block::Thinking { .. } => {}
                     }
                 }
                 if !prompt_texts.is_empty() || !prompt_images.is_empty() {

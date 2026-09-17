@@ -175,9 +175,9 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> (Meta, CoworkSession
         .and_then(|m| {
             m.content.iter().find_map(|block| match block {
                 Block::Text { text } => Some(text.clone()),
+                Block::ToolUse { tool, .. } => tool.command_display(),
                 // Only text opens a prompt in the app's record.
                 Block::Thinking { .. }
-                | Block::ToolUse { .. }
                 | Block::ToolResult { .. }
                 | Block::Image { .. }
                 | Block::Artifact { .. } => None,
