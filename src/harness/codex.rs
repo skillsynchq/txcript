@@ -688,23 +688,43 @@ fn meta_line_str(ts: &str, kind: &str, payload: Value) -> Line {
 #[derive(Debug, Clone)]
 pub struct CodexStore {
     pub sessions_dir: PathBuf,
+    /// Codex's own `/archive` (TUI) and `codex archive`/`codex unarchive`
+    /// (CLI) move a rollout out of the dated `sessions_dir` tree into this
+    /// flat sibling directory, `archived_sessions`. `None` when unknown, as
+    /// for a `sessions_dir` built by hand that isn't under a Codex home.
+    pub archived_sessions_dir: Option<PathBuf>,
 }
 
 impl CodexStore {
     pub fn new(sessions_dir: impl Into<PathBuf>) -> Self {
         Self {
             sessions_dir: sessions_dir.into(),
+            archived_sessions_dir: None,
         }
+    }
+
+    /// Also discover rollouts Codex has archived into `dir`. New sessions
+    /// are always written to `sessions_dir`; this only widens discovery.
+    #[must_use]
+    pub fn with_archived_sessions_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.archived_sessions_dir = Some(dir.into());
+        self
     }
 
     /// The default sessions root: `$CODEX_HOME/sessions` when set (Codex
     /// honors that override before its home lookup), else `~/.codex/sessions`.
+    /// `archived_sessions_dir` is set to the matching sibling
+    /// `archived_sessions` directory.
     #[must_use]
     pub fn default_root() -> Option<Self> {
         std::env::var_os("CODEX_HOME")
             .filter(|v| !v.is_empty())
-            .map(|codex_home| Self::new(PathBuf::from(codex_home).join("sessions")))
-            .or_else(|| home().map(|h| Self::new(h.join(".codex").join("sessions"))))
+            .map(PathBuf::from)
+            .or_else(|| home().map(|h| h.join(".codex")))
+            .map(|codex_home| {
+                Self::new(codex_home.join("sessions"))
+                    .with_archived_sessions_dir(codex_home.join("archived_sessions"))
+            })
     }
 }
 
@@ -713,52 +733,56 @@ impl Store for CodexStore {
     type Ref = PathBuf;
 
     fn discover(&self) -> Result<Vec<Discovered<PathBuf>>> {
+        let mut files = Vec::new();
         if self.sessions_dir.is_dir() {
-            let mut files = Vec::new();
             collect_rollouts(&self.sessions_dir, &mut files);
-            Ok(super::filter_map_parallel(&files, |path| {
-                // A rollout that fails to read, or lacks a session_meta with
-                // an id, is not a resumable session. Only session_meta lines
-                // are parsed — message payloads are skipped whole — and the
-                // read stops at the first session_meta carrying the id, which
-                // is line one of a well-formed rollout. Reading the rest would
-                // mean pulling every byte of every rollout on the machine
-                // through a JSON probe to learn nothing more.
-                let has_id = |l: &Line| l.payload.get("id").and_then(Value::as_str).is_some();
-                let file = fs::File::open(path).ok()?;
-                let mut first: Option<Line> = None;
-                let mut found_id = false;
-                for line in BufReader::new(file).lines().map_while(std::io::Result::ok) {
-                    if line.trim().is_empty() || !is_session_meta(&line) {
-                        continue;
-                    }
-                    let Ok(parsed) = serde_json::from_str::<Line>(&line) else {
-                        continue;
-                    };
-                    found_id = has_id(&parsed);
-                    if first.is_none() {
-                        first = Some(parsed);
-                    }
-                    if found_id {
-                        break;
-                    }
-                }
-                let first = first?;
-                found_id.then(|| {
-                    let mut meta = meta_from_lines(std::slice::from_ref(&first));
-                    if meta.id.is_empty() {
-                        meta.id = jsonl::file_id(path);
-                    }
-                    Discovered {
-                        meta,
-                        reference: path.clone(),
-                    }
-                })
-            }))
-        } else {
-            // A missing sessions root means no sessions, not an error.
-            Ok(Vec::new())
         }
+        // A missing sessions root or archived directory means no sessions
+        // there, not an error; `files` is simply left short.
+        if let Some(archived) = self.archived_sessions_dir.as_deref()
+            && archived.is_dir()
+        {
+            collect_rollouts(archived, &mut files);
+        }
+        Ok(super::filter_map_parallel(&files, |path| {
+            // A rollout that fails to read, or lacks a session_meta with
+            // an id, is not a resumable session. Only session_meta lines
+            // are parsed — message payloads are skipped whole — and the
+            // read stops at the first session_meta carrying the id, which
+            // is line one of a well-formed rollout. Reading the rest would
+            // mean pulling every byte of every rollout on the machine
+            // through a JSON probe to learn nothing more.
+            let has_id = |l: &Line| l.payload.get("id").and_then(Value::as_str).is_some();
+            let file = fs::File::open(path).ok()?;
+            let mut first: Option<Line> = None;
+            let mut found_id = false;
+            for line in BufReader::new(file).lines().map_while(std::io::Result::ok) {
+                if line.trim().is_empty() || !is_session_meta(&line) {
+                    continue;
+                }
+                let Ok(parsed) = serde_json::from_str::<Line>(&line) else {
+                    continue;
+                };
+                found_id = has_id(&parsed);
+                if first.is_none() {
+                    first = Some(parsed);
+                }
+                if found_id {
+                    break;
+                }
+            }
+            let first = first?;
+            found_id.then(|| {
+                let mut meta = meta_from_lines(std::slice::from_ref(&first));
+                if meta.id.is_empty() {
+                    meta.id = jsonl::file_id(path);
+                }
+                Discovered {
+                    meta,
+                    reference: path.clone(),
+                }
+            })
+        }))
     }
 
     fn load(&self, reference: &PathBuf) -> Result<Transcript<Codex>> {

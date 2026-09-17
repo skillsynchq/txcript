@@ -182,6 +182,65 @@ fn discover_extracts_metadata() {
     assert_eq!(meta.cli_version.as_deref(), Some("0.104.0"));
 }
 
+/// Codex's own `/archive` (TUI) / `codex archive` (CLI) moves a rollout out
+/// of the dated `sessions_dir` tree into a flat sibling `archived_sessions`
+/// directory. Discovery must still find it there.
+#[test]
+fn discover_includes_archived_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let nested = sessions.join("2026").join("01").join("02");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        nested.join("rollout-2026-01-02T03-04-05-sess-active.jsonl"),
+        format!(
+            "{}\n",
+            r#"{"timestamp":"2026-01-02T03:04:05.000Z","type":"session_meta","payload":{"id":"sess-active"}}"#,
+        ),
+    )
+    .unwrap();
+
+    let archived = dir.path().join("archived_sessions");
+    std::fs::create_dir_all(&archived).unwrap();
+    std::fs::write(
+        archived.join("rollout-2025-12-01T00-00-00-sess-archived.jsonl"),
+        format!(
+            "{}\n",
+            r#"{"timestamp":"2025-12-01T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-archived"}}"#,
+        ),
+    )
+    .unwrap();
+
+    let store = codex::CodexStore::new(&sessions).with_archived_sessions_dir(&archived);
+    let mut ids: Vec<_> = store
+        .discover()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.meta.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["sess-active", "sess-archived"]);
+}
+
+/// A store with no known archived directory (the common case for a
+/// hand-built `sessions_dir`) only discovers the active tree.
+#[test]
+fn discover_without_archived_dir_only_finds_active_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("rollout-2026-01-02T03-04-05-sess-1.jsonl"),
+        format!(
+            "{}\n",
+            r#"{"timestamp":"2026-01-02T03:04:05.000Z","type":"session_meta","payload":{"id":"sess-1"}}"#,
+        ),
+    )
+    .unwrap();
+
+    let found = codex::CodexStore::new(dir.path()).discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].meta.id, "sess-1");
+}
+
 /// Shaped at codex's granularity: each assistant block is its own message
 /// (codex stores one `response_item` per line), every assistant turn carries a
 /// model, only the final text turn carries usage, and `stop_reason` is None
