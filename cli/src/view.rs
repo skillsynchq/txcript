@@ -515,6 +515,30 @@ fn human_header(out: &mut String, common: &Transcript<Common>, span: &Span, colo
         &format!("{shown} of {}", common.body.len()),
         color,
     );
+    if let Some(usage) = common.total_usage()
+        && !usage.is_zero()
+    {
+        let mut parts = vec![
+            format!("{} in", usage.input_tokens),
+            format!("{} out", usage.output_tokens),
+        ];
+        if let Some(cached) = usage.cache_read_input_tokens
+            && cached > 0
+        {
+            parts.push(format!("{cached} cached"));
+        }
+        if let Some(created) = usage.cache_creation_input_tokens
+            && created > 0
+        {
+            parts.push(format!("{created} cache write"));
+        }
+        human_field(
+            out,
+            "Tokens",
+            &format!("{} ({})", usage.total_tokens(), parts.join(", ")),
+            color,
+        );
+    }
 }
 
 /// Render `messages` under `filters`, returning the line index of each
@@ -548,15 +572,23 @@ fn human_messages(
             continue;
         }
         let ordinal = start + offset + 1;
-        let role = match message.role {
-            Role::User => "User",
-            Role::Assistant => "Assistant",
+        let role_label = match (message.role, &message.usage) {
+            (Role::Assistant, Some(u)) if !u.is_zero() => {
+                format!("Assistant · {} tokens", u.total_tokens())
+            }
+            (Role::Assistant, _) => "Assistant".to_string(),
+            (Role::User, _) => "User".to_string(),
         };
         lines += out[counted..].bytes().filter(|byte| *byte == b'\n').count();
         counted = out.len();
         // The rule follows the blank line `human_rule` opens with.
         message_starts.push(lines + 1);
-        human_rule(out, &format!("Message #{ordinal} · {role}"), width, color);
+        human_rule(
+            out,
+            &format!("Message #{ordinal} · {role_label}"),
+            width,
+            color,
+        );
         for (index, block) in message.content.iter().enumerate() {
             if filters.shows_block(block) {
                 blocks.render(out, (offset, index), block);

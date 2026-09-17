@@ -33,12 +33,12 @@
 //! `txcript-meta.json` sidecar that fx ignores: same-harness round trips keep
 //! reasoning, while fx resume simply renders the conversation without it.
 //!
-//! Known representational losses through `Common`: per-turn token usage and
-//! per-message model (fx stores one session model), `replace_all` on edits
-//! (fx's `edit_file` has no such flag), `terminal` action/profile and other
-//! non-Bash tool argument shapes when a session leaves fx, and the recovery
-//! checkpoint state. `execution.files` (fx's changed-file panel) is emitted
-//! empty; the conversation itself is intact.
+//! Known representational losses through `Common`: per-message model (fx
+//! stores one session model), `replace_all` on edits (fx's `edit_file` has no
+//! such flag), `terminal` action/profile and other non-Bash tool argument
+//! shapes when a session leaves fx, and the recovery checkpoint state.
+//! `execution.files` (fx's changed-file panel) is emitted empty; the
+//! conversation itself is intact.
 
 use std::collections::HashMap;
 use std::fs;
@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::common::{Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput};
+use crate::common::{Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput, Usage};
 use crate::error::{Error, Result};
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
@@ -148,6 +148,7 @@ fn body_to_messages(body: &FxSession, fallback_ts: DateTime<Utc>) -> Vec<Message
         let Some(turn) = event.pointer("/payload/turn") else {
             continue;
         };
+        let turn_usage = parse_payload_usage(event.get("payload"));
         let ts = event
             .get("timestamp_ms")
             .and_then(Value::as_i64)
@@ -160,17 +161,99 @@ fn body_to_messages(body: &FxSession, fallback_ts: DateTime<Utc>) -> Vec<Message
             model.as_deref(),
             &reasoning,
             &images,
+            turn_usage,
             &mut messages,
         );
         turn_idx += 1;
     }
+
+    if messages.iter().all(|m| m.usage.is_none())
+        && let Some(session_usage) = parse_session_usage(body)
+        && let Some(last_asst) = messages.iter_mut().rfind(|m| m.role == Role::Assistant)
+    {
+        last_asst.usage = Some(session_usage);
+    }
+
     messages
+}
+
+fn parse_payload_usage(payload: Option<&Value>) -> Option<Usage> {
+    let payload = payload?;
+    let input = payload
+        .get("total_input_tokens")
+        .or_else(|| payload.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = payload
+        .get("total_output_tokens")
+        .or_else(|| payload.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = payload
+        .get("total_cache_read_tokens")
+        .or_else(|| payload.get("cache_read_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write = payload
+        .get("total_cache_write_tokens")
+        .or_else(|| payload.get("cache_write_tokens"))
+        .and_then(Value::as_u64);
+
+    (input > 0 || output > 0 || cache_read.unwrap_or(0) > 0 || cache_write.unwrap_or(0) > 0)
+        .then_some(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_write,
+        })
+}
+
+fn parse_session_usage(body: &FxSession) -> Option<Usage> {
+    if let Some(usage_val) = &body.usage {
+        let input = usage_val
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = usage_val
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read = usage_val.get("cache_read_tokens").and_then(Value::as_u64);
+        let cache_write = usage_val.get("cache_write_tokens").and_then(Value::as_u64);
+        if input > 0 || output > 0 || cache_read.unwrap_or(0) > 0 || cache_write.unwrap_or(0) > 0 {
+            return Some(Usage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_write,
+            });
+        }
+    }
+    if let Some(session_val) = &body.session {
+        let input = session_val
+            .get("total_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = session_val
+            .get("total_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if input > 0 || output > 0 {
+            return Some(Usage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            });
+        }
+    }
+    None
 }
 
 /// Emit one committed (or interrupted) turn as `Common` messages. Reasoning
 /// blocks for the turn's `n`-th assistant message are keyed `(turn_idx, n)` in
 /// the private sidecar and spliced back in the same order `from_common` wrote
 /// them.
+#[allow(clippy::too_many_arguments)]
 fn emit_turn(
     turn: &Value,
     ts: DateTime<Utc>,
@@ -178,8 +261,10 @@ fn emit_turn(
     model: Option<&str>,
     reasoning: &HashMap<(u64, u64), Vec<Block>>,
     images: &HashMap<&str, &FxImage>,
+    turn_usage: Option<Usage>,
     out: &mut Vec<Message>,
 ) {
+    let start_idx = out.len();
     // The user prompt opens the turn.
     let user_content = user_blocks(turn.get("user"), images);
     if !user_content.is_empty() {
@@ -219,39 +304,46 @@ fn emit_turn(
             content.push(block);
         }
         push_assistant(content, Some(StopReason::Aborted), out);
-        return;
-    }
+    } else {
+        // Committed turn: intermediate steps, then the concluding text.
+        if let Some(steps) = turn
+            .pointer("/execution/tool_steps")
+            .and_then(Value::as_array)
+        {
+            for step in steps {
+                let mut content = Vec::new();
+                if let Some(text) = nonempty_str(step.get("assistant")) {
+                    content.push(Block::Text { text });
+                }
+                if let Some(calls) = step.get("tool_calls").and_then(Value::as_array) {
+                    content.extend(calls.iter().filter_map(tool_use_block));
+                }
+                push_assistant(content, None, out);
 
-    // Committed turn: intermediate steps, then the concluding text.
-    if let Some(steps) = turn
-        .pointer("/execution/tool_steps")
-        .and_then(Value::as_array)
-    {
-        for step in steps {
-            let mut content = Vec::new();
-            if let Some(text) = nonempty_str(step.get("assistant")) {
-                content.push(Block::Text { text });
-            }
-            if let Some(calls) = step.get("tool_calls").and_then(Value::as_array) {
-                content.extend(calls.iter().filter_map(tool_use_block));
-            }
-            push_assistant(content, None, out);
-
-            if let Some(results) = step.get("tool_results").and_then(Value::as_array) {
-                let blocks: Vec<Block> = results.iter().filter_map(tool_result_block).collect();
-                if !blocks.is_empty() {
-                    out.push(plain(Role::User, blocks, ts));
+                if let Some(results) = step.get("tool_results").and_then(Value::as_array) {
+                    let blocks: Vec<Block> = results.iter().filter_map(tool_result_block).collect();
+                    if !blocks.is_empty() {
+                        out.push(plain(Role::User, blocks, ts));
+                    }
                 }
             }
         }
+
+        let final_text = nonempty_str(turn.get("assistant"));
+        let final_content: Vec<Block> = final_text
+            .map(|text| Block::Text { text })
+            .into_iter()
+            .collect();
+        push_assistant(final_content, Some(StopReason::EndTurn), out);
     }
 
-    let final_text = nonempty_str(turn.get("assistant"));
-    let final_content: Vec<Block> = final_text
-        .map(|text| Block::Text { text })
-        .into_iter()
-        .collect();
-    push_assistant(final_content, Some(StopReason::EndTurn), out);
+    if let Some(usage) = turn_usage
+        && let Some(last_asst) = out[start_idx..]
+            .iter_mut()
+            .rfind(|m| m.role == Role::Assistant)
+    {
+        last_asst.usage = Some(usage);
+    }
 }
 
 fn user_blocks(user: Option<&Value>, images: &HashMap<&str, &FxImage>) -> Vec<Block> {
@@ -522,7 +614,7 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> FxSession {
         reasoning: Vec::new(),
         tool_names: HashMap::new(),
     };
-    let mut turn_payloads: Vec<(i64, Value)> = Vec::new();
+    let mut turn_payloads: Vec<(i64, Value, u64, u64)> = Vec::new();
     let mut i = 0;
     let mut turn_idx: u64 = 0;
     while i < messages.len() {
@@ -540,11 +632,19 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> FxSession {
             i += 1;
         }
         let body = &messages[body_start..i];
+        let mut turn_input = 0u64;
+        let mut turn_output = 0u64;
+        for msg in body {
+            if let Some(u) = msg.usage {
+                turn_input = turn_input.saturating_add(u.input_tokens);
+                turn_output = turn_output.saturating_add(u.output_tokens);
+            }
+        }
         let ts = prompt
             .or_else(|| body.first())
             .map_or(meta.timestamp, |m| m.timestamp);
         let payload = builder.build_turn(turn_idx, prompt, body);
-        turn_payloads.push((ts.timestamp_millis(), payload));
+        turn_payloads.push((ts.timestamp_millis(), payload, turn_input, turn_output));
         turn_idx += 1;
     }
 
@@ -553,7 +653,7 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> FxSession {
     let mut events: Vec<Value> = Vec::new();
     events.push(session_started(&session_id, &generation, created_ms, meta));
     let mut last_ts = created_ms;
-    for (idx, (ts_ms, turn)) in turn_payloads.into_iter().enumerate() {
+    for (idx, (ts_ms, turn, turn_input, turn_output)) in turn_payloads.into_iter().enumerate() {
         last_ts = ts_ms;
         let seq = u64::try_from(idx).unwrap_or(0) + 2;
         events.push(json!({
@@ -565,11 +665,28 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> FxSession {
             "kind": "history_turn_committed",
             "payload": {
                 "conversation_language": "und",
-                "total_input_tokens": 0,
-                "total_output_tokens": 0,
+                "total_input_tokens": turn_input,
+                "total_output_tokens": turn_output,
                 "turn": turn,
             },
         }));
+    }
+
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_read: Option<u64> = None;
+    let mut total_cache_write: Option<u64> = None;
+    for m in messages {
+        if let Some(u) = m.usage {
+            total_input = total_input.saturating_add(u.input_tokens);
+            total_output = total_output.saturating_add(u.output_tokens);
+            if let Some(r) = u.cache_read_input_tokens {
+                total_cache_read = Some(total_cache_read.unwrap_or(0).saturating_add(r));
+            }
+            if let Some(w) = u.cache_creation_input_tokens {
+                total_cache_write = Some(total_cache_write.unwrap_or(0).saturating_add(w));
+            }
+        }
     }
 
     assemble_body(
@@ -579,6 +696,10 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> FxSession {
         &authority_id,
         created_ms,
         last_ts,
+        total_input,
+        total_output,
+        total_cache_read,
+        total_cache_write,
         events,
         builder,
     )
@@ -594,6 +715,10 @@ fn assemble_body(
     authority_id: &str,
     created_ms: i64,
     last_ts: i64,
+    total_input: u64,
+    total_output: u64,
+    total_cache_read: Option<u64>,
+    total_cache_write: Option<u64>,
     events: Vec<Value>,
     builder: TurnBuilder,
 ) -> FxSession {
@@ -619,8 +744,8 @@ fn assemble_body(
         "workspace_root": meta.cwd.clone().unwrap_or_default(),
         "conversation_language": "und",
         "history_len": events.len().saturating_sub(1),
-        "total_input_tokens": 0,
-        "total_output_tokens": 0,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
         "last_event_seq": last_seq,
         "event_log_bytes": event_log_bytes,
         "generation_base_seq": 1,
@@ -652,13 +777,42 @@ fn assemble_body(
     let reasoning =
         (!builder.reasoning.is_empty()).then(|| json!({ "entries": builder.reasoning }));
 
+    let usage = if total_input > 0
+        || total_output > 0
+        || total_cache_read.unwrap_or(0) > 0
+        || total_cache_write.unwrap_or(0) > 0
+    {
+        Some(json!({
+            "billing": "complete",
+            "api_duration_complete": true,
+            "wall_duration_complete": true,
+            "code_complete": true,
+            "next_sequence": 1,
+            "settled_through_sequence": 0,
+            "api_duration_ms": 0,
+            "wall_duration_ms": 0,
+            "total_cost": 0,
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "cache_read_tokens": total_cache_read.unwrap_or(0),
+            "cache_write_tokens": total_cache_write.unwrap_or(0),
+            "billable_web_search_calls": 0,
+            "lines_added": 0,
+            "lines_removed": 0,
+            "models": [],
+            "pending": [],
+        }))
+    } else {
+        None
+    };
+
     FxSession {
         events,
         session: Some(session),
         authority: Some(authority),
         commit: Some(commit),
         display: Some(display),
-        usage: None,
+        usage,
         checkpoint: None,
         images: builder.images,
         reasoning,

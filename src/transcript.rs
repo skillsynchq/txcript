@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{Message, Meta};
+use crate::common::{Message, Meta, Usage};
 use crate::error::Result;
 
 /// A transcript in some representation `H`.
@@ -134,6 +134,23 @@ impl CropError {
 }
 
 impl Transcript<Common> {
+    /// Aggregate token usage reported across all turns in this transcript.
+    ///
+    /// Returns `None` when no message in the body records usage.
+    #[must_use]
+    pub fn total_usage(&self) -> Option<Usage> {
+        let mut total: Option<Usage> = None;
+        for msg in &self.body {
+            if let Some(turn_usage) = msg.usage {
+                total = match total {
+                    Some(acc) => Some(acc + turn_usage),
+                    None => Some(turn_usage),
+                };
+            }
+        }
+        total
+    }
+
     /// Resolve a [`Span`] to its messages, borrowing from this transcript.
     /// `None` when the span reaches past the end of the session.
     #[must_use]
