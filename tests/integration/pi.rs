@@ -345,3 +345,25 @@ fn custom_and_mcp_tool_names_preserve_exact_casing() {
         }
     }
 }
+
+#[test]
+fn pi_preserves_stop_reasons_roundtrip() {
+    for stop_reason in [
+        common::StopReason::EndTurn,
+        common::StopReason::ToolUse,
+        common::StopReason::MaxTokens,
+        common::StopReason::Aborted,
+        common::StopReason::Error,
+    ] {
+        let mut common = sample_common();
+        let last_idx = common.body.len() - 1;
+        common.body[last_idx].stop_reason = Some(stop_reason.clone());
+        let native = pi::Pi::from_common(&common).unwrap();
+        let back = pi::Pi::to_common(&native).unwrap();
+        assert_eq!(
+            back.body[last_idx].stop_reason,
+            Some(stop_reason),
+            "Pi roundtrip should preserve stop_reason"
+        );
+    }
+}
