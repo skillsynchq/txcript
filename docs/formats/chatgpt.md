@@ -36,8 +36,12 @@ included in errors or debug output.
 
 The current read path is:
 
-1. Paginate `GET /backend-api/conversations` with `offset`, `limit=100`, and
-   `order=updated` after the caller explicitly selects `--from chatgpt`.
+1. Paginate `GET /backend-api/conversations` with `offset`, `limit=100`,
+   `order=updated`, and `is_archived` after the caller explicitly selects
+   `--from chatgpt`. The active (`is_archived=false`) and archived
+   (`is_archived=true`) lists are two disjoint pages of the same account —
+   mirroring the sidebar and the Settings -> Archived Chats panel — so
+   discovery pages through both and merges the results.
 2. Load one conversation with `GET /backend-api/conversation/{id}`.
 
 An exact UUID can skip the list entirely:

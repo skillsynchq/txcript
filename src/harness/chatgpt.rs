@@ -590,31 +590,13 @@ mod remote {
             response_json(&response)
         }
 
-        #[cfg(test)]
-        fn for_test(access_token: &str, base_url: String) -> Result<Self> {
-            Self::build(
-                Credentials {
-                    access_token: access_token.to_string(),
-                    account_id: "account-test".to_string(),
-                },
-                base_url,
-            )
-        }
-    }
-
-    impl Store for ChatGptStore {
-        type H = ChatGpt;
-        type Ref = ChatGptRef;
-
-        fn discover(&self) -> Result<Vec<Discovered<Self::Ref>>> {
-            eprintln!(
-                "warning: ChatGPT discovery enumerates the selected account through an undocumented private chatgpt.com endpoint that OpenAI can observe or restrict"
-            );
+        /// One archived state's full paginated conversation list.
+        fn list_conversations(&self, is_archived: bool) -> Result<Vec<Discovered<ChatGptRef>>> {
             let mut out = Vec::new();
             let mut offset = 0;
             loop {
                 let path = format!(
-                    "/backend-api/conversations?offset={offset}&limit={PAGE_SIZE}&order=updated"
+                    "/backend-api/conversations?offset={offset}&limit={PAGE_SIZE}&order=updated&is_archived={is_archived}"
                 );
                 let value = self.get_json(&path)?;
                 let rows = value
@@ -664,6 +646,36 @@ mod remote {
                 }
                 offset += rows.len();
             }
+            Ok(out)
+        }
+
+        #[cfg(test)]
+        fn for_test(access_token: &str, base_url: String) -> Result<Self> {
+            Self::build(
+                Credentials {
+                    access_token: access_token.to_string(),
+                    account_id: "account-test".to_string(),
+                },
+                base_url,
+            )
+        }
+    }
+
+    impl Store for ChatGptStore {
+        type H = ChatGpt;
+        type Ref = ChatGptRef;
+
+        fn discover(&self) -> Result<Vec<Discovered<Self::Ref>>> {
+            eprintln!(
+                "warning: ChatGPT discovery enumerates the selected account through an undocumented private chatgpt.com endpoint that OpenAI can observe or restrict"
+            );
+            // The active list and the archived list are two disjoint pages
+            // of the same account: chatgpt.com's own sidebar and its
+            // Settings -> Archived Chats panel query this endpoint with
+            // `is_archived` set to `false` and `true` respectively. Neither
+            // call alone enumerates the account.
+            let mut out = self.list_conversations(false)?;
+            out.extend(self.list_conversations(true)?);
             Ok(out)
         }
 
@@ -1054,6 +1066,7 @@ mod remote {
             let server = thread::spawn(move || {
                 for response in [
                     json!({"items":[{"id":"11111111-1111-4111-8111-111111111111","title":"one","create_time":1,"update_time":2}]}),
+                    json!({"items":[]}),
                     json!({
                         "conversation_id":"11111111-1111-4111-8111-111111111111",
                         "title":"one",
@@ -1098,6 +1111,57 @@ mod remote {
                     .to_ascii_lowercase()
                     .contains("chatgpt-account-id: account-test")
             }));
+        }
+
+        #[test]
+        fn discover_includes_archived_conversations() {
+            let listener =
+                TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|error| panic!("{error}"));
+            let address = listener
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let server_seen = Arc::clone(&seen);
+            let server = thread::spawn(move || {
+                for response in [
+                    json!({"items":[{"id":"11111111-1111-4111-8111-111111111111","title":"active","create_time":1,"update_time":2}]}),
+                    json!({"items":[{"id":"22222222-2222-4222-8222-222222222222","title":"archived","create_time":1,"update_time":2}]}),
+                ] {
+                    let (mut stream, _) =
+                        listener.accept().unwrap_or_else(|error| panic!("{error}"));
+                    let mut bytes = [0_u8; 8192];
+                    let count = stream
+                        .read(&mut bytes)
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    server_seen
+                        .lock()
+                        .unwrap_or_else(|error| panic!("{error}"))
+                        .push(String::from_utf8_lossy(&bytes[..count]).into_owned());
+                    let body = response.to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                        .unwrap_or_else(|error| panic!("{error}"));
+                }
+            });
+            let store = ChatGptStore::for_test("test-token", format!("http://{address}"))
+                .unwrap_or_else(|error| panic!("{error}"));
+            let found = Store::discover(&store).unwrap_or_else(|error| panic!("{error}"));
+            server.join().unwrap_or_else(|_| panic!("server panicked"));
+
+            let ids: Vec<&str> = found
+                .iter()
+                .map(|d| d.reference.conversation_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    "11111111-1111-4111-8111-111111111111",
+                    "22222222-2222-4222-8222-222222222222",
+                ]
+            );
+
+            let requests = seen.lock().unwrap_or_else(|error| panic!("{error}"));
+            assert!(requests[0].contains("is_archived=false"));
+            assert!(requests[1].contains("is_archived=true"));
         }
     }
 }
