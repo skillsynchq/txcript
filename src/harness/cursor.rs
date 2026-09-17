@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::common::{Block, EditOp, ImageSource, Message, Meta, Role, Tool, ToolOutput};
+use crate::common::{
+    Block, EditOp, ImageSource, Message, Meta, Role, Tool, ToolOutput, sanitize_tool_id,
+};
 use crate::error::{Error, Result};
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
 
@@ -1307,7 +1309,7 @@ fn parse_assistant_block(
             let input = v.get("args").cloned().unwrap_or(Value::Object(Map::new()));
             let id = v.get("toolCallId").and_then(Value::as_str).map_or_else(
                 || tool_use_id(session_id, message_idx, block_idx, name),
-                String::from,
+                sanitize_tool_id,
             );
             Some(Block::ToolUse {
                 id,
@@ -1327,7 +1329,7 @@ fn parse_tool_content(obj: &Value) -> Vec<Block> {
             // Only tool-result entries carry output.
             .filter(|v| v.get("type").and_then(Value::as_str) == Some("tool-result"))
             .filter_map(|v| {
-                let tool_use_id = v.get("toolCallId")?.as_str()?.to_string();
+                let tool_use_id = sanitize_tool_id(v.get("toolCallId")?.as_str()?);
                 let content = match v.get("result") {
                     Some(Value::String(s)) => ToolOutput::Text(s.clone()),
                     Some(other) => ToolOutput::Json(other.clone()),
