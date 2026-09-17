@@ -269,6 +269,20 @@ pub enum SessionCommand {
         /// Only sessions recorded in or under this working directory
         #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         cwd: Option<PathBuf>,
+        /// Only sessions on this git branch (exact match)
+        #[arg(long, value_name = "BRANCH")]
+        git_branch: Option<String>,
+        /// Only sessions that used this model (case-insensitive substring)
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Only sessions started at or after this time (RFC3339 or
+        /// YYYY-MM-DD, a bare date meaning that local midnight)
+        #[arg(long, value_name = "WHEN", value_parser = parse_since)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Only sessions started at or before this time (RFC3339 or
+        /// YYYY-MM-DD, a bare date meaning the end of that local day)
+        #[arg(long, value_name = "WHEN", value_parser = parse_until)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
     },
 }
 
@@ -402,7 +416,21 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             with,
             from,
             cwd,
-        } => query::cmd_query(pattern, with, from, cwd.as_deref(), cache),
+            git_branch,
+            model,
+            since,
+            until,
+        } => query::cmd_query(
+            pattern,
+            with,
+            from,
+            cwd.as_deref(),
+            git_branch.as_deref(),
+            model.as_deref(),
+            since,
+            until,
+            cache,
+        ),
     }
 }
 
@@ -2157,12 +2185,17 @@ mod query {
 
     /// Build the same filtered index used by the CLI for the MCP search tool.
     #[cfg(feature = "mcp")]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn index_for(
         from: Option<HarnessId>,
         cwd: Option<&Path>,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<Index, String> {
-        build_index(from, cwd, cache).map(|(index, _)| index)
+        build_index(from, cwd, git_branch, model, since, until, cache).map(|(index, _)| index)
     }
 
     /// The query behind `txcript query` and the MCP search tool: the pattern
@@ -2175,14 +2208,19 @@ mod query {
         q
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn cmd_query(
         pattern: Option<String>,
         with: Option<HarnessId>,
         from: Option<HarnessId>,
         cwd: Option<&Path>,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<std::process::ExitCode, String> {
-        let (index, sessions) = build_index(from, cwd, cache)?;
+        let (index, sessions) = build_index(from, cwd, git_branch, model, since, until, cache)?;
         match pattern {
             Some(pattern) => {
                 if with.is_some() {
@@ -2213,7 +2251,9 @@ mod query {
     }
 
     /// Build the search index and session lookup over every local session
-    /// passing the `from`/`cwd` filters.
+    /// passing the `from`/`cwd` filters, and applying the optional
+    /// `git_branch`, `model`, `since`, and `until` metadata filters so that
+    /// only matching sessions are indexed and returned.
     ///
     /// Sessions parse and extract on every core: workers pull the next
     /// undrained session, parse it, extract its searchable lines, and send
@@ -2230,9 +2270,14 @@ mod query {
     /// # Errors
     /// Returns an error when an explicitly selected live store cannot be
     /// discovered or read.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn build_index(
         from: Option<HarnessId>,
         cwd: Option<&Path>,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<(Index, Sessions), String> {
         let found = super::discover_with_spinner(from)?;
@@ -2251,10 +2296,38 @@ mod query {
         } else {
             HashSet::new()
         };
-        let scoped: Vec<local::Session> = found
-            .into_iter()
-            .filter(|session| super::selected(session, from, cwd))
-            .collect();
+        let scoped: Vec<local::Session> =
+            found
+                .into_iter()
+                .filter(|session| {
+                    if !super::selected(session, from, cwd) {
+                        return false;
+                    }
+                    if let Some(branch) = git_branch
+                        && session.meta.git_branch.as_deref() != Some(branch)
+                    {
+                        return false;
+                    }
+                    if let Some(model_filter) = model
+                        && !session.meta.model.as_deref().is_some_and(|m| {
+                            m.to_lowercase().contains(&model_filter.to_lowercase())
+                        })
+                    {
+                        return false;
+                    }
+                    if let Some(since) = since
+                        && session.meta.timestamp < since
+                    {
+                        return false;
+                    }
+                    if let Some(until) = until
+                        && session.meta.timestamp > until
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
         let total = scoped.len();
 
         // Cursors for the cache check. Empty cursors never hit, so a session
