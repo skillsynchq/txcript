@@ -548,3 +548,376 @@ fn pending_tool_call_yields_no_result_message() {
         }]
     );
 }
+
+#[test]
+fn edit_tool_with_replace_all_survives_fixpoint() {
+    let mut common = fixpoint_common();
+    let t_user = ts("2026-08-17T06:30:47.800Z");
+    let t_tool = ts("2026-08-17T06:30:49.000Z");
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::Text {
+            text: "replace in file".into(),
+        }],
+        timestamp: t_user,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-edit-replace-all".into(),
+            tool: common::Tool::Edit {
+                file_path: "/repo/src/lib.rs".into(),
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: true,
+            },
+        }],
+        timestamp: t_tool,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-edit-replace-all".into(),
+            content: common::ToolOutput::Text("ok".into()),
+            is_error: false,
+        }],
+        timestamp: t_tool,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    let native = CursorDesktop::from_common(&common).unwrap();
+    let back = CursorDesktop::to_common(&native).unwrap();
+    assert_eq!(back.body, common.body);
+}
+
+#[test]
+fn edit_and_write_tools_normalize_and_denormalize_losslessly() {
+    let mut common = fixpoint_common();
+    let t_user = ts("2026-08-17T06:30:47.800Z");
+    let t_tool1 = ts("2026-08-17T06:30:49.000Z");
+    let t_tool2 = ts("2026-08-17T06:30:50.000Z");
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::Text {
+            text: "apply edits and writes".into(),
+        }],
+        timestamp: t_user,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-edit".into(),
+            tool: common::Tool::Edit {
+                file_path: "/repo/src/lib.rs".into(),
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            },
+        }],
+        timestamp: t_tool1,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-edit".into(),
+            content: common::ToolOutput::Text("applied".into()),
+            is_error: false,
+        }],
+        timestamp: t_tool1,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-write".into(),
+            tool: common::Tool::Write {
+                file_path: "/repo/src/main.rs".into(),
+                content: "fn main() {}".into(),
+            },
+        }],
+        timestamp: t_tool2,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-write".into(),
+            content: common::ToolOutput::Text("written".into()),
+            is_error: false,
+        }],
+        timestamp: t_tool2,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    let native = CursorDesktop::from_common(&common).unwrap();
+    let back = CursorDesktop::to_common(&native).unwrap();
+    assert_eq!(back.body, common.body);
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn store_resolves_workspace_id_with_percent_encoding_and_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CursorDesktopStore::new(dir.path());
+    let ws_root = dir.path().join("workspaceStorage");
+
+    #[cfg(not(windows))]
+    let test_cwd = "/Users/me/My Project";
+    #[cfg(windows)]
+    let test_cwd = r"C:\Users\me\My Project";
+
+    // Workspace with spaces (%20)
+    let ws_space = ws_root.join("ws-space");
+    std::fs::create_dir_all(&ws_space).unwrap();
+    #[cfg(not(windows))]
+    let ws_folder = "file:///Users/me/My%20Project";
+    #[cfg(windows)]
+    let ws_folder = "file:///c%3A/Users/me/My%20Project";
+    std::fs::write(
+        ws_space.join("workspace.json"),
+        json!({"folder": ws_folder}).to_string(),
+    )
+    .unwrap();
+
+    let mut t = sample_transcript();
+    t.body.workspace_id = None;
+    t.meta.id = "22222222-2222-4222-8222-222222222222".into();
+    t.meta.cwd = Some(test_cwd.into());
+    let saved = store.save(&t).unwrap();
+    let loaded = store.load(&saved.reference).unwrap();
+    assert_eq!(loaded.body.workspace_id.as_deref(), Some("ws-space"));
+
+    // Negative test: POSIX relative 'repo' does NOT match absolute '/repo'
+    let ws_posix = ws_root.join("ws-posix");
+    std::fs::create_dir_all(&ws_posix).unwrap();
+    std::fs::write(
+        ws_posix.join("workspace.json"),
+        json!({"folder": "file:///repo"}).to_string(),
+    )
+    .unwrap();
+
+    let mut t_rel = sample_transcript();
+    t_rel.body.workspace_id = None;
+    t_rel.meta.id = "33333333-3333-4333-8333-333333333333".into();
+    t_rel.meta.cwd = Some("repo".into());
+    let saved_rel = store.save(&t_rel).unwrap();
+    let loaded_rel = store.load(&saved_rel.reference).unwrap();
+    assert_ne!(loaded_rel.body.workspace_id.as_deref(), Some("ws-posix"));
+}
+
+#[test]
+fn cursor_native_edit_with_extra_fields_survives_conversion_and_has_no_invalid_tool_id() {
+    let mut t = sample_transcript();
+    let native_params = json!({
+        "targetFile": "/repo/src/main.rs",
+        "oldString": "fn old() {}",
+        "newString": "fn new() {}",
+        "relativeWorkspacePath": "src/main.rs",
+        "contentsAfterEdit": "fn new() {}\n"
+    });
+    let edit_bubble = json!({
+        "_v": 3, "type": 2, "bubbleId": "b-edit-native",
+        "createdAt": "2026-08-17T06:30:52.000Z",
+        "tokenCount": {"inputTokens": 0, "outputTokens": 0},
+        "toolFormerData": {
+            "name": "edit_file_v2", "toolCallId": "call-edit-native",
+            "status": "completed", "rawArgs": "",
+            "params": native_params.to_string(),
+            "result": "applied",
+        },
+    });
+    // Add header entry and bubble
+    let mut composer_data: Value =
+        serde_json::from_str(t.body.composer_data.as_ref().unwrap()).unwrap();
+    composer_data["fullConversationHeadersOnly"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"bubbleId": "b-edit-native", "type": 2}));
+    t.body.composer_data = Some(composer_data.to_string());
+    t.body.bubbles.push(DesktopRow {
+        key: bubble_key("b-edit-native"),
+        value: edit_bubble.to_string(),
+    });
+
+    let common = CursorDesktop::to_common(&t).unwrap();
+
+    // Verify it was preserved as Tool::Raw with all fields intact
+    let edit_msg = common
+        .body
+        .iter()
+        .find(|m| {
+            m.content.iter().any(|b| match b {
+                common::Block::ToolUse { id, .. } => id == "call-edit-native",
+                _ => false,
+            })
+        })
+        .unwrap();
+
+    match &edit_msg.content[0] {
+        common::Block::ToolUse { id, tool } => {
+            assert_eq!(id, "call-edit-native");
+            match tool {
+                common::Tool::Raw { tool_name, input } => {
+                    assert_eq!(tool_name, "edit_file_v2");
+                    assert_eq!(input["relativeWorkspacePath"], "src/main.rs");
+                    assert_eq!(input["contentsAfterEdit"], "fn new() {}\n");
+                    assert_eq!(input["targetFile"], "/repo/src/main.rs");
+                    assert_eq!(input["oldString"], "fn old() {}");
+                    assert_eq!(input["newString"], "fn new() {}");
+                }
+                other => panic!("expected Tool::Raw to preserve extra edit fields, got {other:?}"),
+            }
+        }
+        other => panic!("expected ToolUse, got {other:?}"),
+    }
+
+    // Export back to Cursor Desktop
+    let exported = CursorDesktop::from_common(&common).unwrap();
+    let exported_row = exported
+        .body
+        .bubbles
+        .iter()
+        .find(|row| {
+            let val: Value = serde_json::from_str(&row.value).unwrap_or(Value::Null);
+            val.pointer("/toolFormerData/toolCallId") == Some(&json!("call-edit-native"))
+        })
+        .unwrap();
+    let exported_bubble: Value = serde_json::from_str(&exported_row.value).unwrap();
+    let tool_data = &exported_bubble["toolFormerData"];
+    assert_eq!(tool_data["name"], "edit_file_v2");
+    // Verify tool ID is NOT 44 (List MCP Resources) or 43 (Create Plan)
+    assert_ne!(tool_data.get("tool"), Some(&json!(44)));
+    assert_ne!(tool_data.get("tool"), Some(&json!(43)));
+    let exported_params: Value =
+        serde_json::from_str(tool_data["params"].as_str().unwrap()).unwrap();
+    assert_eq!(exported_params["relativeWorkspacePath"], "src/main.rs");
+    assert_eq!(exported_params["contentsAfterEdit"], "fn new() {}\n");
+}
+
+#[test]
+fn exported_tool_ids_match_cursor_definitions() {
+    let mut common = fixpoint_common();
+    let t = ts("2026-08-17T06:30:52.000Z");
+
+    // Add Read tool (id: 40)
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-read-def".into(),
+            tool: common::Tool::Read {
+                file_path: "/repo/f.rs".into(),
+                offset: None,
+                limit: Some(10),
+            },
+        }],
+        timestamp: t,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    // Add Bash tool (id: 15)
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-bash-def".into(),
+            tool: common::Tool::Bash {
+                command: "ls".into(),
+                workdir: None,
+                timeout_ms: None,
+                description: None,
+                run_in_background: false,
+            },
+        }],
+        timestamp: t,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    // Add Edit tool (must NOT be 44)
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-edit-def".into(),
+            tool: common::Tool::Edit {
+                file_path: "/repo/f.rs".into(),
+                old_string: "a".into(),
+                new_string: "b".into(),
+                replace_all: false,
+            },
+        }],
+        timestamp: t,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    // Add Write tool (must NOT be 43)
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-write-def".into(),
+            tool: common::Tool::Write {
+                file_path: "/repo/f.rs".into(),
+                content: "data".into(),
+            },
+        }],
+        timestamp: t,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+
+    let exported = CursorDesktop::from_common(&common).unwrap();
+    let find_call = |call_id: &str| -> Value {
+        exported
+            .body
+            .bubbles
+            .iter()
+            .find_map(|row| {
+                let bubble: Value = serde_json::from_str(&row.value).ok()?;
+                let tool_data = bubble.get("toolFormerData")?.clone();
+                if tool_data.get("toolCallId")?.as_str()? == call_id {
+                    Some(tool_data)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    };
+
+    let read_call = find_call("call-read-def");
+    assert_eq!(read_call["tool"], 40);
+
+    let bash_call = find_call("call-bash-def");
+    assert_eq!(bash_call["tool"], 15);
+
+    let edit_call = find_call("call-edit-def");
+    assert_ne!(edit_call.get("tool"), Some(&json!(44)));
+    assert_eq!(edit_call.get("tool"), None);
+
+    let write_call = find_call("call-write-def");
+    assert_ne!(write_call.get("tool"), Some(&json!(43)));
+    assert_eq!(write_call.get("tool"), None);
+}

@@ -476,6 +476,54 @@ fn normalize_tool(name: &str, params: Value) -> Tool {
             }
             Tool::from_canonical("Read", Value::Object(input))
         }
+        "write_file_v2" => {
+            let can_map = if let Value::Object(map) = &params {
+                let allowed = ["targetFile", "contents"];
+                map.keys().all(|k| allowed.contains(&k.as_str()))
+                    && map.contains_key("targetFile")
+                    && map.contains_key("contents")
+            } else {
+                false
+            };
+            if can_map {
+                let mut input = Map::new();
+                if let Some(path) = params.get("targetFile") {
+                    input.insert("file_path".into(), path.clone());
+                }
+                if let Some(contents) = params.get("contents") {
+                    input.insert("content".into(), contents.clone());
+                }
+                Tool::from_canonical("Write", Value::Object(input))
+            } else {
+                Tool::from_canonical(name, params)
+            }
+        }
+        "edit_file_v2" => {
+            let can_map = if let Value::Object(map) = &params {
+                let allowed = ["targetFile", "oldString", "newString"];
+                map.keys().all(|k| allowed.contains(&k.as_str()))
+                    && map.contains_key("targetFile")
+                    && map.contains_key("oldString")
+                    && map.contains_key("newString")
+            } else {
+                false
+            };
+            if can_map {
+                let mut input = Map::new();
+                if let Some(path) = params.get("targetFile") {
+                    input.insert("file_path".into(), path.clone());
+                }
+                if let Some(old) = params.get("oldString") {
+                    input.insert("old_string".into(), old.clone());
+                }
+                if let Some(new) = params.get("newString") {
+                    input.insert("new_string".into(), new.clone());
+                }
+                Tool::from_canonical("Edit", Value::Object(input))
+            } else {
+                Tool::from_canonical(name, params)
+            }
+        }
         _ => Tool::from_canonical(name, params),
     }
 }
@@ -519,6 +567,24 @@ fn denormalize_tool(tool: &Tool) -> (String, Value, Option<u64>) {
                 params.insert("limit".into(), Value::from(*l));
             }
             ("read_file_v2".into(), Value::Object(params), Some(40))
+        }
+        Tool::Write { file_path, content } => {
+            let mut params = Map::new();
+            params.insert("targetFile".into(), Value::from(file_path.clone()));
+            params.insert("contents".into(), Value::from(content.clone()));
+            ("write_file_v2".into(), Value::Object(params), None)
+        }
+        Tool::Edit {
+            file_path,
+            old_string,
+            new_string,
+            replace_all: false,
+        } => {
+            let mut params = Map::new();
+            params.insert("targetFile".into(), Value::from(file_path.clone()));
+            params.insert("oldString".into(), Value::from(old_string.clone()));
+            params.insert("newString".into(), Value::from(new_string.clone()));
+            ("edit_file_v2".into(), Value::Object(params), None)
         }
         other => {
             let (name, input) = other.to_canonical();
@@ -1060,11 +1126,88 @@ impl CursorDesktopStore {
                 continue;
             };
             let folder = ws.get("folder").and_then(Value::as_str).unwrap_or("");
-            if folder.strip_prefix("file://").is_some_and(|p| p == cwd) {
+            if matches_workspace_folder(folder, cwd) {
                 return entry.file_name().to_str().map(str::to_string);
             }
         }
         None
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn matches_workspace_folder(folder: &str, cwd: &str) -> bool {
+    matches_workspace_folder_platform(folder, cwd, cfg!(windows))
+}
+
+#[cfg(feature = "opencode")]
+pub(crate) fn matches_workspace_folder_platform(folder: &str, cwd: &str, is_windows: bool) -> bool {
+    let Some(decoded) = file_uri_to_path(folder) else {
+        return false;
+    };
+    normalize_path(&decoded, is_windows) == normalize_path(cwd, is_windows)
+}
+
+#[cfg(feature = "opencode")]
+fn file_uri_to_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Some(byte) = hex_pair(bytes[i + 1], bytes[i + 2]) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[cfg(feature = "opencode")]
+fn hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    Some(digit(hi)? * 16 + digit(lo)?)
+}
+
+#[cfg(feature = "opencode")]
+fn normalize_path(s: &str, is_windows: bool) -> String {
+    let mut clean = if is_windows {
+        s.replace('\\', "/")
+    } else {
+        s.to_string()
+    };
+    let bytes = clean.as_bytes();
+    if is_windows
+        && bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && bytes.get(3).is_none_or(|b| *b == b'/')
+    {
+        clean.remove(0);
+    }
+    if clean.len() > 1 && clean.ends_with('/') {
+        clean.pop();
+    }
+    if is_windows {
+        clean.to_ascii_lowercase()
+    } else {
+        clean
     }
 }
 
@@ -1631,5 +1774,74 @@ fn sqlite_unavailable() -> Error {
         harness: CursorDesktop::NAME,
         detail: "Cursor desktop store support requires the `opencode` feature for SQLite"
             .to_string(),
+    }
+}
+
+#[cfg(all(test, feature = "opencode"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_matching_platform_rules() {
+        // POSIX spaces in path
+        assert!(matches_workspace_folder_platform(
+            "file:///Users/me/My%20Project",
+            "/Users/me/My Project",
+            false
+        ));
+
+        // POSIX Unicode path
+        assert!(matches_workspace_folder_platform(
+            "file:///home/user/caf%C3%A9",
+            "/home/user/café",
+            false
+        ));
+
+        // Windows drive path with %3A and %20
+        assert!(matches_workspace_folder_platform(
+            "file:///c%3A/Users/me/My%20Project",
+            r"C:\Users\me\My Project",
+            true
+        ));
+
+        // Windows case-insensitivity
+        assert!(matches_workspace_folder_platform(
+            "file:///C:/Users/Me/PROJECT",
+            r"c:\users\me\project",
+            true
+        ));
+
+        // Negative test: POSIX absolute /repo does NOT match relative repo
+        assert!(!matches_workspace_folder_platform(
+            "file:///repo",
+            "repo",
+            false
+        ));
+
+        // Non-file URI does not match
+        assert!(!matches_workspace_folder_platform(
+            "vscode-vfs://remote/repo",
+            "/repo",
+            false
+        ));
+
+        // Invalid percent escapes do not panic and pass through
+        assert!(matches_workspace_folder_platform(
+            "file:///path/%zz/name",
+            "/path/%zz/name",
+            false
+        ));
+
+        // POSIX backslash is preserved and not converted to slash
+        assert!(matches_workspace_folder_platform(
+            "file:///repo/dir\\file",
+            "/repo/dir\\file",
+            false
+        ));
+        assert!(!matches_workspace_folder_platform(
+            "file:///repo/dir/file",
+            "/repo/dir\\file",
+            false
+        ));
     }
 }
