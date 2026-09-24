@@ -9,6 +9,8 @@
 //! The shape of a request is therefore always the same: identify the caller,
 //! gather facts with at most one HEAD, decide, execute.
 
+#[cfg(feature = "cloudflare_access")]
+pub mod access;
 pub mod config;
 pub mod http;
 pub mod store;

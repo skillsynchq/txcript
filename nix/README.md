@@ -13,9 +13,11 @@ API, and why nothing in a Terraform module needs to know how to compile Rust.
 | `cloudflare-access.nix` | `cloudflared` + Access, as a *separate* import |
 
 ```sh
-nix build .#share-server        # the binary
-nix build .#share-server-s3     # with the S3 backend compiled in
-nix build .#container           # OCI image, loadable with `docker load -i`
+nix build .#share-server            # the binary
+nix build .#share-server-s3         # with the S3 backend compiled in
+nix build .#share-server-access     # with Access verification compiled in
+nix build .#share-server-s3-access  # both
+nix build .#container               # OCI image, loadable with `docker load -i`
 ```
 
 ## Why the build toolchain is minimal
@@ -34,9 +36,9 @@ longer build; worth doing if image size starts to matter.
 ## Auth is a separate module on purpose
 
 `module.nix` knows nothing about Cloudflare. `cloudflare-access.nix` sets the
-identity source and runs the tunnel. Switching to OIDC or mTLS means
-importing a different module — the service package is unchanged and is not
-rebuilt.
+identity source, runs the tunnel, and selects the build that can verify an
+Access assertion. Switching to OIDC or mTLS means importing a different
+module — `module.nix` itself is unchanged.
 
 ```nix
 {
@@ -53,6 +55,8 @@ rebuilt.
 
   services.txcript-share.cloudflareAccess = {
     enable = true;
+    team = "example";
+    audFile = config.age.secrets.access-aud.path;
     tunnelCredentialsFile = config.age.secrets.tunnel.path;
   };
 }
@@ -61,6 +65,10 @@ rebuilt.
 Secrets reach the service through systemd `LoadCredential` as **file paths**,
 never environment values, which is what lets sops, agenix, and plain files
 all work without the binary knowing the difference.
+
+The service verifies the Access assertion itself, against the team's JWKS and
+`audFile`. The tunnel is the ingress; it is not what holds identity up, so an
+origin someone reaches another way is not a forgery hole.
 
 ## Machine images
 

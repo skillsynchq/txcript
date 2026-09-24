@@ -135,7 +135,7 @@ segment.
 listen = "127.0.0.1:8787"
 
 [identity]
-kind = "static_tokens"        # or "forwarded_header", behind a proxy
+kind = "static_tokens"        # or "cloudflare_access", or "forwarded_header"
 header = "x-token"
 tokens_file = "/etc/txcript-share/tokens"
 
@@ -163,7 +163,9 @@ publishers no longer need their own. `AWS_REGION` is required.
 On NixOS, `nixosModules.txcript-share` generates the config, runs the unit
 under `DynamicUser` with `ProtectSystem=strict`, and takes secrets through
 systemd credentials. `nixosModules.cloudflare-access` puts a tunnel in front
-as a separate import.
+as a separate import, and points the service at `cloudflare_access`, which
+verifies `Cf-Access-Jwt-Assertion` at the origin — built with
+`--features cloudflare_access` (`nix build .#share-server-access`).
 
 ### 5. Point the client at it
 

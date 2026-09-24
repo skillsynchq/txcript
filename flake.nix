@@ -96,6 +96,23 @@
             features = [ "s3" ];
           };
 
+          # Access verification compiled in, so the origin checks the
+          # assertion itself rather than trusting the tunnel's header. Two
+          # builds because the store is the other axis, and a binary has to
+          # contain whichever pair a deployment actually uses.
+          share-server-access = pkgs.callPackage ./nix/package.nix {
+            inherit rustPlatform;
+            features = [ "cloudflare_access" ];
+          };
+
+          share-server-s3-access = pkgs.callPackage ./nix/package.nix {
+            inherit rustPlatform;
+            features = [
+              "s3"
+              "cloudflare_access"
+            ];
+          };
+
           # An OCI image: the binary's closure, no base image, no distro.
           container = pkgs.callPackage ./nix/container.nix { inherit share-server; };
         };
@@ -120,7 +137,7 @@
       nixosModules = {
         default = import ./nix/module.nix { inherit self; };
         txcript-share = import ./nix/module.nix { inherit self; };
-        cloudflare-access = import ./nix/cloudflare-access.nix;
+        cloudflare-access = import ./nix/cloudflare-access.nix { inherit self; };
       };
     };
 }

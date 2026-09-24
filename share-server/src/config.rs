@@ -49,6 +49,22 @@ pub enum IdentityConfig {
     /// is reachable directly, anyone can set the header and become anyone.
     /// Bind to loopback and put the proxy in front, or use a network policy.
     ForwardedHeader { header: String },
+    /// Verify the Cloudflare Access assertion here, rather than trusting a
+    /// proxy to have done it.
+    ///
+    /// Unlike `forwarded_header`, this does not require the tunnel to be the
+    /// only route in: a request that reaches the origin some other way
+    /// carries no signature this service will accept.
+    #[cfg(feature = "cloudflare_access")]
+    CloudflareAccess {
+        /// The Zero Trust team: the `<team>` of
+        /// `<team>.cloudflareaccess.com`.
+        team: String,
+        /// A file holding the Access application's AUD tag. A path, like
+        /// every other credential here, so the deployment chooses how it is
+        /// delivered.
+        aud_file: PathBuf,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,11 +179,36 @@ impl Config {
 
 impl IdentityConfig {
     /// # Errors
-    /// When a token file cannot be read or contains an unusable principal id.
+    /// When a credential file cannot be read, or holds something unusable —
+    /// a principal id that is not a plain segment, an empty Access AUD.
     pub fn build(&self) -> Result<Box<dyn Identity>, ConfigError> {
         match self {
             IdentityConfig::ForwardedHeader { header } => {
                 Ok(Box::new(ForwardedClientCert::new(header)))
+            }
+            #[cfg(feature = "cloudflare_access")]
+            IdentityConfig::CloudflareAccess { team, aud_file } => {
+                // The team name becomes a hostname, so anything that is not
+                // one is a configuration error rather than a lookup that
+                // fails later against a URL nobody meant to write.
+                if team.is_empty() || !team.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    return Err(ConfigError::Credentials(format!(
+                        "`{team}` is not a Zero Trust team name"
+                    )));
+                }
+                let raw = std::fs::read_to_string(aud_file).map_err(|error| ConfigError::Read {
+                    path: aud_file.clone(),
+                    detail: error.to_string(),
+                })?;
+                let audience = raw.trim();
+                if audience.is_empty() {
+                    return Err(ConfigError::Credentials(
+                        "the Access AUD file is empty".to_string(),
+                    ));
+                }
+                Ok(Box::new(crate::access::CloudflareAccess::new(
+                    team, audience,
+                )))
             }
             IdentityConfig::StaticTokens {
                 header,
@@ -254,6 +295,55 @@ mod tests {
         .expect("parses");
         assert_eq!(config.listen.to_string(), "127.0.0.1:8787");
         assert_eq!(config.limits.max_document_bytes, 10 * 1024 * 1024);
+    }
+
+    #[cfg(feature = "cloudflare_access")]
+    #[test]
+    fn a_cloudflare_access_identity_reads_its_aud_from_a_file() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let aud = directory.path().join("aud");
+        std::fs::write(&aud, "  0123456789abcdef\n").expect("writes");
+
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [identity]
+            kind = "cloudflare_access"
+            team = "example"
+            aud_file = "{}"
+            [store]
+            kind = "memory"
+            [policy]
+            kind = "owner_prefix"
+            "#,
+            aud.display()
+        ))
+        .expect("parses");
+        assert!(config.identity.build().is_ok());
+    }
+
+    #[cfg(feature = "cloudflare_access")]
+    #[test]
+    fn a_team_that_is_not_a_hostname_label_is_refused() {
+        // The team becomes part of the JWKS URL. A value that is not a
+        // label could point verification at somebody else's key set.
+        let identity = IdentityConfig::CloudflareAccess {
+            team: "example.com/evil".to_string(),
+            aud_file: PathBuf::from("/nonexistent"),
+        };
+        assert!(matches!(identity.build(), Err(ConfigError::Credentials(_))));
+    }
+
+    #[cfg(feature = "cloudflare_access")]
+    #[test]
+    fn an_empty_aud_file_is_refused_rather_than_matching_nothing() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let aud = directory.path().join("aud");
+        std::fs::write(&aud, "\n").expect("writes");
+        let identity = IdentityConfig::CloudflareAccess {
+            team: "example".to_string(),
+            aud_file: aud,
+        };
+        assert!(matches!(identity.build(), Err(ConfigError::Credentials(_))));
     }
 
     #[test]

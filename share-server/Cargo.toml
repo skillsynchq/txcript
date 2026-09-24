@@ -12,17 +12,29 @@ txcript-share-core = { path = "../share-core" }
 txcript-share-store = { path = "../share-store" }
 aws-config = { version = "1.8", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 aws-sdk-s3 = { version = "1.123", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+base64 = { version = "0.22.1", optional = true }
+# RS256 verification and the principal digest. Already in the tree under the
+# rustls the `s3` feature pulls; nothing here needs a JWT library on top.
+ring = { version = "0.17.14", optional = true }
+# A blocking client, because `Identity` is synchronous. Bundled roots rather
+# than the system store, so a container without a CA bundle still verifies.
+ureq = { version = "3.4.2", optional = true, default-features = false, features = ["rustls"] }
 axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "0.9.10"
 
-# Off by default so a filesystem deployment does not compile or ship the AWS
-# client tree.
+# Off by default so a deployment does not compile or ship a backend it does
+# not use.
 [features]
 default = []
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "txcript-share-store/s3"]
+# Verify Cloudflare Access assertions at the origin, so the proxy in front
+# stops being load-bearing for identity. Off by default for the same reason
+# `s3` is: a deployment that authenticates some other way should not compile,
+# ship, or audit a TLS client it never calls.
+cloudflare_access = ["dep:base64", "dep:ring", "dep:ureq"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
