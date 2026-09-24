@@ -213,7 +213,9 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Hermes => go::<hermes::Hermes>(text),
         HarnessId::Amp => go::<amp::Amp>(text),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(text),
-        HarnessId::Simple => go::<simple::Simple>(text),
+        // Share is a delegate over Simple, so the text path is literally
+        // the same one: no `share` feature, no second implementation.
+        HarnessId::Simple | HarnessId::Share => go::<simple::Simple>(text),
         HarnessId::Cowork => go::<cowork::Cowork>(text),
     }
 }
@@ -238,7 +240,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Hermes => go::<hermes::Hermes>(common),
         HarnessId::Amp => go::<amp::Amp>(common),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(common),
-        HarnessId::Simple => go::<simple::Simple>(common),
+        HarnessId::Simple | HarnessId::Share => go::<simple::Simple>(common),
         HarnessId::Cowork => go::<cowork::Cowork>(common),
     }
 }

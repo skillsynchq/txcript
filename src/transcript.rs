@@ -461,10 +461,13 @@ pub enum HarnessId {
     Antigravity,
     Simple,
     Cowork,
+    /// Transcripts published to a share service or an object store. Not an
+    /// agent: a place sessions are read from and written to.
+    Share,
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 17] = [
+    pub const ALL: [HarnessId; 18] = [
         HarnessId::ClaudeCode,
         HarnessId::ClaudeChat,
         HarnessId::ChatGpt,
@@ -482,6 +485,7 @@ impl HarnessId {
         HarnessId::Antigravity,
         HarnessId::Simple,
         HarnessId::Cowork,
+        HarnessId::Share,
     ];
 
     /// The stable lowercase name, matching the corresponding [`Harness::NAME`].
@@ -505,6 +509,7 @@ impl HarnessId {
             HarnessId::Antigravity => "antigravity",
             HarnessId::Simple => "simple",
             HarnessId::Cowork => "cowork",
+            HarnessId::Share => "share",
         }
     }
 }
@@ -552,6 +557,7 @@ impl FromStr for HarnessId {
             "cowork" | "claude_cowork" | "claude-cowork" | "claude_desktop" | "claude-desktop" => {
                 Ok(HarnessId::Cowork)
             }
+            "share" | "shared" | "gist" => Ok(HarnessId::Share),
             other => Err(crate::error::Error::UnknownHarness(other.to_string())),
         }
     }
@@ -559,6 +565,27 @@ impl FromStr for HarnessId {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_harness_id_round_trips_through_its_name() {
+        use super::HarnessId;
+        use std::str::FromStr as _;
+        for harness in HarnessId::ALL {
+            assert_eq!(
+                HarnessId::from_str(harness.as_str()).expect("its own name parses"),
+                harness
+            );
+        }
+        // `share` is a place rather than an agent, and reads as one.
+        assert_eq!(
+            HarnessId::from_str("share").expect("parses"),
+            HarnessId::Share
+        );
+        assert_eq!(
+            HarnessId::from_str("gist").expect("parses"),
+            HarnessId::Share
+        );
+    }
+
     use chrono::{DateTime, Utc};
 
     use super::*;

@@ -444,6 +444,104 @@ impl Store for ShareStore {
     }
 }
 
+// --- the configured store ---------------------------------------------
+
+/// Whichever share backing this machine is configured for.
+///
+/// The two paths write the same bucket and are reached the same way, so the
+/// rest of txcript does not care which is in use — only that one is. An
+/// enum rather than a trait object because [`Store`] has associated types.
+pub enum ConfiguredStore {
+    /// Through a share service.
+    Served(ShareStore),
+    /// Straight to an object store, with the bucket policy as the boundary.
+    #[cfg(feature = "share_s3")]
+    Direct(crate::harness::share_s3::DirectStore),
+}
+
+/// The configured share store, or `None` when this machine has none.
+///
+/// Configuring an endpoint is what opts a machine in. Unset means the
+/// feature is not in use, and nothing contacts anything — which is what
+/// keeps `txcript list` on an unconfigured machine exactly as fast, and as
+/// private, as it is today.
+///
+/// `TXCRIPT_SHARE_URL` selects the served path; `TXCRIPT_SHARE_BUCKET`
+/// selects the direct one. Setting both is a configuration error rather
+/// than a silent preference.
+///
+/// # Errors
+/// When both paths are configured, or the selected one is misconfigured.
+pub fn from_env() -> Result<Option<ConfiguredStore>> {
+    let served = std::env::var("TXCRIPT_SHARE_URL").is_ok_and(|value| !value.trim().is_empty());
+    #[cfg(feature = "share_s3")]
+    let direct = std::env::var("TXCRIPT_SHARE_BUCKET").is_ok_and(|value| !value.trim().is_empty());
+    #[cfg(not(feature = "share_s3"))]
+    let direct = false;
+
+    match (served, direct) {
+        (false, false) => Ok(None),
+        (true, true) => Err(remote(
+            "both TXCRIPT_SHARE_URL and TXCRIPT_SHARE_BUCKET are set; unset one to choose a path",
+        )),
+        (true, false) => Ok(Some(ConfiguredStore::Served(ShareStore::from_env()?))),
+        #[cfg(feature = "share_s3")]
+        (false, true) => Ok(Some(ConfiguredStore::Direct(
+            crate::harness::share_s3::DirectStore::from_env()?,
+        ))),
+        #[cfg(not(feature = "share_s3"))]
+        (false, true) => Err(remote(
+            "TXCRIPT_SHARE_BUCKET is set but direct S3 support was not compiled in \
+             (enable the `share_s3` feature)",
+        )),
+    }
+}
+
+impl Store for ConfiguredStore {
+    type H = Share;
+    type Ref = ShareRef;
+
+    fn discover(&self) -> Result<Vec<Discovered<ShareRef>>> {
+        match self {
+            ConfiguredStore::Served(store) => store.discover(),
+            #[cfg(feature = "share_s3")]
+            ConfiguredStore::Direct(store) => store.discover(),
+        }
+    }
+
+    fn load(&self, reference: &ShareRef) -> Result<Transcript<Share>> {
+        match self {
+            ConfiguredStore::Served(store) => store.load(reference),
+            #[cfg(feature = "share_s3")]
+            ConfiguredStore::Direct(store) => store.load(reference),
+        }
+    }
+
+    fn save(&self, transcript: &Transcript<Share>) -> Result<Saved<ShareRef>> {
+        match self {
+            ConfiguredStore::Served(store) => store.save(transcript),
+            #[cfg(feature = "share_s3")]
+            ConfiguredStore::Direct(store) => store.save(transcript),
+        }
+    }
+
+    fn delete(&self, reference: &ShareRef) -> Result<()> {
+        match self {
+            ConfiguredStore::Served(store) => store.delete(reference),
+            #[cfg(feature = "share_s3")]
+            ConfiguredStore::Direct(store) => store.delete(reference),
+        }
+    }
+
+    fn fingerprints(&self, refs: &[ShareRef]) -> Result<HashMap<String, String>> {
+        match self {
+            ConfiguredStore::Served(store) => store.fingerprints(refs),
+            #[cfg(feature = "share_s3")]
+            ConfiguredStore::Direct(store) => store.fingerprints(refs),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +560,24 @@ mod tests {
     fn anonymous_credentials_cannot_write() {
         assert!(!Anonymous.can_write());
         assert!(Anonymous.headers().expect("no failure").is_empty());
+    }
+
+    /// An unconfigured machine has no share store, and reaching that
+    /// conclusion must not require a request.
+    #[test]
+    fn no_configuration_means_no_store_and_no_contact() {
+        // Only meaningful when the ambient environment is genuinely unset;
+        // the repo never mutates env in tests, so skip rather than fight it.
+        if std::env::var_os("TXCRIPT_SHARE_URL").is_some()
+            || std::env::var_os("TXCRIPT_SHARE_BUCKET").is_some()
+        {
+            return;
+        }
+        let found = from_env().expect("an absent configuration is not an error");
+        assert!(
+            found.is_none(),
+            "unset must mean no store, not a default one"
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@ use crate::harness::{
 use crate::harness::chatgpt;
 #[cfg(feature = "claude_chat")]
 use crate::harness::claude_chat;
+#[cfg(feature = "share")]
+use crate::harness::share;
 
 #[cfg(feature = "hermes")]
 use crate::harness::hermes;
@@ -59,6 +61,8 @@ enum Locator {
     ClaudeChatRemote(claude_chat::ClaudeChatRef),
     #[cfg(feature = "chatgpt")]
     ChatGptRemote(chatgpt::ChatGptRef),
+    #[cfg(feature = "share")]
+    Share(share::ShareRef),
     #[cfg(any(feature = "opencode", feature = "hermes"))]
     Id(String),
 }
@@ -98,6 +102,15 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
         claude_code::ClaudeStore::default_root(),
         &mut out,
     );
+    // A share store joins aggregate discovery, unlike the live web
+    // harnesses below: listing what others published is the whole point of
+    // it. Configuring an endpoint is the opt-in, so an unconfigured machine
+    // contacts nobody and `list` stays exactly as fast as before.
+    #[cfg(feature = "share")]
+    {
+        on_store(HarnessId::Share, out.len());
+        let _ = discover_share_into(&mut out);
+    }
     // Live web harnesses are deliberately excluded from aggregate discovery.
     on_store(HarnessId::Codex, out.len());
     scan(
@@ -229,6 +242,20 @@ pub fn discover_harness(harness: HarnessId) -> Result<Vec<Session>> {
                 .to_string(),
         });
     }
+    #[cfg(feature = "share")]
+    if harness == HarnessId::Share {
+        let mut out = Vec::new();
+        discover_share_into(&mut out)?;
+        out.sort_by_key(|session| std::cmp::Reverse(session.meta.timestamp));
+        return Ok(out);
+    }
+    #[cfg(not(feature = "share"))]
+    if harness == HarnessId::Share {
+        return Err(Error::Remote {
+            harness: "share",
+            detail: "share support was not compiled in (enable the `share` feature)".to_string(),
+        });
+    }
     Ok(discover()
         .into_iter()
         .filter(|session| session.harness == harness)
@@ -277,6 +304,28 @@ fn discover_chatgpt_into(out: &mut Vec<Session>) -> Result<()> {
     Ok(())
 }
 
+/// Share sessions, when this machine has a share store configured.
+///
+/// Not `scan`: that helper is bounded `Store<Ref = PathBuf>` and takes
+/// `updated_at` from a file mtime, and a share reference is neither.
+#[cfg(feature = "share")]
+fn discover_share_into(out: &mut Vec<Session>) -> Result<()> {
+    let Some(store) = share::from_env()? else {
+        return Ok(());
+    };
+    for discovered in Store::discover(&store)? {
+        out.push(Session {
+            harness: HarnessId::Share,
+            meta: discovered.meta,
+            // The service reports an ETag, not a time; `Meta::timestamp`
+            // carries when the session started, which is what `list` shows.
+            updated_at: None,
+            locator: Locator::Share(discovered.reference),
+        });
+    }
+    Ok(())
+}
+
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     Some(DateTime::<Utc>::from(modified))
@@ -296,6 +345,8 @@ impl Session {
             Locator::ChatGptRemote(reference) => {
                 format!("https://chatgpt.com/c/{}", reference.conversation_id)
             }
+            #[cfg(feature = "share")]
+            Locator::Share(reference) => format!("share:{}", reference.slug),
             #[cfg(any(feature = "opencode", feature = "hermes"))]
             Locator::Id(id) => format!("{} db session {id}", self.harness),
         }
@@ -327,6 +378,11 @@ impl Session {
             (HarnessId::ChatGpt, Locator::ChatGptRemote(reference)) => {
                 let store = chatgpt::ChatGptStore::from_codex()?;
                 chatgpt::ChatGpt::to_common(&store.load(reference)?)
+            }
+            #[cfg(feature = "share")]
+            (HarnessId::Share, Locator::Share(reference)) => {
+                let store = configured_share()?;
+                share::Share::to_common(&store.load(reference)?)
             }
             (HarnessId::Codex, Locator::Path(p)) => go(codex::CodexStore::default_root(), p),
             (HarnessId::Pi, Locator::Path(p)) => go(pi::PiStore::default_root(), p),
@@ -383,6 +439,8 @@ impl Session {
             (HarnessId::ChatGpt, Locator::ChatGptRemote(reference)) => {
                 chatgpt::ChatGptStore::from_codex()?.delete(reference)
             }
+            #[cfg(feature = "share")]
+            (HarnessId::Share, Locator::Share(reference)) => configured_share()?.delete(reference),
             (HarnessId::Codex, Locator::Path(p)) => go(codex::CodexStore::default_root(), p),
             (HarnessId::Pi, Locator::Path(p)) => go(pi::PiStore::default_root(), p),
             (HarnessId::Campfire, Locator::Path(p)) => {
@@ -472,6 +530,11 @@ pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
             }
             #[cfg(feature = "opencode")]
             HarnessId::OpenCode => group.ids(opencode::OpenCodeStore::default_db()),
+            // Without this arm the fall-through below would leave every
+            // share session with an empty cursor, which never hits the
+            // cache — a silent re-parse on every run rather than an error.
+            #[cfg(feature = "share")]
+            HarnessId::Share => group.share_remote(configured_share()),
             // Not discovered (no store), or compiled out: no cursor.
             _ => {}
         }
@@ -533,6 +596,28 @@ impl Group<'_> {
         }
     }
 
+    #[cfg(feature = "share")]
+    fn share_remote(self, store: Result<share::ConfiguredStore>) {
+        let Ok(store) = store else {
+            return;
+        };
+        let refs: Vec<share::ShareRef> = self
+            .at
+            .iter()
+            .filter_map(|&i| self.sessions[i].share_remote().cloned())
+            .collect();
+        let Ok(by_key) = store.fingerprints(&refs) else {
+            return;
+        };
+        for &i in self.at {
+            if let Some(reference) = self.sessions[i].share_remote()
+                && let Some(cursor) = by_key.get(&reference.key())
+            {
+                self.out[i].clone_from(cursor);
+            }
+        }
+    }
+
     #[cfg(feature = "chatgpt")]
     fn chatgpt_remote(self, store: Result<chatgpt::ChatGptStore>) {
         let refs: Vec<chatgpt::ChatGptRef> = self
@@ -584,6 +669,8 @@ impl Session {
             Locator::ClaudeChatRemote(_) => None,
             #[cfg(feature = "chatgpt")]
             Locator::ChatGptRemote(_) => None,
+            #[cfg(feature = "share")]
+            Locator::Share(_) => None,
             #[cfg(any(feature = "opencode", feature = "hermes"))]
             Locator::Id(_) => None,
         }
@@ -594,6 +681,22 @@ impl Session {
         match &self.locator {
             Locator::ClaudeChatRemote(reference) => Some(reference),
             Locator::Path(_) => None,
+            #[cfg(feature = "chatgpt")]
+            Locator::ChatGptRemote(_) => None,
+            #[cfg(feature = "share")]
+            Locator::Share(_) => None,
+            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            Locator::Id(_) => None,
+        }
+    }
+
+    #[cfg(feature = "share")]
+    fn share_remote(&self) -> Option<&share::ShareRef> {
+        match &self.locator {
+            Locator::Share(reference) => Some(reference),
+            Locator::Path(_) => None,
+            #[cfg(feature = "claude_chat")]
+            Locator::ClaudeChatRemote(_) => None,
             #[cfg(feature = "chatgpt")]
             Locator::ChatGptRemote(_) => None,
             #[cfg(any(feature = "opencode", feature = "hermes"))]
@@ -608,6 +711,8 @@ impl Session {
             Locator::Path(_) => None,
             #[cfg(feature = "claude_chat")]
             Locator::ClaudeChatRemote(_) => None,
+            #[cfg(feature = "share")]
+            Locator::Share(_) => None,
             #[cfg(any(feature = "opencode", feature = "hermes"))]
             Locator::Id(_) => None,
         }
@@ -619,6 +724,8 @@ impl Session {
         match &self.locator {
             Locator::Id(id) => Some(id),
             Locator::Path(_) => None,
+            #[cfg(feature = "share")]
+            Locator::Share(_) => None,
             #[cfg(feature = "claude_chat")]
             Locator::ClaudeChatRemote(_) => None,
             #[cfg(feature = "chatgpt")]
@@ -709,6 +816,23 @@ pub fn write_with(
         // Live web sources are server-authoritative and have no import. Their
         // additional in-place-resume refusals live in the CLI because that
         // path deliberately bypasses `write` for existing sessions.
+        // Publishing. Unlike the live web sources below, a share store is a
+        // real write target — that is what it is for.
+        #[cfg(feature = "share")]
+        HarnessId::Share => {
+            let store = configured_share()?;
+            let native = <share::Share as Codec>::from_common(common)?;
+            let saved = store.save(&native)?;
+            Ok(Written {
+                id: saved.id,
+                location: format!("share:{}", saved.reference.slug),
+            })
+        }
+        #[cfg(not(feature = "share"))]
+        HarnessId::Share => Err(Error::Unconvertible {
+            harness: "share",
+            detail: "share support was not compiled in (enable the `share` feature)".to_string(),
+        }),
         HarnessId::ClaudeChat => Err(Error::Unconvertible {
             harness: "claude_chat",
             detail: "Claude Chat is a live read-only source; sessions can be pulled out and converted into another harness, but never continued into Claude"
@@ -1002,7 +1126,9 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
         match harness {
             HarnessId::ClaudeCode => ("claude".into(), vec!["--resume".into(), id]),
             // Source-only harnesses: the CLI refuses before this fallback.
-            HarnessId::ClaudeChat | HarnessId::ChatGpt | HarnessId::Simple => {
+            // Source-only harnesses, and `share`, which is a place rather
+            // than an agent: there is nothing to launch.
+            HarnessId::ClaudeChat | HarnessId::ChatGpt | HarnessId::Simple | HarnessId::Share => {
                 ("txcript".into(), Vec::new())
             }
             HarnessId::Codex => ("codex".into(), vec!["resume".into(), id]),
@@ -1044,6 +1170,16 @@ fn apply_resume_template(template: &str, id: &str) -> Option<(String, Vec<String
         .collect::<Vec<_>>()
         .into_iter();
     parts.next().map(|bin| (bin, parts.collect()))
+}
+
+/// The configured share store, or an error naming what to set.
+#[cfg(feature = "share")]
+fn configured_share() -> Result<share::ConfiguredStore> {
+    share::from_env()?.ok_or_else(|| Error::Remote {
+        harness: "share",
+        detail: "no share store is configured (set TXCRIPT_SHARE_URL or TXCRIPT_SHARE_BUCKET)"
+            .to_string(),
+    })
 }
 
 fn required<S>(store: Option<S>) -> Result<S> {
@@ -1115,6 +1251,16 @@ mod resume_template_tests {
             .unwrap_or_else(|| panic!("template expands"));
         assert_eq!(bin, "agent");
         assert_eq!(args, vec!["--resume=a b c".to_string()]);
+    }
+
+    #[test]
+    fn a_share_store_has_no_agent_to_resume_into() {
+        // It is a place transcripts live, not something that runs. The CLI
+        // refuses before this fallback; the fallback must not invent a
+        // command anyway.
+        let (program, args) = super::resume_command(super::HarnessId::Share, "alice/sess-1");
+        assert_eq!(program, "txcript");
+        assert!(args.is_empty());
     }
 
     #[test]

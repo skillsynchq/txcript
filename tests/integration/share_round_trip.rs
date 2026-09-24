@@ -213,6 +213,32 @@ async fn change_cursors_come_from_the_listing() {
     .expect("blocking task");
 }
 
+/// The enum the CLI holds must delegate every method, not just the ones a
+/// happy path touches.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_configured_store_delegates_the_whole_trait() {
+    use txcript::harness::share::ConfiguredStore;
+
+    let (base, _dir) = serve().await;
+    tokio::task::spawn_blocking(move || {
+        let store = ConfiguredStore::Served(
+            ShareStore::new(base, Box::new(Token("alice-secret"))).expect("client"),
+        );
+        let saved = store.save(&transcript()).expect("save");
+        let found = store.discover().expect("discover");
+        assert_eq!(found.len(), 1);
+        store.load(&found[0].reference).expect("load");
+        let cursors = store
+            .fingerprints(std::slice::from_ref(&saved.reference))
+            .expect("fingerprints");
+        assert!(!cursors.is_empty());
+        store.delete(&saved.reference).expect("delete");
+        assert!(store.discover().expect("discover").is_empty());
+    })
+    .await
+    .expect("blocking task");
+}
+
 // --- the two paths must be interchangeable ---------------------------
 //
 // A bucket written directly has to list and load correctly through a service

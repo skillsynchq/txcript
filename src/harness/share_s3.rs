@@ -75,11 +75,60 @@ impl DirectStore {
         })
     }
 
+    /// From the environment: `TXCRIPT_SHARE_BUCKET` and
+    /// `TXCRIPT_SHARE_OWNER`, optionally `TXCRIPT_SHARE_ENDPOINT` (for `R2`,
+    /// `MinIO`, or another gateway) and `TXCRIPT_SHARE_PREFIX`.
+    ///
+    /// Credentials come from the ambient AWS chain, never from here, so an
+    /// instance role, a web identity, and a key file all work unchanged.
+    ///
+    /// # Errors
+    /// When the bucket or owner is unset, or a client cannot be built.
+    pub fn from_env() -> Result<Self> {
+        let bucket =
+            env("TXCRIPT_SHARE_BUCKET").ok_or_else(|| remote("TXCRIPT_SHARE_BUCKET is not set"))?;
+        let owner = env("TXCRIPT_SHARE_OWNER").ok_or_else(|| {
+            remote("TXCRIPT_SHARE_OWNER is not set: a direct publisher has no service to derive its prefix from")
+        })?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| remote(&format!("could not start a runtime: {error}")))?;
+        let loaded = runtime.block_on(aws_config::load_defaults(
+            aws_config::BehaviorVersion::latest(),
+        ));
+        let mut builder = aws_sdk_s3::config::Builder::from(&loaded);
+        if let Some(endpoint) = env("TXCRIPT_SHARE_ENDPOINT") {
+            // A gateway that is not AWS almost always serves path-style only.
+            builder = builder.endpoint_url(endpoint).force_path_style(true);
+        }
+        let client = aws_sdk_s3::Client::from_conf(builder.build());
+        let mut inner = S3::new(client, bucket);
+        if let Some(prefix) = env("TXCRIPT_SHARE_PREFIX") {
+            inner = inner.with_root(prefix);
+        }
+
+        crate::harness::checked_id_component(Share::NAME, &owner)?;
+        Ok(Self {
+            inner,
+            owner,
+            runtime,
+        })
+    }
+
     fn key_for(&self, session: &str) -> Result<Key> {
         let owner = txcript_share_core::PrincipalId::new(self.owner.clone())
             .ok_or_else(|| remote("the configured owner is not a usable key segment"))?;
         Key::new(owner, session).ok_or_else(|| remote("the session id is not a usable key segment"))
     }
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn remote(detail: &str) -> Error {
