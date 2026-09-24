@@ -280,7 +280,7 @@ implementation including the doubles. A seam is only as good as its worst
 passing implementation.
 
 ```rust
-// Runs for S3 (MinIO in a container), Filesystem, Postgres, InMemory.
+// Runs for S3 (Silo in a container), Filesystem, Postgres, InMemory.
 store_conformance!(S3, Filesystem, Postgres, InMemory);
 ```
 

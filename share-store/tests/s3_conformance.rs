@@ -8,11 +8,16 @@
 //! no skip.
 //!
 //! Requires a live S3-compatible endpoint. Set `TXCRIPT_S3_ENDPOINT` (for
-//! example a local `MinIO`) together with credentials; the test skips when it
-//! is unset so a normal `cargo test` needs no infrastructure.
+//! example a local Silo container) together with credentials; the test skips
+//! when it is unset so a normal `cargo test` needs no infrastructure.
+//!
+//! Silo is the community-maintained fork of `MinIO`, kept protocol- and
+//! format-compatible with it: the same S3 surface, the same `MINIO_*`
+//! variables, and the same `minioadmin` default credentials.
 //!
 //! ```sh
-//! minio server /tmp/miniodata --address 127.0.0.1:19000 &
+//! docker run -d --name txcript-silo -p 127.0.0.1:19000:9000 \
+//!   docker.io/pgsty/silo:latest server /data
 //! TXCRIPT_S3_ENDPOINT=http://127.0.0.1:19000 \
 //!   AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
 //!   AWS_REGION=us-east-1 \
@@ -37,7 +42,7 @@ fn client() -> Option<Client> {
             std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
         ))
         .endpoint_url(endpoint)
-        // MinIO and most self-hosted gateways serve path-style only.
+        // Silo and most self-hosted gateways serve path-style only.
         .force_path_style(true)
         .credentials_provider(Credentials::new(key, secret, None, None, "txcript-test"))
         .build();
