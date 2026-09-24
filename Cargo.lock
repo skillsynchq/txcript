@@ -3922,6 +3922,7 @@ name = "txcript"
 version = "0.14.4"
 dependencies = [
  "aes",
+ "aws-sdk-s3",
  "axum",
  "base64",
  "cbc",
@@ -4008,6 +4009,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-types",
+ "serde_json",
  "tempfile",
  "tokio",
  "txcript-share-core",

@@ -18,7 +18,7 @@ use txcript_share_core::identity::{Headers, Identity};
 use txcript_share_core::plan::{ObjectFacts, Plan, Precondition, Request, Status, decide};
 use txcript_share_core::policy::{Action, ListScope, Policy, Target};
 use txcript_share_core::{Key, Principal};
-use txcript_share_store::{Attrs, Cursor, ObjectStore, StoreError};
+use txcript_share_store::{Cursor, ObjectStore, StoreError, attrs_for_document};
 
 use crate::config::Limits;
 use crate::store::Store;
@@ -95,7 +95,7 @@ async fn publish(
     let created = matches!(precondition, Precondition::IfAbsent);
     match state
         .store
-        .put(key, &body, &summarize(&doc), precondition)
+        .put(key, &body, &attrs_for_document(&doc), precondition)
         .await
     {
         Ok(version) => (
@@ -356,27 +356,4 @@ fn parse_simple(body: &str) -> Option<Value> {
     let value: Value = serde_json::from_str(body).ok()?;
     let is_document = value.is_object() && value.get("messages").is_some_and(Value::is_array);
     is_document.then_some(value)
-}
-
-/// The metadata a listing shows, so `discover()` never downloads a body.
-/// `Attrs` owns the byte budget, so a long non-ASCII title is clipped rather
-/// than failing the write.
-fn summarize(doc: &Value) -> Attrs {
-    let text = |name: &str| doc.get(name).and_then(Value::as_str).unwrap_or_default();
-    let messages = doc
-        .get("messages")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    [
-        ("id", text("id").to_string()),
-        ("messages", messages.to_string()),
-        ("timestamp", text("timestamp").to_string()),
-        ("model", text("model").to_string()),
-        ("git_branch", text("git_branch").to_string()),
-        ("title", text("title").to_string()),
-        ("cwd", text("cwd").to_string()),
-    ]
-    .into_iter()
-    .filter(|(_, value)| !value.is_empty())
-    .fold(Attrs::new(), |attrs, (name, value)| attrs.set(name, &value))
 }

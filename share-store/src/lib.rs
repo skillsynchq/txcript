@@ -134,6 +134,38 @@ impl Attrs {
     }
 }
 
+/// The attributes a listing shows for a Simple transcript document.
+///
+/// Shared so that a service and a direct-to-store client write the *same*
+/// metadata: the two paths are meant to be interchangeable, and a bucket
+/// written by one has to list correctly through the other. `Attrs` owns the
+/// byte budget, so a long non-ASCII title is clipped rather than failing the
+/// write.
+#[must_use]
+pub fn attrs_for_document(doc: &serde_json::Value) -> Attrs {
+    let text = |name: &str| {
+        doc.get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let messages = doc
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    [
+        ("id", text("id").to_string()),
+        ("messages", messages.to_string()),
+        ("timestamp", text("timestamp").to_string()),
+        ("model", text("model").to_string()),
+        ("git_branch", text("git_branch").to_string()),
+        ("title", text("title").to_string()),
+        ("cwd", text("cwd").to_string()),
+    ]
+    .into_iter()
+    .filter(|(_, value)| !value.is_empty())
+    .fold(Attrs::new(), |attrs, (name, value)| attrs.set(name, &value))
+}
+
 /// What a listing returns per object: metadata only, never a body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {

@@ -23,6 +23,8 @@ pub mod opencode;
 pub mod pi;
 #[cfg(feature = "share")]
 pub mod share;
+#[cfg(feature = "share_s3")]
+pub mod share_s3;
 pub mod simple;
 
 pub(crate) mod jsonl;

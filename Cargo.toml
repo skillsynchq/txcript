@@ -58,6 +58,10 @@ futures-util = { version = "0.3.33", optional = true }
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time"], optional = true }
 wreq = { version = "6.0.0-rc.31", default-features = false, features = ["brotli", "deflate", "gzip", "stream", "tokio-rt", "webpki-roots", "zstd"], optional = true }
 wreq-util = { version = "3.0.0-rc.14", features = ["emulation-compression"], optional = true }
+txcript-share-store = { path = "share-store", optional = true }
+# `share-store` names these types in its public API (`ObjectStore` takes a
+# `Key`), so a consumer needs the crate by name.
+txcript-share-core = { path = "share-core", optional = true }
 uuid = { version = "1.23.4", features = ["v4", "v5"] }
 wasm-bindgen = { version = "0.2.126", optional = true }
 
@@ -72,12 +76,13 @@ sha2 = { version = "0.10.9", optional = true }
 # The share round-trip test runs the real service in-process and drives it
 # with the real client, so the two halves are tested against each other
 # rather than against a mock of each other.
-txcript-share-server = { path = "share-server" }
+txcript-share-server = { path = "share-server", features = ["s3"] }
 txcript-share-core = { path = "share-core" }
 txcript-share-store = { path = "share-store" }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
 axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
 criterion = "0.8.2"
+aws-sdk-s3 = { version = "1.123", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 proptest = "1.11.0"
 tempfile = "3.27.0"
 
@@ -144,6 +149,18 @@ share = [
     "dep:tokio",
     "dep:wreq",
     "dep:wreq-util",
+]
+# Talk to S3 directly, with no share service in between. IAM enforces
+# ownership by key prefix; nothing here does. Reuses the same object layer
+# the service uses, so both paths write an identical bucket layout.
+share_s3 = [
+    # Reuses the `Share` harness marker and `ShareRef`, so it is the same
+    # format reached a different way rather than a second one.
+    "share",
+    "dep:txcript-share-store",
+    "dep:txcript-share-core",
+    "dep:tokio",
+    "txcript-share-store/s3",
 ]
 # Fuzzy/substring search over transcripts (`txcript::search`). nucleo-matcher
 # is pure Rust (helix's matcher) and compiles to wasm32; combine with `wasm`

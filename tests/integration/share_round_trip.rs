@@ -40,9 +40,8 @@ fn principal(id: &str) -> Principal {
     )
 }
 
-/// A service on a loopback port, backed by a real directory.
-async fn serve() -> (String, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
+/// A service on a loopback port over any backing store.
+async fn serve_on(store: ServerStore) -> String {
     let identity: Box<dyn Identity> = Box::new(
         StaticTokens::new("x-token")
             .with("alice-secret", principal("alice"))
@@ -51,7 +50,7 @@ async fn serve() -> (String, tempfile::TempDir) {
     let state = Arc::new(State {
         identity,
         policy: Box::new(OwnerPrefix),
-        store: ServerStore::Filesystem(Filesystem::new(dir.path())),
+        store,
         limits: txcript_share_server::config::Limits::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -61,6 +60,13 @@ async fn serve() -> (String, tempfile::TempDir) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, router(state)).await;
     });
+    base
+}
+
+/// A service backed by a real directory.
+async fn serve() -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = serve_on(ServerStore::Filesystem(Filesystem::new(dir.path()))).await;
     (base, dir)
 }
 
@@ -205,4 +211,151 @@ async fn change_cursors_come_from_the_listing() {
     })
     .await
     .expect("blocking task");
+}
+
+// --- the two paths must be interchangeable ---------------------------
+//
+// A bucket written directly has to list and load correctly through a service
+// placed in front of it later, and the reverse. That is what makes "start
+// direct, add a service when you need one" a real migration path rather than
+// a hope, so it is asserted rather than asserted-about.
+//
+// Needs a live S3-compatible endpoint; skipped when `TXCRIPT_S3_ENDPOINT` is
+// unset, so an ordinary `cargo test` needs no infrastructure.
+
+#[cfg(feature = "share_s3")]
+mod interchangeable {
+    use super::{Token, serve_on, transcript};
+    use txcript::harness::share::ShareStore;
+    use txcript::harness::share_s3::DirectStore;
+    use txcript::{Store, TextCodec};
+    use txcript_share_store::S3;
+
+    fn s3(bucket: &str, root: &str) -> Option<S3> {
+        let endpoint = std::env::var("TXCRIPT_S3_ENDPOINT").ok()?;
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".into()),
+                std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into()),
+                None,
+                None,
+                "txcript-test",
+            ))
+            .build();
+        Some(S3::new(aws_sdk_s3::Client::from_conf(config), bucket).with_root(root))
+    }
+
+    /// Creating an existing bucket is not an error worth failing on.
+    async fn make_bucket() {
+        let Ok(endpoint) = std::env::var("TXCRIPT_S3_ENDPOINT") else {
+            return;
+        };
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".into()),
+                std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into()),
+                None,
+                None,
+                "txcript-test",
+            ))
+            .build();
+        let _ = aws_sdk_s3::Client::from_conf(config)
+            .create_bucket()
+            .bucket("txcript-share-interop")
+            .send()
+            .await;
+    }
+
+    fn run_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or_else(|_| "0".into(), |since| since.as_nanos().to_string())
+    }
+
+    /// Publish with the direct client, read it back through the service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bucket_written_directly_reads_through_a_service() {
+        let root = format!("interop-{}", run_id());
+        let Some(client_side) = s3("txcript-share-interop", &root) else {
+            eprintln!("skipping: TXCRIPT_S3_ENDPOINT is not set");
+            return;
+        };
+        let Some(service_side) = s3("txcript-share-interop", &root) else {
+            return;
+        };
+        make_bucket().await;
+
+        let base = serve_on(txcript_share_server::Store::S3(service_side)).await;
+
+        tokio::task::spawn_blocking(move || {
+            let direct = DirectStore::new(client_side, "alice").expect("direct store");
+            let saved = direct.save(&transcript()).expect("publish directly");
+            assert_eq!(saved.reference.slug, "alice/sess-round-trip");
+
+            // …and the service, over the same bucket, sees it.
+            let served = ShareStore::new(base, Box::new(Token("alice-secret"))).expect("client");
+            let listed = served.discover().expect("the service lists it");
+            assert_eq!(listed.len(), 1, "a directly-written object must be listed");
+            assert_eq!(
+                listed[0].meta.title.as_deref(),
+                Some("Fix the parser"),
+                "and its metadata must be the same projection"
+            );
+            let loaded = served
+                .load(&listed[0].reference)
+                .expect("the service loads it");
+            assert!(
+                txcript::harness::share::Share::to_text(&loaded)
+                    .expect("render")
+                    .contains("Fix the parser")
+            );
+        })
+        .await
+        .expect("blocking task");
+    }
+
+    /// Publish through the service, read it back with the direct client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bucket_written_by_a_service_reads_directly() {
+        let root = format!("interop-{}", run_id());
+        let Some(service_side) = s3("txcript-share-interop", &root) else {
+            eprintln!("skipping: TXCRIPT_S3_ENDPOINT is not set");
+            return;
+        };
+        let Some(client_side) = s3("txcript-share-interop", &root) else {
+            return;
+        };
+        make_bucket().await;
+
+        let base = serve_on(txcript_share_server::Store::S3(service_side)).await;
+
+        tokio::task::spawn_blocking(move || {
+            let served = ShareStore::new(base, Box::new(Token("alice-secret"))).expect("client");
+            served
+                .save(&transcript())
+                .expect("publish through the service");
+
+            let direct = DirectStore::new(client_side, "alice").expect("direct store");
+            let listed = direct.discover().expect("the direct client lists it");
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].meta.title.as_deref(), Some("Fix the parser"));
+            let loaded = direct.load(&listed[0].reference).expect("loads");
+            assert!(
+                txcript::harness::share::Share::to_text(&loaded)
+                    .expect("render")
+                    .contains("Fix the parser")
+            );
+        })
+        .await
+        .expect("blocking task");
+    }
 }

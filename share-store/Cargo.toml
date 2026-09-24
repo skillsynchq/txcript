@@ -12,6 +12,9 @@ publish = false
 # no HTTP, no async runtime: the real backends are hosts' business, and this
 # crate defines the shape they must fit.
 txcript-share-core = { path = "../share-core" }
+# For the shared metadata projection: both writers derive a listing's
+# attributes from a Simple document, and they must agree.
+serde_json = "1.0.150"
 
 # S3 is optional so a Filesystem-only deployment does not compile, ship, or
 # audit the AWS client tree. The codec-free core and the other backends stay
