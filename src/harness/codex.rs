@@ -881,8 +881,8 @@ impl CodexStore {
         }
     }
 
-    /// Also discover rollouts Codex has archived into `dir`. New sessions
-    /// are always written to `sessions_dir`; this only widens discovery.
+    /// Also discover and delete rollouts Codex has archived into `dir`.
+    /// New sessions are always written to `sessions_dir`.
     #[must_use]
     pub fn with_archived_sessions_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.archived_sessions_dir = Some(dir.into());
@@ -991,8 +991,8 @@ impl Store for CodexStore {
     }
 
     /// Removes a Codex rollout log. Guarded on shape and containment:
-    /// the reference must be a `.jsonl` file resolving within `sessions_dir`,
-    /// so a foreign or stale reference never removes files outside the sessions root.
+    /// the reference must be a `.jsonl` file resolving within `sessions_dir`
+    /// or the configured `archived_sessions_dir`. Neither root itself is deletable.
     fn delete(&self, reference: &PathBuf) -> Result<()> {
         if reference.extension().is_none_or(|ext| ext != "jsonl") {
             return Err(Error::Malformed {
@@ -1001,12 +1001,20 @@ impl Store for CodexStore {
             });
         }
         let canon = reference.canonicalize()?;
-        let sessions = self.sessions_dir.canonicalize()?;
-        if canon.strip_prefix(&sessions).is_err() || canon == sessions {
+        // Either directory can be absent, including the active tree when
+        // every session has been archived. Only an existing, resolved root
+        // can authorize deletion; symlink escapes fail this same check.
+        let contained = std::iter::once(&self.sessions_dir)
+            .chain(self.archived_sessions_dir.iter())
+            .any(|root| {
+                root.canonicalize()
+                    .is_ok_and(|root| canon.starts_with(&root) && canon != root)
+            });
+        if !contained {
             return Err(Error::Malformed {
                 harness: Codex::NAME,
                 detail: format!(
-                    "refusing to delete outside the sessions root: {}",
+                    "refusing to delete outside the configured sessions roots: {}",
                     reference.display()
                 ),
             });

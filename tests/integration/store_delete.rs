@@ -273,3 +273,46 @@ mod opencode_archive {
         assert!(store.delete(&"nope".to_string()).is_err());
     }
 }
+
+#[test]
+fn codex_delete_archived_session_with_or_without_active_directory() {
+    for keep_active_dir in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+        let store = codex::CodexStore::new(&sessions).with_archived_sessions_dir(&archived);
+        let native = codex::Codex::from_common(&small_common("archived-session")).unwrap();
+        let saved = store.save(&native).unwrap();
+        assert!(saved.reference.starts_with(&sessions));
+
+        std::fs::create_dir_all(&archived).unwrap();
+        let reference = archived.join(saved.reference.file_name().unwrap());
+        std::fs::rename(&saved.reference, &reference).unwrap();
+        if !keep_active_dir {
+            std::fs::remove_dir_all(&sessions).unwrap();
+        }
+
+        let found = store.discover().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].reference, reference);
+        assert_eq!(store.load(&reference).unwrap().meta.id, saved.id);
+        store.delete(&reference).unwrap();
+        assert!(!reference.exists());
+        assert!(store.discover().unwrap().is_empty());
+        assert!(
+            archived.is_dir(),
+            "deleting a rollout must keep its directory"
+        );
+        assert!(store.delete(&reference).is_err());
+    }
+}
+
+#[test]
+fn codex_active_delete_works_when_archive_directory_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let archived = dir.path().join("archived_sessions");
+    let store = codex::CodexStore::new(&sessions).with_archived_sessions_dir(&archived);
+    roundtrip(&store);
+    assert!(!archived.exists());
+}

@@ -40,6 +40,15 @@ won't show it until it's unarchived back into `sessions/`. A `CodexStore` built 
 custom `sessions_dir` has no archived directory unless one is set with
 `with_archived_sessions_dir`.
 
+Deletion accepts rollout files in either configured directory, including when the active
+directory is missing. It resolves symlinks before checking containment and refuses paths
+outside both directories. Saving always writes into `sessions_dir`.
+
+For Rust callers, the new public field changes struct-literal construction. Replace
+`CodexStore { sessions_dir }` with `CodexStore::new(sessions_dir)`, or include
+`archived_sessions_dir: None` in the literal. Use `with_archived_sessions_dir` to enable
+archives for a custom store.
+
 ## Dissection of a transcript
 
 Every line shares one envelope — upstream's `RolloutLine`: a `timestamp` (RFC 3339, millisecond

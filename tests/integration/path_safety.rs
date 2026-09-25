@@ -344,3 +344,64 @@ fn discovery_survives_a_symlink_loop() {
             .is_empty()
     );
 }
+
+#[test]
+fn codex_delete_refuses_paths_outside_both_configured_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let archived = dir.path().join("archived_sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&archived).unwrap();
+    let store = codex::CodexStore::new(&sessions).with_archived_sessions_dir(&archived);
+
+    for name in ["sessions-other", "archived_sessions-other"] {
+        let foreign_dir = dir.path().join(name);
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("rollout.jsonl");
+        std::fs::write(&foreign, b"{}").unwrap();
+        for reference in [
+            foreign.clone(),
+            sessions.join("..").join(name).join("rollout.jsonl"),
+            archived.join("..").join(name).join("rollout.jsonl"),
+        ] {
+            assert!(store.delete(&reference).is_err());
+            assert!(foreign.is_file(), "the outside file must survive");
+        }
+    }
+}
+
+#[test]
+fn codex_delete_requires_archive_directory_to_be_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let archived = dir.path().join("archived_sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&archived).unwrap();
+    let reference = archived.join("rollout.jsonl");
+    std::fs::write(&reference, b"{}").unwrap();
+    let store = codex::CodexStore::new(&sessions);
+    assert!(store.delete(&reference).is_err());
+    assert!(reference.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_delete_refuses_symlink_escapes_from_both_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let archived = dir.path().join("archived_sessions");
+    let foreign = dir.path().join("rollout.jsonl");
+    std::fs::write(&foreign, b"{}").unwrap();
+    let store = codex::CodexStore::new(&sessions).with_archived_sessions_dir(&archived);
+    for root in [&sessions, &archived] {
+        std::fs::create_dir_all(root).unwrap();
+        let link = root.join("rollout-link.jsonl");
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        assert!(store.delete(&link).is_err());
+        assert!(foreign.is_file(), "the symlink target must survive");
+        assert!(
+            link.is_symlink(),
+            "a rejected reference must remain untouched"
+        );
+    }
+}
