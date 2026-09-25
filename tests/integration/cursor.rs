@@ -521,6 +521,50 @@ fn parses_existing_cursor_message_shapes() {
     ));
 }
 
+#[test]
+fn native_call_ids_are_sanitized_into_common() {
+    let body = cursor::CursorDb {
+        blobs: vec![cursor::CursorBlob {
+            id: "assistant".into(),
+            data: serde_json::to_vec(&json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool-call",
+                    "toolCallId": "call-abc-12\nfc_def_4",
+                    "toolName": "ReadFile",
+                    "args": { "target_file": "/repo/x.rs" }
+                }]
+            }))
+            .unwrap(),
+        }],
+        meta: Vec::new(),
+        session_meta: Some(json!({"schemaVersion": 1, "hasConversation": true})),
+    };
+    let transcript = Transcript::<cursor::Cursor>::new(
+        common::Meta {
+            id: "sess".into(),
+            timestamp: ts("2026-01-02T03:04:05.000Z"),
+            cwd: None,
+            git_branch: None,
+            title: None,
+            cli_version: None,
+            model: None,
+        },
+        body,
+    );
+    let common = cursor::Cursor::to_common(&transcript).unwrap();
+    let ids: Vec<&str> = common
+        .body
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            common::Block::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["call-abc-12_fc_def_4"]);
+}
+
 fn latest_root_blob(body: &cursor::CursorDb) -> &cursor::CursorBlob {
     let meta = cursor_meta_json(body);
     let id = meta
