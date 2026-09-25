@@ -124,6 +124,40 @@ pub enum StopReason {
     Other(String),
 }
 
+impl StopReason {
+    /// Parse a stop or finish reason string commonly used by model APIs and harnesses
+    /// (Anthropic, `OpenAI`, `OpenCode`, Pi, Grok, etc.) into a canonical `StopReason`.
+    /// Unrecognized reasons are preserved as `StopReason::Other(s.to_string())`.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "end_turn" | "stop" => Self::EndTurn,
+            "tool_use" | "tool_calls" | "tool-calls" | "toolUse" => Self::ToolUse,
+            "max_tokens" | "length" => Self::MaxTokens,
+            "stop_sequence" => Self::StopSequence,
+            "aborted" | "cancelled" | "canceled" | "abort" => Self::Aborted,
+            "error" => Self::Error,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Canonical representation as an Anthropic-style stop reason string:
+    /// `"end_turn"`, `"tool_use"`, `"max_tokens"`, `"stop_sequence"`, `"aborted"`, `"error"`,
+    /// or the custom reason string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::ToolUse => "tool_use",
+            Self::MaxTokens => "max_tokens",
+            Self::StopSequence => "stop_sequence",
+            Self::Aborted => "aborted",
+            Self::Error => "error",
+            Self::Other(s) => s.as_str(),
+        }
+    }
+}
+
 /// Token accounting for one assistant turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -573,6 +607,39 @@ mod tests {
         let tool = Tool::from_canonical("Bash", input.clone());
         assert!(matches!(tool, Tool::Bash { .. }));
         assert_eq!(tool.to_canonical().1, input);
+    }
+
+    #[test]
+    fn stop_reason_parsing_and_as_str() {
+        assert_eq!(StopReason::parse("end_turn"), StopReason::EndTurn);
+        assert_eq!(StopReason::parse("stop"), StopReason::EndTurn);
+        assert_eq!(StopReason::parse("tool_use"), StopReason::ToolUse);
+        assert_eq!(StopReason::parse("tool_calls"), StopReason::ToolUse);
+        assert_eq!(StopReason::parse("tool-calls"), StopReason::ToolUse);
+        assert_eq!(StopReason::parse("toolUse"), StopReason::ToolUse);
+        assert_eq!(StopReason::parse("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(StopReason::parse("length"), StopReason::MaxTokens);
+        assert_eq!(StopReason::parse("stop_sequence"), StopReason::StopSequence);
+        assert_eq!(StopReason::parse("aborted"), StopReason::Aborted);
+        assert_eq!(StopReason::parse("cancelled"), StopReason::Aborted);
+        assert_eq!(StopReason::parse("canceled"), StopReason::Aborted);
+        assert_eq!(StopReason::parse("abort"), StopReason::Aborted);
+        assert_eq!(StopReason::parse("error"), StopReason::Error);
+        assert_eq!(
+            StopReason::parse("custom_reason"),
+            StopReason::Other("custom_reason".to_string())
+        );
+
+        assert_eq!(StopReason::EndTurn.as_str(), "end_turn");
+        assert_eq!(StopReason::ToolUse.as_str(), "tool_use");
+        assert_eq!(StopReason::MaxTokens.as_str(), "max_tokens");
+        assert_eq!(StopReason::StopSequence.as_str(), "stop_sequence");
+        assert_eq!(StopReason::Aborted.as_str(), "aborted");
+        assert_eq!(StopReason::Error.as_str(), "error");
+        assert_eq!(
+            StopReason::Other("custom_reason".to_string()).as_str(),
+            "custom_reason"
+        );
     }
 }
 

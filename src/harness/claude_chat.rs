@@ -819,15 +819,7 @@ fn u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn parse_stop_reason(reason: &str) -> StopReason {
-    match reason {
-        "end_turn" | "stop" => StopReason::EndTurn,
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" | "length" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "aborted" | "cancelled" => StopReason::Aborted,
-        "error" => StopReason::Error,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(reason)
 }
 
 fn read_only_error() -> Error {

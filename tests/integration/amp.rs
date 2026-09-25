@@ -601,3 +601,26 @@ fn continuing_into_amp_is_refused() {
         );
     }
 }
+
+#[test]
+fn amp_preserves_stop_reasons_roundtrip() {
+    for stop_reason in [
+        common::StopReason::EndTurn,
+        common::StopReason::ToolUse,
+        common::StopReason::MaxTokens,
+        common::StopReason::StopSequence,
+        common::StopReason::Aborted,
+        common::StopReason::Error,
+    ] {
+        let mut common = sample_common();
+        let last_idx = common.body.len() - 1;
+        common.body[last_idx].stop_reason = Some(stop_reason.clone());
+        let native = amp::Amp::from_common(&common).unwrap();
+        let back = amp::Amp::to_common(&native).unwrap();
+        assert_eq!(
+            back.body[last_idx].stop_reason,
+            Some(stop_reason),
+            "Amp roundtrip should preserve stop_reason"
+        );
+    }
+}
