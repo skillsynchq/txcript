@@ -59,7 +59,7 @@ struct Queued {
     timestamp: DateTime<Utc>,
     model: Option<String>,
     usage: Option<Usage>,
-    result_call_id: Option<String>,
+    result_key: Option<(String, usize)>,
     is_fallback_result: bool,
 }
 
@@ -101,7 +101,8 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
     let mut turn_models: HashMap<String, String> = HashMap::new();
     let mut turn_usage: HashMap<String, Usage> = HashMap::new();
     let mut last_assistant_text_by_turn: HashMap<String, usize> = HashMap::new();
-    let mut canonical_results: HashSet<String> = HashSet::new();
+    let mut canonical_results = HashSet::new();
+    let mut call_occurrences = HashMap::new();
     let mut pending_web_search_ids: HashMap<String, Vec<String>> = HashMap::new();
     let mut unresolved_web_search_indices: HashMap<String, Vec<usize>> = HashMap::new();
 
@@ -116,6 +117,23 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
             .and_then(parse_ts)
             .unwrap_or(fallback_ts);
         let payload = &line.payload;
+        // Function/custom IDs may be reused after a call completes. Scope
+        // mirror suppression to the latest occurrence, not the entire log.
+        if line.kind == "response_item"
+            && matches!(
+                payload.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            )
+            && let Some(id) = payload.get("call_id").and_then(Value::as_str)
+        {
+            call_occurrences.insert(id, queued.len() + 1);
+        }
+        let result_key = |id: &str| {
+            (
+                id.to_string(),
+                call_occurrences.get(id).copied().unwrap_or(0),
+            )
+        };
         match line.kind.as_str() {
             "turn_context" => {
                 current_turn_id = payload
@@ -165,10 +183,10 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             .and_then(Value::as_str)
                             .map(String::from)
                         {
-                            canonical_results.insert(call_id.clone());
+                            canonical_results.insert(result_key(&call_id));
                             queued.push(tool_result(
                                 ts,
-                                call_id,
+                                result_key(&call_id),
                                 ToolOutput::Text(format_exec_output(payload)),
                                 payload
                                     .get("exit_code")
@@ -202,10 +220,10 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             {
                                 id.clone_from(&call_id);
                             }
-                            canonical_results.insert(call_id.clone());
+                            canonical_results.insert(result_key(&call_id));
                             queued.push(tool_result(
                                 ts,
-                                call_id,
+                                result_key(&call_id),
                                 ToolOutput::Text(format_web_search_result(payload)),
                                 false,
                                 false,
@@ -313,7 +331,13 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                                 .map_or(ToolOutput::Text(String::new()), |s| {
                                     ToolOutput::Text(s.to_string())
                                 });
-                            queued.push(tool_result(ts, call_id, content, false, true));
+                            queued.push(tool_result(
+                                ts,
+                                result_key(&call_id),
+                                content,
+                                false,
+                                true,
+                            ));
                         }
                     }
                     "custom_tool_call" => {
@@ -357,8 +381,14 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                                 .and_then(Value::as_str)
                                 .unwrap_or_default();
                             let (content, is_error) = parse_custom_tool_output(raw);
-                            canonical_results.insert(call_id.clone());
-                            queued.push(tool_result(ts, call_id, content, is_error, false));
+                            canonical_results.insert(result_key(&call_id));
+                            queued.push(tool_result(
+                                ts,
+                                result_key(&call_id),
+                                content,
+                                is_error,
+                                false,
+                            ));
                         }
                     }
                     "web_search_call" => {
@@ -398,12 +428,12 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
         }
     }
 
-    // Drop the fallback function_call_output when a canonical result exists.
+    // Drop a fallback only when this call occurrence has a canonical result.
     queued
         .into_iter()
         .filter(|q| {
             !q.is_fallback_result
-                || q.result_call_id
+                || q.result_key
                     .as_ref()
                     .is_none_or(|c| !canonical_results.contains(c))
         })
@@ -425,7 +455,7 @@ fn plain(role: Role, content: Vec<Block>, ts: DateTime<Utc>, model: Option<Strin
         timestamp: ts,
         model,
         usage: None,
-        result_call_id: None,
+        result_key: None,
         is_fallback_result: false,
     }
 }
@@ -446,14 +476,14 @@ fn tool_use(
         timestamp: ts,
         model,
         usage: None,
-        result_call_id: None,
+        result_key: None,
         is_fallback_result: false,
     }
 }
 
 fn tool_result(
     ts: DateTime<Utc>,
-    call_id: String,
+    result_key: (String, usize),
     content: ToolOutput,
     is_error: bool,
     is_fallback: bool,
@@ -461,14 +491,14 @@ fn tool_result(
     Queued {
         role: Role::User,
         content: vec![Block::ToolResult {
-            tool_use_id: call_id.clone(),
+            tool_use_id: result_key.0.clone(),
             content,
             is_error,
         }],
         timestamp: ts,
         model: None,
         usage: None,
-        result_call_id: Some(call_id),
+        result_key: Some(result_key),
         is_fallback_result: is_fallback,
     }
 }
@@ -501,6 +531,10 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
     }
     lines.push(meta_line(&meta.timestamp, "session_meta", payload));
 
+    // Only pending patch calls need custom-tool results. Completed IDs can
+    // be reused by a different tool later in the transcript.
+    let mut pending_patch_ids = HashSet::new();
+
     for (i, msg) in messages.iter().enumerate() {
         let ts = msg.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
 
@@ -516,7 +550,7 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
             lines.push(meta_line(&msg.timestamp, "turn_context", tc));
         }
 
-        push_message_lines(&mut lines, msg, &ts);
+        push_message_lines(&mut lines, msg, &ts, &mut pending_patch_ids);
 
         if matches!(msg.role, Role::Assistant)
             && let Some(usage) = msg.usage.as_ref()
@@ -544,7 +578,12 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
 }
 
 /// Emit the `response_item` (and paired display `event_msg`) lines for one message.
-fn push_message_lines(lines: &mut Vec<Line>, msg: &Message, ts: &str) {
+fn push_message_lines<'a>(
+    lines: &mut Vec<Line>,
+    msg: &'a Message,
+    ts: &str,
+    pending_patch_ids: &mut HashSet<&'a str>,
+) {
     let role_str = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -594,31 +633,30 @@ fn push_message_lines(lines: &mut Vec<Line>, msg: &Message, ts: &str) {
                 ));
             }
             Block::ToolUse { id, tool } => {
-                let (name, input) = tool.to_canonical();
-                lines.push(meta_line_str(
-                    ts,
-                    "response_item",
-                    json!({
-                        "type": "function_call",
-                        "name": openai_tool_name(&name),
-                        "arguments": input.to_string(),
-                        "call_id": id,
-                    }),
-                ));
+                if is_patch_tool(tool) {
+                    pending_patch_ids.insert(id.as_str());
+                } else {
+                    pending_patch_ids.remove(id.as_str());
+                }
+                push_tool_use_lines(lines, ts, id, tool);
             }
             Block::ToolResult {
                 tool_use_id,
                 content,
-                ..
+                is_error,
             } => {
+                let (kind, output) = if pending_patch_ids.remove(tool_use_id.as_str()) {
+                    (
+                        "custom_tool_call_output",
+                        custom_tool_output(content, *is_error),
+                    )
+                } else {
+                    ("function_call_output", tool_output_text(content))
+                };
                 lines.push(meta_line_str(
                     ts,
                     "response_item",
-                    json!({
-                        "type": "function_call_output",
-                        "call_id": tool_use_id,
-                        "output": tool_output_text(content),
-                    }),
+                    json!({ "type": kind, "call_id": tool_use_id, "output": output }),
                 ));
             }
         }
@@ -641,6 +679,146 @@ fn push_message_lines(lines: &mut Vec<Line>, msg: &Message, ts: &str) {
             lines.push(meta_line_str(ts, "event_msg", event));
         }
     }
+}
+
+/// Emit the native call line for one tool invocation: `exec_command` for
+/// shell and `custom_tool_call` for edits. Foreign tools keep their canonical
+/// function-call form and their paired function-call results.
+fn push_tool_use_lines(lines: &mut Vec<Line>, ts: &str, id: &str, tool: &Tool) {
+    match tool {
+        Tool::Bash {
+            command, workdir, ..
+        } => {
+            // `exec_command` takes `cmd`/`workdir`; the remaining
+            // `Bash` extras (timeout, description, background) have
+            // no native slot and are dropped — matching the inbound
+            // normalizer, which keeps the same two fields.
+            let mut args = Map::new();
+            args.insert("cmd".into(), Value::String(command.clone()));
+            if let Some(w) = workdir {
+                args.insert("workdir".into(), Value::String(w.clone()));
+            }
+            lines.push(meta_line_str(
+                ts,
+                "response_item",
+                json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": Value::Object(args).to_string(),
+                    "call_id": id,
+                }),
+            ));
+        }
+        Tool::Edit {
+            file_path,
+            old_string,
+            new_string,
+            ..
+        } => {
+            push_custom_tool_call(
+                lines,
+                ts,
+                id,
+                &apply_patch_update(file_path, old_string, new_string),
+            );
+        }
+        Tool::Write { file_path, content } => {
+            push_custom_tool_call(lines, ts, id, &apply_patch_add(file_path, content));
+        }
+        Tool::Raw { tool_name, input } if tool_name == "ApplyPatch" => {
+            // The fallback shape inbound keeps is
+            // `{"patch": <envelope>, "files": [...]}`; unwrap it
+            // so live Codex sees the string input it wrote.
+            let input = match input.get("patch").and_then(Value::as_str) {
+                Some(patch) => patch.to_owned(),
+                None => match input {
+                    Value::String(text) => text.clone(),
+                    // Even a malformed historical call must satisfy Codex's
+                    // string input type. The reader decodes JSON strings.
+                    other => other.to_string(),
+                },
+            };
+            push_custom_tool_call(lines, ts, id, &input);
+        }
+        _ => {
+            let (name, input) = tool.to_canonical();
+            lines.push(meta_line_str(
+                ts,
+                "response_item",
+                json!({
+                    "type": "function_call",
+                    "name": openai_tool_name(&name),
+                    "arguments": input.to_string(),
+                    "call_id": id,
+                }),
+            ));
+        }
+    }
+}
+
+/// A call Codex issued as `custom_tool_call` (`apply_patch`), so its result
+/// must be a `custom_tool_call_output` to pair on replay.
+fn is_patch_tool(tool: &Tool) -> bool {
+    matches!(tool, Tool::Edit { .. } | Tool::Write { .. })
+        || matches!(tool, Tool::Raw { tool_name, .. } if tool_name == "ApplyPatch")
+}
+
+/// Rebuild the single-hunk `*** Update File` envelope the inbound parser
+/// folds into `Edit`, so the call re-imports identically. `replace_all` has
+/// no envelope equivalent; the patch applies once.
+fn apply_patch_update(file_path: &str, old_string: &str, new_string: &str) -> String {
+    let mut patch = vec![
+        "*** Begin Patch".to_string(),
+        format!("*** Update File: {file_path}"),
+        "@@".to_string(),
+    ];
+    patch.extend(old_string.lines().map(|l| format!("-{l}")));
+    patch.extend(new_string.lines().map(|l| format!("+{l}")));
+    patch.push("*** End Patch".to_string());
+    patch.join("\n")
+}
+
+/// Rebuild the `*** Add File` envelope the inbound parser folds into `Write`.
+fn apply_patch_add(file_path: &str, content: &str) -> String {
+    let mut patch = vec![
+        "*** Begin Patch".to_string(),
+        format!("*** Add File: {file_path}"),
+    ];
+    patch.extend(content.lines().map(|l| format!("+{l}")));
+    patch.push("*** End Patch".to_string());
+    patch.join("\n")
+}
+
+fn push_custom_tool_call(lines: &mut Vec<Line>, ts: &str, id: &str, input: &str) {
+    lines.push(meta_line_str(
+        ts,
+        "response_item",
+        json!({
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": id,
+            "name": "apply_patch",
+            "input": input,
+        }),
+    ));
+}
+
+/// Mirror the `custom_tool_call_output` envelope Codex writes (see
+/// `parse_custom_tool_output`): `output` carries the payload, `exit_code`
+/// carries the error bit, so the result re-imports with `is_error` intact.
+fn custom_tool_output(content: &ToolOutput, is_error: bool) -> String {
+    let output = match content {
+        ToolOutput::Text(s) => Value::String(s.clone()),
+        ToolOutput::Json(v) => v.clone(),
+    };
+    json!({
+        "output": output,
+        "metadata": {
+            "exit_code": i64::from(is_error),
+            "duration_seconds": 0.0,
+        },
+    })
+    .to_string()
 }
 
 /// The `OpenAI` API validates replayed function-call names with `[A-Za-z0-9_-]+`.

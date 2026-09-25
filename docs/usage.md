@@ -65,9 +65,15 @@ txcript query                            # interactive picker; Enter continues
     [--from <harness>]                   #   search only <harness> (default: all)
     [--with <harness>]                   #   continue the pick in <harness>
     [--cwd <dir>]                        #   only sessions recorded under <dir>
+    [--git-branch <branch>]              #   only sessions on this branch (exact)
+    [--model <substr>]                   #   only sessions using this model (case-insensitive substring)
+    [--since <when>]                     #   only sessions started at or after <when>
+    [--until <when>]                     #   only sessions started at or before <when>
 ```
 
 A pattern matches literally and case-insensitively: `relay bug` finds lines containing that exact text, spaces and all.
+
+`--since` / `--until` accept RFC3339 timestamps (`2025-06-01T00:00:00Z`) or bare dates (`2025-06-01`); bare dates mean local midnight (for `--since`) or end of local day (for `--until`).
 
 In the picker, type to filter, arrows / ctrl-p/n to move, Enter to continue the selection in its own harness (or `--with`), Esc to cancel. Every row shows which kind of content matched: user text, assistant text, thinking, tool use, tool output, or session metadata.
 
@@ -82,12 +88,13 @@ txcript mcp                              # stdio transport
 Exposes three read-only tools; their optional filters match the CLI:
 
 - `list_sessions(from?, cwd?, limit?, offset?)`
-- `search_sessions(pattern, from?, cwd?)`
+- `search_sessions(pattern, from?, cwd?, git_branch?, model?, since?, until?)`
 - `read_session(id, from?)`
 
-<sub>\* Omitting `from` includes every harness; omitting `cwd` applies no directory filter. Sessions without a recorded working directory match only when `cwd` is omitted.</sub>
+<sub>\* Omitting `from` includes every harness; omitting `cwd` applies no directory filter. Sessions without a recorded working directory match only when `cwd` is omitted. `git_branch` is exact; `model` is a case-insensitive substring; `since`/`until` are RFC3339 strings or bare dates.</sub>
 
 `list_sessions` pages with `limit` and `offset` and reports the total before paging; the live Claude Chat and ChatGPT sources are never listed. `read_session` takes the same `#range` suffix as `view` and returns the same compact text; a read too large to return whole is refused with suggested sub-ranges. `--cache` applies to the server too.
+
 
 ### Shell integration
 

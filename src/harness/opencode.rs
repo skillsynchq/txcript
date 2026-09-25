@@ -321,102 +321,151 @@ fn parse_tool(part: &Value) -> Option<(Block, Option<Block>)> {
 
 // ── codec: from_common ─────────────────────────────────────────────────
 
-fn build_export(meta: &Meta, messages: &[Message]) -> Export {
-    // `opencode import` rejects ids that don't start with "ses"; sessions
-    // converted from other harnesses carry plain UUIDs. Re-shape those
-    // deterministically so re-importing the same session keeps its id.
-    let session_id = if meta.id.is_empty() {
+fn format_session_id(id: &str) -> String {
+    if id.is_empty() {
         format!("ses_{}", Uuid::new_v4().simple())
-    } else if meta.id.starts_with("ses") {
-        meta.id.clone()
+    } else if id.starts_with("ses") {
+        id.to_string()
     } else {
-        format!("ses_{}", meta.id.replace('-', ""))
-    };
+        format!("ses_{}", id.replace('-', ""))
+    }
+}
+
+struct ExportContext<'a> {
+    session_id: &'a str,
+    cwd: &'a str,
+    default_model: Option<&'a str>,
+    messages: &'a [Message],
+}
+
+fn build_user_record(
+    ctx: &ExportContext<'_>,
+    msg: &Message,
+    msg_id: &str,
+    idx: usize,
+) -> (MessageRecord, bool) {
+    let msg_ms = msg.timestamp.timestamp_millis();
+    let mut info = Map::new();
+    info.insert("id".into(), json!(msg_id));
+    info.insert("sessionID".into(), json!(ctx.session_id));
+    info.insert(
+        "time".into(),
+        json!({ "created": msg_ms, "completed": msg_ms }),
+    );
+    info.insert("role".into(), json!("user"));
+    info.insert("agent".into(), json!("build"));
+    let model = msg
+        .model
+        .as_deref()
+        .or(ctx.default_model)
+        .unwrap_or("unknown");
+    info.insert(
+        "model".into(),
+        json!({ "providerID": "anthropic", "modelID": model }),
+    );
+    let mut parts = Vec::new();
+    for (j, block) in msg.content.iter().enumerate() {
+        if let Some(part) = user_part(block, ctx.session_id, msg_id, idx, j, msg_ms) {
+            parts.push(part);
+        }
+    }
+    let emitted = !parts.is_empty();
+    (
+        MessageRecord {
+            info: Value::Object(info),
+            parts,
+        },
+        emitted,
+    )
+}
+
+fn build_assistant_record(
+    ctx: &ExportContext<'_>,
+    msg: &Message,
+    msg_id: &str,
+    parent_id: &str,
+    idx: &mut usize,
+) -> MessageRecord {
+    let msg_ms = msg.timestamp.timestamp_millis();
+    let mut info = Map::new();
+    info.insert("id".into(), json!(msg_id));
+    info.insert("sessionID".into(), json!(ctx.session_id));
+    info.insert(
+        "time".into(),
+        json!({ "created": msg_ms, "completed": msg_ms }),
+    );
+    info.insert("role".into(), json!("assistant"));
+    let model = msg
+        .model
+        .as_deref()
+        .or(ctx.default_model)
+        .unwrap_or("unknown");
+    info.insert("modelID".into(), json!(model));
+    info.insert("providerID".into(), json!("anthropic"));
+    info.insert("mode".into(), json!("build"));
+    info.insert("agent".into(), json!("build"));
+    info.insert("parentID".into(), json!(parent_id));
+    info.insert("path".into(), json!({ "cwd": ctx.cwd, "root": ctx.cwd }));
+    info.insert("finish".into(), json!(finish_str(msg.stop_reason.as_ref())));
+    info.insert("cost".into(), json!(0.0));
+    info.insert("tokens".into(), tokens_value(msg.usage.as_ref()));
+
+    let mut parts = vec![json!({
+        "id": format!("prt_{}", det_hex(ctx.session_id, *idx, 0)),
+        "sessionID": ctx.session_id,
+        "messageID": msg_id,
+        "type": "step-start",
+    })];
+    for (j, block) in msg.content.iter().enumerate() {
+        let part = assistant_part(
+            block,
+            ctx.session_id,
+            msg_id,
+            *idx,
+            j + 1,
+            msg_ms,
+            ctx.messages,
+            idx,
+        );
+        parts.push(part);
+    }
+    MessageRecord {
+        info: Value::Object(info),
+        parts,
+    }
+}
+
+fn build_export(meta: &Meta, messages: &[Message]) -> Export {
+    let session_id = format_session_id(&meta.id);
     let now = meta.timestamp.timestamp_millis();
-    // `opencode import` validates messages against its live schema, which
-    // requires an agent, a model, and (on assistant turns) a mode, a path,
-    // and the id of the user message that prompted the turn.
-    let model_id = |msg: &Message| {
-        msg.model
-            .clone()
-            .or_else(|| meta.model.clone())
-            .unwrap_or_else(|| "unknown".to_string())
+    let ctx = ExportContext {
+        session_id: &session_id,
+        cwd: meta.cwd.as_deref().unwrap_or_default(),
+        default_model: meta.model.as_deref(),
+        messages,
     };
-    let cwd = meta.cwd.clone().unwrap_or_default();
 
     let mut out: Vec<MessageRecord> = Vec::new();
     let mut last_user_msg_id: Option<String> = None;
     let mut idx = 0usize;
     while idx < messages.len() {
         let msg = &messages[idx];
-        let msg_ms = msg.timestamp.timestamp_millis();
         let msg_id = format!("msg_{}", det_hex(&session_id, idx, 0));
 
-        let mut info = Map::new();
-        info.insert("id".into(), json!(msg_id));
-        info.insert("sessionID".into(), json!(session_id));
-        info.insert(
-            "time".into(),
-            json!({ "created": msg_ms, "completed": msg_ms }),
-        );
-
-        let mut parts: Vec<Value> = Vec::new();
         match msg.role {
             Role::User => {
-                info.insert("role".into(), json!("user"));
-                info.insert("agent".into(), json!("build"));
-                info.insert(
-                    "model".into(),
-                    json!({ "providerID": "anthropic", "modelID": model_id(msg) }),
-                );
-                last_user_msg_id = Some(msg_id.clone());
-                for (j, block) in msg.content.iter().enumerate() {
-                    if let Some(part) = user_part(block, &session_id, &msg_id, idx, j, msg_ms) {
-                        parts.push(part);
-                    }
+                let (record, emitted) = build_user_record(&ctx, msg, &msg_id, idx);
+                if emitted {
+                    last_user_msg_id = Some(msg_id.clone());
+                    out.push(record);
                 }
             }
             Role::Assistant => {
-                info.insert("role".into(), json!("assistant"));
-                info.insert("modelID".into(), json!(model_id(msg)));
-                info.insert("providerID".into(), json!("anthropic"));
-                info.insert("mode".into(), json!("build"));
-                info.insert("agent".into(), json!("build"));
-                info.insert(
-                    "parentID".into(),
-                    json!(last_user_msg_id.clone().unwrap_or_else(|| msg_id.clone())),
-                );
-                info.insert("path".into(), json!({ "cwd": cwd, "root": cwd }));
-                info.insert("finish".into(), json!(finish_str(msg.stop_reason.as_ref())));
-                info.insert("cost".into(), json!(0.0));
-                info.insert("tokens".into(), tokens_value(msg.usage.as_ref()));
-
-                // Every assistant turn opens with a step-start part.
-                parts.push(json!({
-                    "id": format!("prt_{}", det_hex(&session_id, idx, 0)),
-                    "sessionID": session_id,
-                    "messageID": msg_id,
-                    "type": "step-start",
-                }));
-                for (j, block) in msg.content.iter().enumerate() {
-                    let part = assistant_part(
-                        block,
-                        &session_id,
-                        &msg_id,
-                        idx,
-                        j + 1,
-                        msg_ms,
-                        messages,
-                        &mut idx,
-                    );
-                    parts.push(part);
-                }
+                let parent_id = last_user_msg_id.as_deref().unwrap_or(&msg_id);
+                let record = build_assistant_record(&ctx, msg, &msg_id, parent_id, &mut idx);
+                out.push(record);
             }
         }
-        out.push(MessageRecord {
-            info: Value::Object(info),
-            parts,
-        });
         idx += 1;
     }
 
@@ -523,27 +572,26 @@ fn assistant_part(
                 "metadata": {},
                 "time": time,
             });
-            // Fold the immediately-following ToolResult into state.output.
+            // Fold matching ToolResult from the following user turn into state.output.
             if let Some(next) = messages.get(*idx + 1)
                 && matches!(next.role, Role::User)
-                && next.content.len() == 1
-                && let Block::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = &next.content[0]
-                && tool_use_id == id
+                && let Some(result) = next.content.iter().find_map(|b| match b {
+                    Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } if tool_use_id == id => Some((content, *is_error)),
+                    _ => None,
+                })
+                && let Value::Object(obj) = &mut state
             {
-                if let Value::Object(obj) = &mut state {
-                    if *is_error {
-                        obj.insert("status".into(), json!("error"));
-                        obj.insert("error".into(), json!(output_to_string(content)));
-                        obj.remove("output");
-                    } else {
-                        obj.insert("output".into(), json!(output_to_string(content)));
-                    }
+                if result.1 {
+                    obj.insert("status".into(), json!("error"));
+                    obj.insert("error".into(), json!(output_to_string(result.0)));
+                    obj.remove("output");
+                } else {
+                    obj.insert("output".into(), json!(output_to_string(result.0)));
                 }
-                *idx += 1;
             }
             json!({ "type": "tool", "tool": oc_name, "callID": id, "state": state })
         }

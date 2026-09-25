@@ -237,6 +237,59 @@ fn from_common_with_empty_id_is_deterministic() {
 }
 
 #[test]
+fn from_common_preserves_artifacts() {
+    let mut common = sample_common();
+    common.body[0]
+        .content
+        .push(txcript::common::Block::Artifact {
+            artifact: txcript::common::Artifact {
+                id: "art-1".into(),
+                name: "report.pdf".into(),
+                source: txcript::common::ArtifactSource::Path {
+                    path: "/tmp/report.pdf".into(),
+                    media_type: Some("application/pdf".into()),
+                },
+            },
+        });
+    common.body[3]
+        .content
+        .push(txcript::common::Block::Artifact {
+            artifact: txcript::common::Artifact {
+                id: "art-2".into(),
+                name: "summary.txt".into(),
+                source: txcript::common::ArtifactSource::Text {
+                    text: "result data".into(),
+                    media_type: Some("text/plain".into()),
+                },
+            },
+        });
+
+    let native = hermes::Hermes::from_common(&common).unwrap();
+    let user_msg = native.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    let assistant_msgs = native.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect::<Vec<_>>();
+
+    let user_text = user_msg["content"].as_str().unwrap();
+    assert!(user_text.contains("[artifact: report.pdf] /tmp/report.pdf"));
+
+    let has_artifact = assistant_msgs.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|t| t.contains("[artifact: summary.txt]\nresult data"))
+    });
+    assert!(has_artifact);
+}
+
+#[test]
 fn missing_or_invalid_started_at_uses_stable_epoch() {
     for text in [
         r#"{"id":"missing","messages":[]}"#,

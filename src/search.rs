@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
+use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str, Utf32String};
 use serde::{Deserialize, Serialize};
@@ -122,6 +124,21 @@ pub struct Query {
         skip_serializing_if = "Option::is_none"
     )]
     pub hits_per_doc: Option<usize>,
+    /// Only sessions recorded in or under this working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Only sessions recorded on this git branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Only sessions recorded with this model (case-insensitive substring match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Only sessions started on or after this timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Only sessions started on or before this timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
 }
 
 #[allow(clippy::unnecessary_wraps)] // serde default for an Option field
@@ -158,6 +175,11 @@ impl Query {
             harnesses: None,
             limit: None,
             hits_per_doc: default_hits_per_doc(),
+            cwd: None,
+            git_branch: None,
+            model: None,
+            since: None,
+            until: None,
         }
     }
 
@@ -575,11 +597,54 @@ impl Index {
 
 impl Doc {
     fn selected(&self, query: &Query) -> bool {
-        query
-            .harnesses
-            .as_ref()
-            .is_none_or(|hs| hs.contains(&self.key.harness))
+        if let Some(hs) = &query.harnesses
+            && !hs.contains(&self.key.harness)
+        {
+            return false;
+        }
+        if let Some(dir) = &query.cwd {
+            let Some(cwd) = self.meta.cwd.as_deref() else {
+                return false;
+            };
+            if !path_under(cwd, dir) {
+                return false;
+            }
+        }
+        if let Some(branch) = &query.git_branch {
+            let Some(doc_branch) = self.meta.git_branch.as_deref() else {
+                return false;
+            };
+            if doc_branch != branch {
+                return false;
+            }
+        }
+        if let Some(model) = &query.model {
+            let Some(doc_model) = self.meta.model.as_deref() else {
+                return false;
+            };
+            if !doc_model.to_lowercase().contains(&model.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(since) = query.since
+            && self.meta.timestamp < since
+        {
+            return false;
+        }
+        if let Some(until) = query.until
+            && self.meta.timestamp > until
+        {
+            return false;
+        }
+        true
     }
+}
+
+fn path_under(session_cwd: &str, dir: &str) -> bool {
+    let p_cwd = Path::new(session_cwd);
+    let p_dir = Path::new(dir);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(p_cwd).starts_with(canon(p_dir))
 }
 
 /// Pass-1 result for one document: its index, best line score, and each

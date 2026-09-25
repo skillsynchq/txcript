@@ -335,3 +335,337 @@ fn codec_fixpoint_through_common_loses_nothing() {
     let back = codex::Codex::to_common(&native).unwrap();
     assert_eq!(common, back);
 }
+
+#[test]
+fn from_common_denormalizes_bash_to_exec_command() {
+    let mut common = sample_common();
+    if let common::Block::ToolUse {
+        tool: common::Tool::Bash { workdir, .. },
+        ..
+    } = &mut common.body[2].content[0]
+    {
+        *workdir = Some("/repo with spaces".into());
+    }
+    let native = codex::Codex::from_common(&common).unwrap();
+    let mut found = false;
+    for line in &native.body {
+        if line.kind != "response_item"
+            || line.payload.get("type").and_then(serde_json::Value::as_str) != Some("function_call")
+        {
+            continue;
+        }
+        let name = line
+            .payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        // No generic canonical name may leak: Codex knows only exec_command.
+        assert_ne!(
+            name, "Bash",
+            "from_common must not emit the canonical Bash name"
+        );
+        if name == "exec_command" {
+            let args: serde_json::Value = line
+                .payload
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(serde_json::Value::Null);
+            if args.get("cmd").and_then(serde_json::Value::as_str) == Some("ls") {
+                assert_eq!(args["workdir"], "/repo with spaces");
+                assert_eq!(line.payload["call_id"], "call-x");
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "from_common must emit native exec_command instead of generic Bash"
+    );
+}
+
+#[test]
+fn from_common_denormalizes_edit_to_apply_patch_with_error_result() {
+    let mut common = sample_common();
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-patch".into(),
+            tool: common::Tool::Edit {
+                file_path: "src/main.rs".into(),
+                old_string: "old".into(),
+                new_string: "new".into(),
+                replace_all: false,
+            },
+        }],
+        timestamp: ts("2026-01-02T03:04:11.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-patch".into(),
+            content: common::ToolOutput::Text("Success.".into()),
+            is_error: true,
+        }],
+        timestamp: ts("2026-01-02T03:04:12.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    // Structured output keeps its shape through the envelope's `output`
+    // field instead of flattening to text as `function_call_output` did.
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "call-patch-json".into(),
+            tool: common::Tool::Write {
+                file_path: "src/new.rs".into(),
+                content: "fn main() {}".into(),
+            },
+        }],
+        timestamp: ts("2026-01-02T03:04:13.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "call-patch-json".into(),
+            content: common::ToolOutput::Json(serde_json::json!({"files": ["src/new.rs"]})),
+            is_error: false,
+        }],
+        timestamp: ts("2026-01-02T03:04:14.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    let native = codex::Codex::from_common(&common).unwrap();
+    assert!(
+        native.body.iter().any(|line| {
+            line.kind == "response_item"
+                && line.payload.get("type").and_then(serde_json::Value::as_str)
+                    == Some("custom_tool_call")
+                && line.payload.get("name").and_then(serde_json::Value::as_str)
+                    == Some("apply_patch")
+        }),
+        "from_common must emit native apply_patch instead of generic Edit"
+    );
+    // The envelope round-trips through to_common losslessly, including the
+    // error bit via exit_code.
+    let back = codex::Codex::to_common(&native).unwrap();
+    assert_eq!(common, back);
+}
+
+#[test]
+fn from_common_patch_envelopes_encode_multiline_and_empty_files() {
+    for (tool, expected_input) in [
+        (
+            common::Tool::Edit {
+                file_path: "src/main.rs".into(),
+                old_string: "old\n\n".into(),
+                new_string: "new\n\n".into(),
+                replace_all: false,
+            },
+            "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n-\n+new\n+\n*** End Patch",
+        ),
+        (
+            common::Tool::Write {
+                file_path: "notes.md".into(),
+                content: "first\nsecond\n\n".into(),
+            },
+            "*** Begin Patch\n*** Add File: notes.md\n+first\n+second\n+\n*** End Patch",
+        ),
+        (
+            common::Tool::Write {
+                file_path: "empty.txt".into(),
+                content: String::new(),
+            },
+            "*** Begin Patch\n*** Add File: empty.txt\n*** End Patch",
+        ),
+    ] {
+        let mut common = sample_common();
+        common.body[2].content = vec![common::Block::ToolUse {
+            id: "call-x".into(),
+            tool,
+        }];
+        let native = codex::Codex::from_common(&common).unwrap();
+        let call = native
+            .body
+            .iter()
+            .find(|line| line.kind == "response_item" && line.payload["type"] == "custom_tool_call")
+            .unwrap();
+        assert_eq!(call.payload["input"], expected_input);
+    }
+}
+
+#[test]
+fn from_common_raw_patch_inputs_are_always_strings() {
+    let patch =
+        "*** Begin Patch\n*** Delete File: old.rs\n*** Add File: new.rs\n+hello\n*** End Patch";
+    for input in [
+        serde_json::json!({"patch": patch, "files": ["old.rs", "new.rs"]}),
+        // Failed native calls can carry malformed arguments. Their history
+        // still needs a string input, as required by Codex's CustomToolCall.
+        serde_json::json!({"unexpected": "argument"}),
+        serde_json::json!(["unexpected", "array"]),
+        serde_json::Value::Null,
+    ] {
+        let mut common = sample_common();
+        common.body[2].content = vec![common::Block::ToolUse {
+            id: "call-x".into(),
+            tool: common::Tool::Raw {
+                tool_name: "ApplyPatch".into(),
+                input,
+            },
+        }];
+        let native = codex::Codex::from_common(&common).unwrap();
+        let call = native
+            .body
+            .iter()
+            .find(|line| line.kind == "response_item" && line.payload["type"] == "custom_tool_call")
+            .unwrap();
+        assert!(call.payload["input"].is_string(), "{call:?}");
+        let result = native
+            .body
+            .iter()
+            .find(|line| {
+                line.kind == "response_item" && line.payload["type"] == "custom_tool_call_output"
+            })
+            .unwrap();
+        assert_eq!(call.payload["call_id"], result.payload["call_id"]);
+        let back = codex::Codex::to_common(&native).unwrap();
+        assert_eq!(common, back);
+    }
+}
+
+#[test]
+fn from_common_keeps_foreign_web_search_paired_with_its_function_result() {
+    let mut common = sample_common();
+    common.body[2].content = vec![common::Block::ToolUse {
+        id: "call-x".into(),
+        tool: common::Tool::Raw {
+            tool_name: "WebSearch".into(),
+            input: serde_json::json!({"query": "rust lang"}),
+        },
+    }];
+    let native = codex::Codex::from_common(&common).unwrap();
+    // A foreign search input has no native WebSearchAction type tag, and
+    // its function result must keep a corresponding function call.
+    assert!(
+        !native.body.iter().any(|line| {
+            line.kind == "response_item" && line.payload["type"] == "web_search_call"
+        })
+    );
+    assert!(native.body.iter().any(|line| {
+        line.kind == "response_item"
+            && line.payload["type"] == "function_call"
+            && line.payload["name"] == "WebSearch"
+            && line.payload["call_id"] == "call-x"
+    }));
+    assert_eq!(common, codex::Codex::to_common(&native).unwrap());
+}
+
+#[test]
+fn interleaved_tool_calls_keep_their_results_through_disk() {
+    use common::{Block, Tool, ToolOutput};
+
+    let call = |id: &str, tool| Block::ToolUse {
+        id: id.into(),
+        tool,
+    };
+    let result = |id: &str, content, is_error| Block::ToolResult {
+        tool_use_id: id.into(),
+        content,
+        is_error,
+    };
+    let shell = Tool::Bash {
+        command: "ls".into(),
+        workdir: Some("/repo with spaces".into()),
+        timeout_ms: None,
+        description: None,
+        run_in_background: false,
+    };
+    let mut common = sample_common();
+    let mut calls = common.body[2].clone();
+    calls.content = vec![
+        call(
+            "a",
+            Tool::Edit {
+                file_path: "main.rs".into(),
+                old_string: "old".into(),
+                new_string: "new".into(),
+                replace_all: false,
+            },
+        ),
+        call(
+            "b",
+            Tool::Write {
+                file_path: "new.rs".into(),
+                content: "new".into(),
+            },
+        ),
+        call("c", shell.clone()),
+    ];
+    // Finish c and b first, then reuse b while a is still pending.
+    let mut results = common.body[3].clone();
+    results.content = vec![
+        result("c", ToolOutput::Text("shell c".into()), false),
+        result("b", ToolOutput::Text("write b".into()), false),
+    ];
+    let mut reused = calls.clone();
+    reused.content = vec![call("b", shell)];
+    let mut remaining = results.clone();
+    remaining.content = vec![
+        result(
+            "a",
+            ToolOutput::Json(serde_json::json!({"error": "conflict"})),
+            true,
+        ),
+        result("b", ToolOutput::Text("shell b".into()), false),
+    ];
+    common.body = vec![calls, results, reused, remaining];
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = codex::CodexStore::new(dir.path());
+    let native = codex::Codex::from_common(&common).unwrap();
+    let saved = store.save(&native).unwrap();
+    let reloaded = store.load(&saved.reference).unwrap();
+    let kinds: Vec<_> = reloaded
+        .body
+        .iter()
+        .filter(|line| line.kind == "response_item")
+        .map(|line| {
+            (
+                line.payload["call_id"].as_str().unwrap(),
+                line.payload["type"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("a", "custom_tool_call"),
+            ("b", "custom_tool_call"),
+            ("c", "function_call"),
+            ("c", "function_call_output"),
+            ("b", "custom_tool_call_output"),
+            ("b", "function_call"),
+            ("a", "custom_tool_call_output"),
+            ("b", "function_call_output"),
+        ]
+    );
+    let back = codex::Codex::to_common(&reloaded).unwrap();
+    // Codex stores one response item per block, splitting multi-block messages.
+    let blocks = |transcript: Transcript<Common>| {
+        transcript
+            .body
+            .into_iter()
+            .flat_map(|msg| msg.content)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(blocks(common), blocks(back));
+}

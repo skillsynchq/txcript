@@ -269,6 +269,20 @@ pub enum SessionCommand {
         /// Only sessions recorded in or under this working directory
         #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         cwd: Option<PathBuf>,
+        /// Only sessions on this git branch (exact match)
+        #[arg(long, value_name = "BRANCH")]
+        git_branch: Option<String>,
+        /// Only sessions that used this model (case-insensitive substring)
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Only sessions started at or after this time (RFC3339 or
+        /// YYYY-MM-DD, a bare date meaning that local midnight)
+        #[arg(long, value_name = "WHEN", value_parser = parse_since)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Only sessions started at or before this time (RFC3339 or
+        /// YYYY-MM-DD, a bare date meaning the end of that local day)
+        #[arg(long, value_name = "WHEN", value_parser = parse_until)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
     },
 }
 
@@ -402,7 +416,109 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             with,
             from,
             cwd,
-        } => query::cmd_query(pattern, with, from, cwd.as_deref(), cache),
+            git_branch,
+            model,
+            since,
+            until,
+        } => query::cmd_query(
+            pattern,
+            with,
+            from,
+            cwd.as_deref(),
+            git_branch.as_deref(),
+            model.as_deref(),
+            since,
+            until,
+            cache,
+        ),
+    }
+}
+
+/// Strip the Windows verbatim-device prefix (`\\?\`, including `\\?\UNC\`)
+/// that `canonicalize` adds, so vanished paths still match canonicalized
+/// parents. Wide-char math keeps non-UTF8 paths intact.
+#[cfg(windows)]
+const VERBATIM_PREFIX: &[u16] = &[0x5C, 0x5C, 0x3F, 0x5C]; // `\\?\`
+#[cfg(windows)]
+const UNC_PREFIX: &[u16] = &[0x5C, 0x5C, 0x3F, 0x5C, 0x55, 0x4E, 0x43, 0x5C]; // `\\?\UNC\`
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if let Some(rest) = wide.strip_prefix(UNC_PREFIX) {
+        // `\\?\UNC\server\share` ⟺ `\\server\share`.
+        let mut full = vec![0x5C, 0x5C];
+        full.extend_from_slice(rest);
+        std::ffi::OsString::from_wide(&full).into()
+    } else if let Some(rest) = wide.strip_prefix(VERBATIM_PREFIX) {
+        std::ffi::OsString::from_wide(rest).into()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+/// Component-wise `starts_with` that folds case on Windows, where `C:\Users`
+/// and `c:\users` are the same directory. Non-Windows keeps the exact
+/// `Path::starts_with`.
+fn path_starts_with(child: &std::path::Path, parent: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut child_comps = child.components();
+        let mut parent_comps = parent.components();
+        loop {
+            match (parent_comps.next(), child_comps.next()) {
+                (None, _) => return true,
+                (Some(_), None) => return false,
+                (Some(p), Some(c)) => {
+                    // Unicode lowercase approximates the filesystem's own
+                    // case folding; ASCII-only would miss e.g. `é` vs `É`.
+                    if p.as_os_str().to_string_lossy().to_lowercase()
+                        != c.as_os_str().to_string_lossy().to_lowercase()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        child.starts_with(parent)
+    }
+}
+
+/// Canonicalize the longest existing prefix of `path`, re-appending the
+/// vanished tail verbatim, so the parent still resolves symlinks, junctions,
+/// or 8.3 short names the raw spelling would mismatch.
+fn canonicalize_lenient(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(base) = current.canonicalize() {
+            let mut out = strip_verbatim_prefix(&base);
+            for component in tail.iter().rev() {
+                out.push(component);
+            }
+            return out;
+        }
+        let mut components = current.components();
+        match components.next_back() {
+            // Empty path, or only a prefix/root remains: nothing resolvable.
+            None | Some(Component::Prefix(_) | Component::RootDir) => {
+                return strip_verbatim_prefix(path);
+            }
+            Some(last) => {
+                tail.push(last.as_os_str().to_os_string());
+                current = components.as_path();
+            }
+        }
     }
 }
 
@@ -415,8 +531,10 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
 /// vanished directories compare as plain components.
 #[must_use]
 pub fn under_dir(session_cwd: &str, dir: &std::path::Path) -> bool {
-    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    canon(std::path::Path::new(session_cwd)).starts_with(canon(dir))
+    path_starts_with(
+        &canonicalize_lenient(std::path::Path::new(session_cwd)),
+        &canonicalize_lenient(dir),
+    )
 }
 
 /// The `--from`/`--cwd` session filters shared by `list` and `query`.
@@ -692,6 +810,46 @@ mod filter_tests {
             None,
             Some(repo)
         ));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_leaves_plain_paths_alone() {
+        let p = std::path::Path::new("some/relative/dir");
+        assert_eq!(super::strip_verbatim_prefix(p), p.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_strips_device_and_unc_forms() {
+        assert_eq!(
+            super::strip_verbatim_prefix(std::path::Path::new(r"\\?\C:\some\repo")),
+            std::path::PathBuf::from(r"C:\some\repo")
+        );
+        assert_eq!(
+            super::strip_verbatim_prefix(std::path::Path::new(r"\\?\UNC\server\share")),
+            std::path::PathBuf::from(r"\\server\share")
+        );
+    }
+
+    // Drive-letter paths only parse where `\` separates components.
+    // The tempdir case is the reported scenario: live `dir`, vanished child.
+    #[cfg(windows)]
+    #[test]
+    fn cwd_filter_matches_vanished_child_of_live_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("packages").join("foo");
+        assert!(super::under_dir(gone.to_str().unwrap(), dir.path()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cwd_filter_handles_windows_verbatim_prefixes_and_casing() {
+        let dir = std::path::Path::new(r"C:\some\repo");
+        assert!(super::under_dir(r"C:\some\repo\packages\foo", dir));
+        assert!(super::under_dir(r"c:\Some\Repo\packages\foo", dir));
+        assert!(super::under_dir(r"C:/some/repo/packages/foo", dir));
+        assert!(!super::under_dir(r"C:\some\repo2", dir));
+        assert!(!super::under_dir(r"C:\other\repo", dir));
     }
 }
 
@@ -2157,12 +2315,17 @@ mod query {
 
     /// Build the same filtered index used by the CLI for the MCP search tool.
     #[cfg(feature = "mcp")]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn index_for(
         from: Option<HarnessId>,
         cwd: Option<&Path>,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<Index, String> {
-        build_index(from, cwd, cache).map(|(index, _)| index)
+        build_index(from, cwd, git_branch, model, since, until, cache).map(|(index, _)| index)
     }
 
     /// The query behind `txcript query` and the MCP search tool: the pattern
@@ -2175,14 +2338,19 @@ mod query {
         q
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn cmd_query(
         pattern: Option<String>,
         with: Option<HarnessId>,
         from: Option<HarnessId>,
         cwd: Option<&Path>,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<std::process::ExitCode, String> {
-        let (index, sessions) = build_index(from, cwd, cache)?;
+        let (index, sessions) = build_index(from, cwd, git_branch, model, since, until, cache)?;
         match pattern {
             Some(pattern) => {
                 if with.is_some() {
@@ -2213,7 +2381,9 @@ mod query {
     }
 
     /// Build the search index and session lookup over every local session
-    /// passing the `from`/`cwd` filters.
+    /// passing the `from`/`cwd` filters, and applying the optional
+    /// `git_branch`, `model`, `since`, and `until` metadata filters so that
+    /// only matching sessions are indexed and returned.
     ///
     /// Sessions parse and extract on every core: workers pull the next
     /// undrained session, parse it, extract its searchable lines, and send
@@ -2230,9 +2400,14 @@ mod query {
     /// # Errors
     /// Returns an error when an explicitly selected live store cannot be
     /// discovered or read.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn build_index(
         from: Option<HarnessId>,
         cwd: Option<&Path>,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<(Index, Sessions), String> {
         let found = super::discover_with_spinner(from)?;
@@ -2251,10 +2426,38 @@ mod query {
         } else {
             HashSet::new()
         };
-        let scoped: Vec<local::Session> = found
-            .into_iter()
-            .filter(|session| super::selected(session, from, cwd))
-            .collect();
+        let scoped: Vec<local::Session> =
+            found
+                .into_iter()
+                .filter(|session| {
+                    if !super::selected(session, from, cwd) {
+                        return false;
+                    }
+                    if let Some(branch) = git_branch
+                        && session.meta.git_branch.as_deref() != Some(branch)
+                    {
+                        return false;
+                    }
+                    if let Some(model_filter) = model
+                        && !session.meta.model.as_deref().is_some_and(|m| {
+                            m.to_lowercase().contains(&model_filter.to_lowercase())
+                        })
+                    {
+                        return false;
+                    }
+                    if let Some(since) = since
+                        && session.meta.timestamp < since
+                    {
+                        return false;
+                    }
+                    if let Some(until) = until
+                        && session.meta.timestamp > until
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
         let total = scoped.len();
 
         // Cursors for the cache check. Empty cursors never hit, so a session

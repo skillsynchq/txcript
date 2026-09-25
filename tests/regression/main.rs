@@ -6,6 +6,8 @@
 //! incident can be understood from this file alone. General invariants
 //! belong in `tests/integration/`; see `tests/README.md`.
 
+mod codex_pairing;
+
 use chrono::{DateTime, Utc};
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
 use txcript::harness::{claude_code, codex, grok};

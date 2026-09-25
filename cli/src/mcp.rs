@@ -50,6 +50,18 @@ struct SearchSessionsRequest {
     /// Omit to search every directory. Sessions without a recorded cwd are
     /// excluded when this filter is present.
     cwd: Option<String>,
+    /// Only sessions on this git branch (exact match). Omit to include all
+    /// branches.
+    git_branch: Option<String>,
+    /// Only sessions that used this model (case-insensitive substring).
+    /// Omit to include all models.
+    model: Option<String>,
+    /// Only sessions started at or after this time. RFC3339 string, e.g.
+    /// `2025-01-01T00:00:00Z` or bare date `2025-01-01` (UTC midnight).
+    since: Option<String>,
+    /// Only sessions started at or before this time. RFC3339 string, e.g.
+    /// `2025-12-31T23:59:59Z` or bare date `2025-12-31` (end of UTC day).
+    until: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -291,7 +303,7 @@ impl SessionServer {
     /// Search local session content with the same matching, harness, and
     /// working-directory behavior as `txcript query <pattern>`.
     #[tool(
-        description = "Search local coding-agent sessions for a literal, case-insensitive pattern: it must appear in a line exactly as written, spaces included. Optional `from` and `cwd` filters match the txcript CLI; omitted filters search all harnesses or directories.",
+        description = "Search local coding-agent sessions for a literal, case-insensitive pattern: it must appear in a line exactly as written, spaces included. Optional `from`, `cwd`, `git_branch`, `model`, `since`, and `until` filters match the txcript CLI flags; omitted filters search all sessions.",
         annotations(title = "Search sessions", read_only_hint = true)
     )]
     fn search_sessions(
@@ -300,8 +312,28 @@ impl SessionServer {
     ) -> Result<Json<SearchResults>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         let cwd = request.cwd.as_deref().map(Path::new);
-        let index = super::query::index_for(from, cwd, self.cache.as_deref())
-            .map_err(|error| ErrorData::internal_error(error, None))?;
+        let since = request
+            .since
+            .as_deref()
+            .map(super::parse_since)
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(format!("`since`: {e}"), None))?;
+        let until = request
+            .until
+            .as_deref()
+            .map(super::parse_until)
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(format!("`until`: {e}"), None))?;
+        let index = super::query::index_for(
+            from,
+            cwd,
+            request.git_branch.as_deref(),
+            request.model.as_deref(),
+            since,
+            until,
+            self.cache.as_deref(),
+        )
+        .map_err(|error| ErrorData::internal_error(error, None))?;
         let mut query = super::query::user_query(&request.pattern);
         // Match the CLI's one-shot output bounds.
         query.limit = Some(20);

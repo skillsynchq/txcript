@@ -412,3 +412,133 @@ fn fragment_covers_ranges_and_rejects_out_of_bounds() {
     assert_eq!(all, t.body.as_slice());
     assert_eq!(t.fragment(&Span(0..t.body.len() + 1)), None);
 }
+
+// ── multi-criteria filter tests ─────────────────────────────────────────────
+
+/// Build a two-document index: "alpha" on branch `main`, "beta" on `dev`.
+/// The common search pattern "needle" appears in both.
+fn two_doc_index() -> Index {
+    let make = |id: &str, branch: &str, model: Option<&str>, secs: i64| {
+        let mut m = meta(id, secs);
+        m.git_branch = Some(branch.to_string());
+        m.model = model.map(str::to_string);
+        Transcript::new(m, vec![message(Role::User, vec![text("needle content")])])
+    };
+    let mut index = Index::new();
+    index.insert(
+        key(HarnessId::ClaudeCode, "alpha"),
+        &make("alpha", "main", Some("claude-3-5-sonnet"), 0),
+    );
+    index.insert(
+        key(HarnessId::ClaudeCode, "beta"),
+        &make("beta", "dev", Some("gpt-4o"), 3600),
+    );
+    index
+}
+
+#[test]
+fn query_filter_git_branch_exact_match() {
+    let index = two_doc_index();
+
+    let mut q = Query::substring("needle");
+    q.git_branch = Some("main".to_string());
+    let hits = index.query(&q);
+    assert_eq!(hits.len(), 1, "only the 'main' branch session");
+    assert_eq!(hits[0].key.id, "alpha");
+
+    // Unknown branch → no hits.
+    q.git_branch = Some("nonexistent".to_string());
+    assert!(index.query(&q).is_empty());
+
+    // No filter → both sessions.
+    q.git_branch = None;
+    assert_eq!(index.query(&q).len(), 2);
+}
+
+#[test]
+fn query_filter_model_case_insensitive_substring() {
+    let index = two_doc_index();
+
+    // "sonnet" is a substring of "claude-3-5-sonnet".
+    let mut q = Query::substring("needle");
+    q.model = Some("SONNET".to_string());
+    let hits = index.query(&q);
+    assert_eq!(hits.len(), 1, "only the claude sonnet session");
+    assert_eq!(hits[0].key.id, "alpha");
+
+    // "gpt" matches the beta session.
+    q.model = Some("gpt".to_string());
+    let hits = index.query(&q);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key.id, "beta");
+
+    // No filter → both.
+    q.model = None;
+    assert_eq!(index.query(&q).len(), 2);
+}
+
+#[test]
+fn query_filter_since_and_until() {
+    let index = two_doc_index();
+
+    // Base timestamp is 1_780_000_000; beta is +3600 s later.
+    let base = Utc.timestamp_opt(1_780_000_000, 0).single().unwrap();
+    let after_alpha = Utc.timestamp_opt(1_780_001_000, 0).single().unwrap();
+    let after_beta = Utc.timestamp_opt(1_780_010_000, 0).single().unwrap();
+
+    let mut q = Query::substring("needle");
+
+    // since=after_alpha only includes beta.
+    q.since = Some(after_alpha);
+    let hits = index.query(&q);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key.id, "beta");
+
+    // until=base only includes alpha (beta is strictly after).
+    q.since = None;
+    q.until = Some(base);
+    let hits = index.query(&q);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key.id, "alpha");
+
+    // since and until together can produce zero results.
+    q.since = Some(after_beta);
+    q.until = Some(after_beta);
+    assert!(index.query(&q).is_empty());
+
+    // No filter → both.
+    q.since = None;
+    q.until = None;
+    assert_eq!(index.query(&q).len(), 2);
+}
+
+#[test]
+fn query_filter_cwd_path_prefix() {
+    // The meta helper sets cwd = "/work/replay"; make a second with a sibling dir.
+    let t_a = Transcript::new(
+        meta("a", 0),
+        vec![message(Role::User, vec![text("needle content")])],
+    );
+    let mut m_b = meta("b", 0);
+    m_b.cwd = Some("/work/other".to_string());
+    let t_b = Transcript::new(m_b, vec![message(Role::User, vec![text("needle content")])]);
+
+    let mut index = Index::new();
+    index.insert(key(HarnessId::ClaudeCode, "a"), &t_a);
+    index.insert(key(HarnessId::ClaudeCode, "b"), &t_b);
+
+    // "/work/replay" prefix: only session a.
+    let mut q = Query::substring("needle");
+    q.cwd = Some("/work/replay".to_string());
+    let hits = index.query(&q);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key.id, "a");
+
+    // "/work" is a parent: both sessions are under it.
+    q.cwd = Some("/work".to_string());
+    assert_eq!(index.query(&q).len(), 2);
+
+    // No filter → both.
+    q.cwd = None;
+    assert_eq!(index.query(&q).len(), 2);
+}

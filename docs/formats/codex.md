@@ -91,7 +91,15 @@ the form `["bash"|"sh"|"zsh", "-lc"|"-c", cmd]` collapse to the inner command.
   representation keeps every payload as raw JSON, so native ↔ disk round-trips are lossless.
 - **`apply_patch` is best-effort.** Only a lone single-hunk update maps to `Edit` and a lone file
   add to `Write`; multi-file, multi-hunk, delete, and move patches stay as a raw `ApplyPatch`
-  with the touched paths listed.
+  with the touched paths listed. On export, `Edit` and `Write` become `apply_patch`
+  custom-tool calls, and raw `ApplyPatch` envelopes are unwrapped. Their results use
+  `custom_tool_call_output`, preserving the error flag. Patches are line-based:
+  `replace_all` becomes one hunk, Codex can normalize trailing blank lines, and the Common
+  reader does not retain the final line terminator. Exported `Write` calls use an add-file
+  patch, which does not encode whether the original call created or overwrote a file.
+- **Shell export.** `Bash` becomes `exec_command` with `cmd` and optional `workdir`.
+  The canonical timeout, description, and background fields have no matching fields in
+  this mapping and are omitted. Other tools keep their canonical function-call form.
 - **Resume is picky.** `from_common` must emit `model_provider: "openai"` in `session_meta` —
   current Codex resolves a null provider to the empty name and fails resume with
   ``Model provider `` not found``. `base_instructions` may be null (defaults substitute). Foreign
@@ -106,7 +114,9 @@ the form `["bash"|"sh"|"zsh", "-lc"|"-c", cmd]` collapse to the inner command.
   malformed lines are skipped by the JSONL parser rather than aborting the file; a `session_meta`
   without an id disqualifies a file from discovery instead of producing a broken session.
 - **Duplicate results are by design.** Seeing both `exec_command_end` and a matching
-  `function_call_output` in a file is normal; only one becomes a `ToolResult`.
+  `function_call_output` in a file is normal; only one becomes a `ToolResult`. Matching
+  and duplicate suppression follow each function/custom call occurrence, so a completed
+  ID can be reused without changing the result type or dropping an earlier result.
 
 ## References
 

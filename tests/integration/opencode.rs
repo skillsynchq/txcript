@@ -252,6 +252,131 @@ fn codec_fixpoint_through_common_loses_nothing() {
     assert_eq!(common, back);
 }
 
+fn sample_parallel_common() -> Transcript<Common> {
+    let meta = common::Meta {
+        id: "ses_parallel".into(),
+        timestamp: ts("2026-01-02T03:04:05.000Z"),
+        cwd: Some("/repo".into()),
+        git_branch: None,
+        title: Some("Parallel".into()),
+        cli_version: Some("1.15.0".into()),
+        model: Some("claude-opus-4-7".into()),
+    };
+    let model = || Some("claude-opus-4-7".to_string());
+    let body = vec![
+        common::Message {
+            role: common::Role::User,
+            content: vec![common::Block::Text {
+                text: "read and edit files".into(),
+            }],
+            timestamp: ts("2026-01-02T03:04:06.000Z"),
+            model: None,
+            stop_reason: None,
+            usage: None,
+        },
+        common::Message {
+            role: common::Role::Assistant,
+            content: vec![
+                common::Block::ToolUse {
+                    id: "call-1".into(),
+                    tool: common::Tool::Read {
+                        file_path: "/repo/a.rs".into(),
+                        offset: None,
+                        limit: None,
+                    },
+                },
+                common::Block::ToolUse {
+                    id: "call-2".into(),
+                    tool: common::Tool::Edit {
+                        file_path: "/repo/b.rs".into(),
+                        old_string: "foo".into(),
+                        new_string: "bar".into(),
+                        replace_all: false,
+                    },
+                },
+            ],
+            timestamp: ts("2026-01-02T03:04:07.000Z"),
+            model: model(),
+            stop_reason: Some(common::StopReason::ToolUse),
+            usage: None,
+        },
+        common::Message {
+            role: common::Role::User,
+            content: vec![
+                common::Block::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: common::ToolOutput::Text("file content a".into()),
+                    is_error: false,
+                },
+                common::Block::ToolResult {
+                    tool_use_id: "call-2".into(),
+                    content: common::ToolOutput::Text("edited b".into()),
+                    is_error: false,
+                },
+            ],
+            timestamp: ts("2026-01-02T03:04:08.000Z"),
+            model: None,
+            stop_reason: None,
+            usage: None,
+        },
+        common::Message {
+            role: common::Role::Assistant,
+            content: vec![common::Block::Text {
+                text: "all changes finished".into(),
+            }],
+            timestamp: ts("2026-01-02T03:04:09.000Z"),
+            model: model(),
+            stop_reason: Some(common::StopReason::EndTurn),
+            usage: Some(common::Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+        },
+    ];
+    Transcript::new(meta, body)
+}
+
+#[test]
+fn parallel_tool_calls_and_results_preserve_valid_parent_ids() {
+    let transcript = sample_parallel_common();
+    let export = opencode::OpenCode::from_common(&transcript).unwrap();
+
+    let emitted_user_ids: std::collections::HashSet<String> = export
+        .body
+        .messages
+        .iter()
+        .filter(|m| m.info.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .filter_map(|m| {
+            m.info
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+
+    assert_eq!(
+        emitted_user_ids.len(),
+        1,
+        "only the prompt user message is emitted"
+    );
+
+    for m in &export.body.messages {
+        if m.info.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            let parent_id = m
+                .info
+                .get("parentID")
+                .and_then(|p| p.as_str())
+                .expect("assistant message must have parentID");
+            assert!(
+                emitted_user_ids.contains(parent_id),
+                "assistant parentID '{parent_id}' must resolve to an emitted user message",
+            );
+        }
+    }
+}
+
 #[test]
 fn custom_and_mcp_tool_names_preserve_exact_casing() {
     let cases = [
