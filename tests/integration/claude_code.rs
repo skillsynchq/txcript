@@ -4,7 +4,7 @@
 //! extraction.
 
 use chrono::{DateTime, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use txcript::common;
 use txcript::harness::claude_code;
 use txcript::{Codec, Common, Store, TextCodec, Transcript};
@@ -570,5 +570,300 @@ fn commands_are_searchable_by_name() {
         hits.iter()
             .any(|hit| hit.origin == txcript::search::Origin::ToolUse),
         "the command name should be searchable"
+    );
+}
+
+/// Ctrl+C mid-tool leaves an assistant turn ending in an unanswered `ToolUse`.
+/// Every exported `tool_use` needs its `tool_result`, or the Anthropic API
+/// rejects the resumed session with HTTP 400.
+#[test]
+fn from_common_closes_dangling_tool_call_with_aborted_result() {
+    let mut common = sample_common();
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "dangling".into(),
+            tool: common::Tool::Bash {
+                command: "sleep 60".into(),
+                workdir: None,
+                timeout_ms: None,
+                description: None,
+                run_in_background: false,
+            },
+        }],
+        timestamp: ts("2026-01-02T03:04:09.000Z"),
+        model: Some("claude-opus-4-8".into()),
+        stop_reason: Some(common::StopReason::Aborted),
+        usage: None,
+    });
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let results = exported_results(&native);
+    assert!(
+        results.contains(&("dangling".to_string(), true)),
+        "an unanswered call must export an error result, got {results:?}"
+    );
+    // Paired calls must not gain a duplicate result.
+    assert_eq!(
+        results.iter().filter(|(id, _)| id == "t1").count(),
+        1,
+        "paired calls keep exactly one result, got {results:?}"
+    );
+}
+
+fn exported_results(native: &Transcript<claude_code::ClaudeCode>) -> Vec<(String, bool)> {
+    let body = serde_json::to_value(native.body.clone()).unwrap();
+    let mut results = Vec::new();
+    if let Value::Array(records) = &body {
+        for record in records {
+            if let Some(blocks) = record
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        results.push((
+                            block["tool_use_id"].as_str().unwrap_or("").to_string(),
+                            block
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+/// An id answered once then reused by a dangling call closes only the open
+/// occurrence; the settled pair is untouched.
+#[test]
+fn from_common_closes_only_the_reused_call_left_open() {
+    let bash = || common::Tool::Bash {
+        command: "ls".into(),
+        workdir: None,
+        timeout_ms: None,
+        description: None,
+        run_in_background: false,
+    };
+    let mut common = sample_common();
+    let call = |id: &str, tool| common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: id.into(),
+            tool,
+        }],
+        timestamp: ts("2026-01-02T03:04:09.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    };
+    let result = |text: &str| common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "reused".into(),
+            content: common::ToolOutput::Text(text.into()),
+            is_error: false,
+        }],
+        timestamp: ts("2026-01-02T03:04:10.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    };
+    common.body.push(call("reused", bash()));
+    common.body.push(result("first"));
+    common.body.push(call("reused", bash()));
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let results = exported_results(&native);
+    assert_eq!(
+        results.iter().filter(|(id, _)| id == "reused").count(),
+        2,
+        "one settled result plus one synthesized, got {results:?}"
+    );
+    assert!(
+        results.contains(&("reused".to_string(), true)),
+        "the open reuse must close as an error, got {results:?}"
+    );
+}
+
+/// Two open calls in one turn close together: the following message must
+/// begin with a matching number of results.
+#[test]
+fn from_common_closes_every_dangling_call_in_one_turn() {
+    let bash = |command: &str| common::Tool::Bash {
+        command: command.into(),
+        workdir: None,
+        timeout_ms: None,
+        description: None,
+        run_in_background: false,
+    };
+    let mut common = sample_common();
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![
+            common::Block::ToolUse {
+                id: "open-1".into(),
+                tool: bash("sleep 60"),
+            },
+            common::Block::ToolUse {
+                id: "open-2".into(),
+                tool: bash("sleep 61"),
+            },
+        ],
+        timestamp: ts("2026-01-02T03:04:09.000Z"),
+        model: None,
+        stop_reason: Some(common::StopReason::Aborted),
+        usage: None,
+    });
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let results = exported_results(&native);
+    assert!(
+        results.contains(&("open-1".to_string(), true))
+            && results.contains(&("open-2".to_string(), true)),
+        "both open calls must close as errors, got {results:?}"
+    );
+    // Same input, identical output: insert order must not depend on hash
+    // iteration order.
+    let again = claude_code::ClaudeCode::from_common(&common).unwrap();
+    assert_eq!(
+        serde_json::to_value(native.body).unwrap(),
+        serde_json::to_value(again.body).unwrap()
+    );
+}
+
+/// A result recorded before its call (Codex web-search order) already
+/// answers it: export must not synthesize a duplicate.
+#[test]
+fn from_common_keeps_result_before_call_without_duplicate() {
+    let mut common = sample_common();
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolResult {
+            tool_use_id: "early".into(),
+            content: common::ToolOutput::Text("found".into()),
+            is_error: false,
+        }],
+        timestamp: ts("2026-01-02T03:04:09.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "early".into(),
+            tool: common::Tool::Raw {
+                tool_name: "WebSearch".into(),
+                input: serde_json::json!({"query": "pairing"}),
+            },
+        }],
+        timestamp: ts("2026-01-02T03:04:10.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let results = exported_results(&native);
+    assert_eq!(
+        results.iter().filter(|(id, _)| id == "early").count(),
+        1,
+        "the early result answers the call, got {results:?}"
+    );
+}
+
+/// An interruption followed by more conversation: the synthetic result is
+/// inserted directly after the call, where the API requires it — not at
+/// the end.
+#[test]
+fn from_common_inserts_aborted_result_immediately_after_the_call() {
+    let bash = || common::Tool::Bash {
+        command: "sleep 60".into(),
+        workdir: None,
+        timeout_ms: None,
+        description: None,
+        run_in_background: false,
+    };
+    let mut common = sample_common();
+    common.body.push(common::Message {
+        role: common::Role::Assistant,
+        content: vec![common::Block::ToolUse {
+            id: "mid".into(),
+            tool: bash(),
+        }],
+        timestamp: ts("2026-01-02T03:04:09.000Z"),
+        model: None,
+        stop_reason: Some(common::StopReason::Aborted),
+        usage: None,
+    });
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::Text {
+            text: "never mind".into(),
+        }],
+        timestamp: ts("2026-01-02T03:04:10.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let body = serde_json::to_value(native.body).unwrap();
+    let records = body.as_array().unwrap();
+    let at = records
+        .iter()
+        .position(|r| {
+            r.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|b| {
+                        b.get("type").and_then(Value::as_str) == Some("tool_use")
+                            && b.get("id").and_then(Value::as_str) == Some("mid")
+                    })
+                })
+        })
+        .unwrap();
+    let next = &records[at + 1];
+    let first = next
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.first());
+    assert!(
+        next.get("type").and_then(Value::as_str) == Some("user")
+            && first.and_then(|b| b.get("type").and_then(Value::as_str)) == Some("tool_result")
+            && first.and_then(|b| b.get("tool_use_id").and_then(Value::as_str)) == Some("mid")
+            && first
+                .and_then(|b| b.get("is_error").and_then(Value::as_bool))
+                .unwrap_or(false),
+        "the call must be followed at once by its error result, got {next}"
+    );
+}
+
+/// Slash-command calls are answered by `local_command` lines, never by
+/// `tool_result` — synthesizing one for them would itself be rejected.
+#[test]
+fn from_common_leaves_command_calls_without_tool_result() {
+    let mut common = sample_common();
+    common.body.push(common::Message {
+        role: common::Role::User,
+        content: vec![common::Block::ToolUse {
+            id: "cmd-1".into(),
+            tool: common::Tool::Command {
+                command: "/release".into(),
+                args: None,
+            },
+        }],
+        timestamp: ts("2026-01-02T03:04:09.000Z"),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    });
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let results = exported_results(&native);
+    assert!(
+        results.iter().all(|(id, _)| id != "cmd-1"),
+        "command calls must not gain a tool_result, got {results:?}"
     );
 }

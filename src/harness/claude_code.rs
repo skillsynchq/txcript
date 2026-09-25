@@ -223,8 +223,11 @@ pub(crate) fn records_to_messages(records: &[Record], fallback_ts: DateTime<Utc>
 /// the `sessionId` stamped on every line (a fresh UUID when empty). Shared
 /// with harnesses that embed Claude Code's JSONL (Cowork).
 pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Record> {
+    // Lower first: artifact calls arrive with their results, so the dangling
+    // pass below must not close them a second time.
     let lowered = lower_artifact_messages(messages);
-    let messages = lowered.as_slice();
+    let messages = close_dangling_calls(lowered);
+    let messages = messages.as_slice();
     let session_id = if meta.id.is_empty() {
         Uuid::new_v4().to_string()
     } else {
@@ -319,6 +322,89 @@ pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Reco
     }
 
     records
+}
+
+/// Close calls the transcript never answers with one aborted error result
+/// each, inserted directly after the turn that made them: the Anthropic API
+/// rejects a resume whose `tool_use` lacks its `tool_result` in the next
+/// message (HTTP 400), e.g. after Ctrl+C mid-tool — appending at the end
+/// would leave a mid-transcript interruption just as broken. Slash commands
+/// are excluded — their output rides `local_command` lines, where a stray
+/// `tool_result` is itself rejected. A result recorded before its call
+/// (Codex web-search order) already answers it, so it holds as credit
+/// instead of drawing a duplicate.
+fn close_dangling_calls(messages: Vec<Message>) -> Vec<Message> {
+    // Message indices of still-open calls per id, in opened order; each
+    // result answers the earliest opening, and anything recorded early
+    // holds as credit for a call that arrives later.
+    let mut open: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    let mut credit: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, msg) in messages.iter().enumerate() {
+        for block in &msg.content {
+            match block {
+                Block::ToolUse { id, tool } if !matches!(tool, Tool::Command { .. }) => {
+                    let id = id.as_str();
+                    if let Some(n) = credit.get_mut(id).filter(|n| **n > 0) {
+                        *n -= 1;
+                    } else {
+                        open.entry(id).or_default().push(i);
+                    }
+                }
+                Block::ToolResult { tool_use_id, .. } => {
+                    let id = tool_use_id.as_str();
+                    if let Some(v) = open.get_mut(id).filter(|v| !v.is_empty()) {
+                        v.remove(0);
+                    } else {
+                        *credit.entry(id).or_insert(0) += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Unmatched openings per message, in opened order, so each turn's
+    // results land directly after it. Owned ids: the rebuild below moves
+    // `messages`, which borrowed keys would not survive.
+    let mut inserts: Vec<Vec<String>> = vec![Vec::new(); messages.len()];
+    for (id, idxs) in &open {
+        for &i in idxs {
+            inserts[i].push((*id).to_string());
+        }
+    }
+    // HashMap iteration is randomly ordered: sort each turn's ids so the
+    // export is deterministic for the same input.
+    for ids in &mut inserts {
+        ids.sort();
+    }
+    let turns = inserts.iter().filter(|v| !v.is_empty()).count();
+    if turns == 0 {
+        return messages;
+    }
+    let mut closed = Vec::with_capacity(messages.len() + turns);
+    for (msg, ids) in messages.into_iter().zip(inserts) {
+        let timestamp = msg.timestamp;
+        closed.push(msg);
+        if !ids.is_empty() {
+            closed.push(Message {
+                role: Role::User,
+                content: ids
+                    .into_iter()
+                    .map(|tool_use_id| Block::ToolResult {
+                        tool_use_id,
+                        content: ToolOutput::Text(
+                            "Tool execution was interrupted or cancelled.".into(),
+                        ),
+                        is_error: true,
+                    })
+                    .collect(),
+                timestamp,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            });
+        }
+    }
+    closed
 }
 
 /// Claude Code's native artifact is a normal `Artifact` tool call followed
