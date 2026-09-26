@@ -125,7 +125,7 @@ pub enum StopReason {
 }
 
 /// Token accounting for one assistant turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -133,6 +133,63 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Compute total tokens represented by this usage record, including cached and creation tokens.
+    #[must_use]
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+    }
+
+    /// Whether all token counts in this record are zero or unset.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens.unwrap_or(0) == 0
+            && self.cache_creation_input_tokens.unwrap_or(0) == 0
+    }
+}
+
+impl std::ops::Add for Usage {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let combine_opt = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(x), Some(y)) => Some(x.saturating_add(y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
+
+        Self {
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_input_tokens: combine_opt(
+                self.cache_read_input_tokens,
+                rhs.cache_read_input_tokens,
+            ),
+            cache_creation_input_tokens: combine_opt(
+                self.cache_creation_input_tokens,
+                rhs.cache_creation_input_tokens,
+            ),
+        }
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl std::iter::Sum for Usage {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |acc, u| acc + u)
+    }
 }
 
 /// A base64-encoded inline image.
@@ -573,6 +630,42 @@ mod tests {
         let tool = Tool::from_canonical("Bash", input.clone());
         assert!(matches!(tool, Tool::Bash { .. }));
         assert_eq!(tool.to_canonical().1, input);
+    }
+
+    #[test]
+    fn usage_arithmetic_and_aggregation() {
+        let u1 = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: Some(25),
+            cache_creation_input_tokens: None,
+        };
+        let u2 = Usage {
+            input_tokens: 200,
+            output_tokens: 150,
+            cache_read_input_tokens: Some(30),
+            cache_creation_input_tokens: Some(10),
+        };
+
+        assert_eq!(u1.total_tokens(), 175);
+        assert_eq!(u2.total_tokens(), 390);
+        assert!(!u1.is_zero());
+        assert!(Usage::default().is_zero());
+
+        let sum = u1 + u2;
+        assert_eq!(sum.input_tokens, 300);
+        assert_eq!(sum.output_tokens, 200);
+        assert_eq!(sum.cache_read_input_tokens, Some(55));
+        assert_eq!(sum.cache_creation_input_tokens, Some(10));
+        assert_eq!(sum.total_tokens(), 565);
+
+        let mut acc = u1;
+        acc += u2;
+        assert_eq!(acc, sum);
+
+        let list = vec![u1, u2, Usage::default()];
+        let iter_sum: Usage = list.into_iter().sum();
+        assert_eq!(iter_sum, sum);
     }
 }
 

@@ -7,7 +7,9 @@
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use txcript::common::{Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput};
+use txcript::common::{
+    Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput, Usage,
+};
 use txcript::harness::fx::{Fx, FxStore};
 use txcript::{Codec, Store, TextCodec, Transcript};
 
@@ -715,5 +717,62 @@ fn unparseable_tool_arguments_fall_back_to_raw_string() {
                 input: Value::String("not json {".into()),
             },
         }
+    );
+}
+
+#[test]
+fn usage_cache_tokens_round_trip() {
+    let meta = Meta {
+        id: SESSION_ID.into(),
+        timestamp: ts("2026-07-02T01:24:11.341Z"),
+        cwd: Some("/repo".into()),
+        git_branch: None,
+        title: None,
+        cli_version: None,
+        model: Some("zai/glm-5.2".into()),
+    };
+    let t = ts("2026-07-02T01:24:12.000Z");
+    let common = Transcript::new(
+        meta,
+        vec![
+            Message {
+                role: Role::User,
+                content: vec![Block::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: t,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text {
+                    text: "hi there".into(),
+                }],
+                timestamp: t,
+                model: Some("zai/glm-5.2".into()),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(Usage {
+                    input_tokens: 150,
+                    output_tokens: 45,
+                    cache_read_input_tokens: Some(30),
+                    cache_creation_input_tokens: Some(15),
+                }),
+            },
+        ],
+    );
+
+    let native = Fx::from_common(&common).unwrap();
+    let back = Fx::to_common(&native).unwrap();
+    let last_asst_usage = back.body.iter().rev().find_map(|m| m.usage);
+    assert_eq!(
+        last_asst_usage,
+        Some(Usage {
+            input_tokens: 150,
+            output_tokens: 45,
+            cache_read_input_tokens: Some(30),
+            cache_creation_input_tokens: Some(15),
+        })
     );
 }

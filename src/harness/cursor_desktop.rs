@@ -332,19 +332,36 @@ fn flush(messages: &mut Vec<Message>, assistant: &mut Option<Message>) {
 fn bubble_usage(bubble: &Value) -> Option<Usage> {
     let input = bubble
         .pointer("/tokenCount/inputTokens")
+        .or_else(|| bubble.pointer("/tokenCount/promptTokens"))
+        .or_else(|| bubble.pointer("/tokenUsage/promptTokens"))
+        .or_else(|| bubble.pointer("/tokenUsage/inputTokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let output = bubble
         .pointer("/tokenCount/outputTokens")
+        .or_else(|| bubble.pointer("/tokenCount/completionTokens"))
+        .or_else(|| bubble.pointer("/tokenUsage/completionTokens"))
+        .or_else(|| bubble.pointer("/tokenUsage/outputTokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    // All-zero counts are the serializer default, not an observation.
-    (input > 0 || output > 0).then_some(Usage {
-        input_tokens: input,
-        output_tokens: output,
-        cache_read_input_tokens: None,
-        cache_creation_input_tokens: None,
-    })
+    let cache_read = bubble
+        .pointer("/tokenCount/cacheReadTokens")
+        .or_else(|| bubble.pointer("/tokenCount/cachedTokens"))
+        .or_else(|| bubble.pointer("/tokenUsage/cacheReadTokens"))
+        .or_else(|| bubble.pointer("/tokenUsage/cachedTokens"))
+        .and_then(Value::as_u64);
+    let cache_write = bubble
+        .pointer("/tokenCount/cacheCreationTokens")
+        .or_else(|| bubble.pointer("/tokenUsage/cacheCreationTokens"))
+        .and_then(Value::as_u64);
+
+    (input > 0 || output > 0 || cache_read.unwrap_or(0) > 0 || cache_write.unwrap_or(0) > 0)
+        .then_some(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_write,
+        })
 }
 
 /// Emit the `ToolUse` on the assistant message and its paired result on the

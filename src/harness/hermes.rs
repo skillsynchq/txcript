@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::common::{Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput};
+use crate::common::{Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput, Usage};
 use crate::error::{Error, Result};
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
 
@@ -395,8 +395,60 @@ fn assistant_message(row: &Value, meta: &Meta, timestamp: DateTime<Utc>) -> Opti
             .get("finish_reason")
             .and_then(Value::as_str)
             .map(parse_finish_reason),
-        usage: None,
+        usage: parse_row_usage(row),
     })
+}
+
+fn parse_row_usage(row: &Value) -> Option<Usage> {
+    if let Some(u) = row.get("usage") {
+        let input = u
+            .get("prompt_tokens")
+            .or_else(|| u.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = u
+            .get("completion_tokens")
+            .or_else(|| u.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read = u
+            .get("cached_tokens")
+            .or_else(|| u.get("cache_read_tokens"))
+            .or_else(|| u.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64);
+        let cache_write = u
+            .get("cache_creation_tokens")
+            .or_else(|| u.get("cache_write_tokens"))
+            .or_else(|| u.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64);
+        if input > 0 || output > 0 || cache_read.unwrap_or(0) > 0 || cache_write.unwrap_or(0) > 0 {
+            return Some(Usage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_write,
+            });
+        }
+    }
+    let input = row
+        .get("prompt_tokens")
+        .or_else(|| row.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = row
+        .get("completion_tokens")
+        .or_else(|| row.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if input > 0 || output > 0 {
+        return Some(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        });
+    }
+    None
 }
 
 fn content_blocks(value: Option<&Value>) -> Vec<Block> {
@@ -652,6 +704,7 @@ fn export_from_messages(meta: &Meta, messages: &[Message]) -> Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn rows_from_messages(session_id: &str, messages: &[Message]) -> Vec<Value> {
     let mut rows = Vec::new();
     let mut next_id = 1_u64;
@@ -731,6 +784,22 @@ fn rows_from_messages(session_id: &str, messages: &[Message]) -> Vec<Value> {
                         "finish_reason".into(),
                         json!(finish_reason(message.stop_reason.as_ref(), has_tools)),
                     );
+                    if let Some(usage) = &message.usage
+                        && !usage.is_zero()
+                    {
+                        let mut usage_obj = json!({
+                            "prompt_tokens": usage.input_tokens,
+                            "completion_tokens": usage.output_tokens,
+                            "total_tokens": usage.total_tokens(),
+                        });
+                        if let Some(cache_read) = usage.cache_read_input_tokens {
+                            usage_obj["cached_tokens"] = json!(cache_read);
+                        }
+                        if let Some(cache_write) = usage.cache_creation_input_tokens {
+                            usage_obj["cache_creation_tokens"] = json!(cache_write);
+                        }
+                        object.insert("usage".into(), usage_obj);
+                    }
                 }
                 rows.push(row);
                 next_id += 1;
