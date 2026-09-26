@@ -862,14 +862,25 @@ fn materialize_artifacts_for_claude_code(
 ) -> Result<Transcript<Common>> {
     const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
-    crate::harness::checked_id_component(claude_code::ClaudeCode::NAME, &common.meta.id)?;
+    // Resolve the session id up front: if the transcript carries no id yet,
+    // mint a fresh UUID here so the artifact directory and the eventual
+    // session file both land under the same name.
+    let session_id = if common.meta.id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        common.meta.id.clone()
+    };
+    crate::harness::checked_id_component(claude_code::ClaudeCode::NAME, &session_id)?;
     let artifact_root = projects_root
         .join(claude_code::encode_project_dir(
             common.meta.cwd.as_deref().unwrap_or_default(),
         ))
-        .join(&common.meta.id)
+        .join(&session_id)
         .join("artifacts");
     let mut prepared = common.clone();
+    // Stamp the resolved id so the caller (ClaudeStore::save) and every
+    // downstream codec see the same session identity.
+    prepared.meta.id = session_id;
     for (message_index, message) in prepared.body.iter_mut().enumerate() {
         for (block_index, block) in message.content.iter_mut().enumerate() {
             let Block::Artifact { artifact } = block else {

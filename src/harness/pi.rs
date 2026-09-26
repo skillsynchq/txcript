@@ -576,9 +576,14 @@ pub(crate) fn write_session(
     meta: &Meta,
     records: &[Record],
 ) -> Result<Saved<PathBuf>> {
-    let id = meta.id.clone();
     // Callers are the pi and campfire stores; either way the id is the
-    // transcript's own.
+    // transcript's own. If the transcript has no id yet, mint a fresh UUID
+    // so the session header and the filename are consistent.
+    let id = if meta.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        meta.id.clone()
+    };
     super::checked_id_component("pi", &id)?;
     let cwd = meta.cwd.as_deref().unwrap_or_default();
     let dir = sessions_dir.join(encode_cwd(cwd));
@@ -588,7 +593,18 @@ pub(crate) fn write_session(
         .to_rfc3339_opts(SecondsFormat::Millis, true)
         .replace([':', '.'], "-");
     let path = dir.join(format!("{file_ts}_{id}.jsonl"));
-    fs::write(&path, jsonl::render(records)?)?;
+    // If we minted a fresh id, patch the session header in the records so the
+    // id field inside the file matches the filename. A mismatch would confuse
+    // pi's `--continue` lookup which keys on the in-file session id.
+    if meta.id == id {
+        fs::write(&path, jsonl::render(records)?)?;
+    } else {
+        let mut patched: Vec<Record> = records.to_vec();
+        if let Some(Record::Session(header)) = patched.first_mut() {
+            header.id.clone_from(&id);
+        }
+        fs::write(&path, jsonl::render(&patched)?)?;
+    }
     Ok(Saved {
         id,
         reference: path,
