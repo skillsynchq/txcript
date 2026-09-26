@@ -356,6 +356,21 @@ impl Tool {
         }
     }
 
+    /// For [`Tool::Command`], formats the command invocation as typed by a user
+    /// (e.g. `"/commit -m \"Initial commit\""` or `"/compact"`).
+    #[must_use]
+    pub fn command_display(&self) -> Option<String> {
+        match self {
+            Tool::Command { command, args } => {
+                match args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                    Some(a) => Some(format!("{command} {a}")),
+                    None => Some(command.clone()),
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Inverse of [`Tool::from_canonical`]: the canonical name and input for
     /// this tool, ready for a codec to denormalize into a harness's native
     /// names and keys.

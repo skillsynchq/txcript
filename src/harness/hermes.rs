@@ -749,6 +749,7 @@ fn native_content(blocks: &[Block]) -> Value {
             .iter()
             .filter_map(|block| match block {
                 Block::Text { text } => Some(text.clone()),
+                Block::ToolUse { tool, .. } => tool.command_display(),
                 Block::Artifact { artifact } => Some(artifact.display_text()),
                 _ => None,
             })
@@ -765,6 +766,9 @@ fn native_content(blocks: &[Block]) -> Value {
             .iter()
             .filter_map(|block| match block {
                 Block::Text { text } => Some(json!({"type": "text", "text": text})),
+                Block::ToolUse { tool, .. } => tool
+                    .command_display()
+                    .map(|cmd| json!({"type": "text", "text": cmd})),
                 Block::Artifact { artifact } => {
                     Some(json!({"type": "text", "text": artifact.display_text()}))
                 }
