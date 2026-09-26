@@ -337,6 +337,83 @@ fn codec_fixpoint_through_common_loses_nothing() {
 }
 
 #[test]
+fn from_common_preserves_interleaved_block_ordering() {
+    let meta = common::Meta {
+        id: "interleave-1".into(),
+        timestamp: ts("2026-01-02T03:04:05.000Z"),
+        cwd: Some("/repo".into()),
+        git_branch: Some("main".into()),
+        title: None,
+        cli_version: Some("0.104.0".into()),
+        model: Some("gpt-5.2-codex".into()),
+    };
+    let body = vec![common::Message {
+        role: common::Role::Assistant,
+        content: vec![
+            common::Block::Text {
+                text: "Checking the directory first.".into(),
+            },
+            common::Block::ToolUse {
+                id: "call-ls".into(),
+                tool: common::Tool::Bash {
+                    command: "ls".into(),
+                    workdir: None,
+                    timeout_ms: None,
+                    description: None,
+                    run_in_background: false,
+                },
+            },
+            common::Block::Text {
+                text: "Directory check completed.".into(),
+            },
+        ],
+        timestamp: ts("2026-01-02T03:04:06.000Z"),
+        model: Some("gpt-5.2-codex".into()),
+        stop_reason: None,
+        usage: None,
+    }];
+    let transcript = Transcript::new(meta, body);
+    let native = codex::Codex::from_common(&transcript).unwrap();
+
+    let kinds: Vec<(&str, Option<&str>)> = native
+        .body
+        .iter()
+        .map(|line| {
+            let line_type = line.kind.as_str();
+            let payload_type = line.payload.get("type").and_then(serde_json::Value::as_str);
+            (line_type, payload_type)
+        })
+        .collect();
+
+    assert_eq!(
+        kinds,
+        vec![
+            ("session_meta", None),
+            ("turn_context", None),
+            ("response_item", Some("message")),
+            ("event_msg", Some("agent_message")),
+            ("response_item", Some("function_call")),
+            ("response_item", Some("message")),
+            ("event_msg", Some("agent_message")),
+        ]
+    );
+
+    // Verify first message text came before the tool call
+    let first_text = native.body[2].payload["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(first_text, "Checking the directory first.");
+
+    let call_id = native.body[4].payload["call_id"].as_str().unwrap();
+    assert_eq!(call_id, "call-ls");
+
+    let second_text = native.body[5].payload["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(second_text, "Directory check completed.");
+}
+
+#[test]
 fn from_common_denormalizes_bash_to_exec_command() {
     let mut common = sample_common();
     if let common::Block::ToolUse {

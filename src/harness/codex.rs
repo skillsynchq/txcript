@@ -577,7 +577,34 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
     lines
 }
 
-/// Emit the `response_item` (and paired display `event_msg`) lines for one message.
+fn flush_message_content(
+    lines: &mut Vec<Line>,
+    message_content: &mut Vec<Value>,
+    text_chunks: &mut Vec<String>,
+    role: Role,
+    role_str: &str,
+    ts: &str,
+) {
+    if !message_content.is_empty() {
+        lines.push(meta_line_str(
+            ts,
+            "response_item",
+            json!({ "type": "message", "role": role_str, "content": std::mem::take(message_content) }),
+        ));
+        if !text_chunks.is_empty() {
+            let combined = std::mem::take(text_chunks).join("\n\n");
+            let event = match role {
+                Role::User => {
+                    json!({ "type": "user_message", "message": combined, "kind": "plain" })
+                }
+                Role::Assistant => json!({ "type": "agent_message", "message": combined }),
+            };
+            lines.push(meta_line_str(ts, "event_msg", event));
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn push_message_lines<'a>(
     lines: &mut Vec<Line>,
     msg: &'a Message,
@@ -617,6 +644,14 @@ fn push_message_lines<'a>(
                 text_chunks.push(text);
             }
             Block::Thinking { text, .. } => {
+                flush_message_content(
+                    lines,
+                    &mut message_content,
+                    &mut text_chunks,
+                    msg.role,
+                    role_str,
+                    ts,
+                );
                 lines.push(meta_line_str(
                     ts,
                     "response_item",
@@ -633,6 +668,14 @@ fn push_message_lines<'a>(
                 ));
             }
             Block::ToolUse { id, tool } => {
+                flush_message_content(
+                    lines,
+                    &mut message_content,
+                    &mut text_chunks,
+                    msg.role,
+                    role_str,
+                    ts,
+                );
                 if is_patch_tool(tool) {
                     pending_patch_ids.insert(id.as_str());
                 } else {
@@ -645,6 +688,14 @@ fn push_message_lines<'a>(
                 content,
                 is_error,
             } => {
+                flush_message_content(
+                    lines,
+                    &mut message_content,
+                    &mut text_chunks,
+                    msg.role,
+                    role_str,
+                    ts,
+                );
                 let (kind, output) = if pending_patch_ids.remove(tool_use_id.as_str()) {
                     (
                         "custom_tool_call_output",
@@ -662,23 +713,14 @@ fn push_message_lines<'a>(
         }
     }
 
-    if !message_content.is_empty() {
-        lines.push(meta_line_str(
-            ts,
-            "response_item",
-            json!({ "type": "message", "role": role_str, "content": message_content }),
-        ));
-        if !text_chunks.is_empty() {
-            let combined = text_chunks.join("\n\n");
-            let event = match msg.role {
-                Role::User => {
-                    json!({ "type": "user_message", "message": combined, "kind": "plain" })
-                }
-                Role::Assistant => json!({ "type": "agent_message", "message": combined }),
-            };
-            lines.push(meta_line_str(ts, "event_msg", event));
-        }
-    }
+    flush_message_content(
+        lines,
+        &mut message_content,
+        &mut text_chunks,
+        msg.role,
+        role_str,
+        ts,
+    );
 }
 
 /// Emit the native call line for one tool invocation: `exec_command` for
