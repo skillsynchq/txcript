@@ -542,3 +542,26 @@ fn query_filter_cwd_path_prefix() {
     q.cwd = None;
     assert_eq!(index.query(&q).len(), 2);
 }
+
+/// `query --cwd` must apply the same Windows rules as `list --cwd`:
+/// verbatim prefixes stripped, case folded.
+#[cfg(windows)]
+#[test]
+fn query_filter_cwd_matches_verbatim_and_case_variants() {
+    let mut m = meta("w", 0);
+    m.cwd = Some(r"\\?\C:\work\replay".to_string());
+    let t = Transcript::new(m, vec![message(Role::User, vec![text("needle content")])]);
+    let mut index = Index::new();
+    index.insert(key(HarnessId::ClaudeCode, "w"), &t);
+
+    let mut q = Query::substring("needle");
+    q.cwd = Some(r"c:\WORK\replay".to_string());
+    let hits = index.query(&q);
+    assert_eq!(
+        hits.len(),
+        1,
+        "verbatim prefix + case must match, got {}",
+        hits.len()
+    );
+    assert_eq!(hits[0].key.id, "w");
+}

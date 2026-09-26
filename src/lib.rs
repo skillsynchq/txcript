@@ -23,6 +23,7 @@ pub mod error;
 pub mod harness;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local;
+pub mod paths;
 #[cfg(feature = "search")]
 pub mod search;
 pub mod text;

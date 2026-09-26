@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
-use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -606,7 +605,7 @@ impl Doc {
             let Some(cwd) = self.meta.cwd.as_deref() else {
                 return false;
             };
-            if !path_under(cwd, dir) {
+            if !crate::paths::under_dir(cwd, std::path::Path::new(dir)) {
                 return false;
             }
         }
@@ -638,13 +637,6 @@ impl Doc {
         }
         true
     }
-}
-
-fn path_under(session_cwd: &str, dir: &str) -> bool {
-    let p_cwd = Path::new(session_cwd);
-    let p_dir = Path::new(dir);
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    canon(p_cwd).starts_with(canon(p_dir))
 }
 
 /// Pass-1 result for one document: its index, best line score, and each
