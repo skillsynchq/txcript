@@ -167,6 +167,10 @@ as a separate import, and points the service at `cloudflare_access`, which
 verifies `Cf-Access-Jwt-Assertion` at the origin — built with
 `--features cloudflare_access` (`nix build .#share-server-access`).
 
+Authenticating with Cloudflare Access, end to end — the Zero Trust side, the
+service configuration, and what to check against a real tenant — is
+[Cloudflare Access in front of the share service](cloudflare-access.md).
+
 ### 5. Point the client at it
 
 ```sh

@@ -109,14 +109,26 @@ host agree on who owns a transcript when both front one bucket.
 
 Fetching happens on a refresher thread, never on a request: `principal()`
 reads the key set that thread published and returns, so a certs endpoint that
-hangs costs a request nothing. The key set is fetched once at startup, on the
-hour after that, and whenever a request reports a `kid` the published set does
-not have — which is how a key rotation recovers in the moment rather than an
-hour later. That report is a doorbell, not a fetch, and the refresher keeps a
-minute between fetches, so a forged header carrying a random `kid` cannot turn
-into an outbound request each. A key set that has never been fetched is a 503,
-not a 401: an outage must not read as a wall of user auth failures, and one
-already held keeps verifying honest tokens while refreshing it fails.
+hangs costs a request nothing. The key set is fetched at startup, hourly
+after that, every 5s while fetching is failing — a service that comes up
+before its network must recover on its own — and whenever a request reports a
+`kid` the published set does not have, which is how a key rotation recovers in
+the moment rather than an hour later. That report is a doorbell, not a fetch,
+and once a fetch has succeeded the refresher keeps a minute between them, so a
+forged header carrying a random `kid` cannot turn into an outbound request
+each.
+
+Which refusal a caller gets turns on whether the key set is **current**, not
+on whether the last refresh happened to fail:
+
+| key set | `kid` we hold | `kid` we do not |
+|---|---|---|
+| fetched within the TTL | verify | 401 — we hold what the team publishes |
+| fetched longer ago | verify, for a day | 503 — we could not check |
+| never fetched | — | 503 |
+
+An outage must not read as a wall of user auth failures, and a forged flood
+during one must not read as an outage.
 
 **Switching an existing deployment from `forwarded_header` changes who owns
 what.** The principal id is derived from the Access identity rather than from
@@ -124,19 +136,13 @@ the header value, so transcripts published under the old scheme keep their old
 owner prefix: still readable, no longer writable by the person who published
 them. Migrate the keys, or start on an empty prefix.
 
-### Verifying it against a real tenant
+### Setting it up
 
-Local tests cover the token handling with a key set of their own. What they
-cannot cover is Cloudflare, so once per deployment:
-
-- an unauthenticated browser request gets a **302 to the SSO login**, not a
-  401 — that is Access in front doing its job;
-- a human SSO login publishes, and the owner segment of the returned slug is
-  stable across logins;
-- a service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`)
-  authenticates and lands on a *different* owner segment from the human;
-- a request carrying a hand-written `Cf-Access-Jwt-Assertion`, sent straight
-  to the origin, is refused.
+[Cloudflare Access in front of the share service](../docs/cloudflare-access.md)
+is the end-to-end guide: the Zero Trust side (team, application, AUD tag,
+service tokens), the service and NixOS configuration, the checks to run once
+against a real tenant — no local test can cover those — and what each failure
+looks like in the log.
 
 ## Testing
 

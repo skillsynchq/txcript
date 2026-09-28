@@ -19,6 +19,14 @@ let
   # to contain both. Picking the matching build keeps that from being a
   # configuration the deployment can silently get wrong.
   usesS3 = (config.services.txcript-share.store.kind or "") == "s3";
+
+  # Nix cannot see a Cargo feature, and every build of this package shares a
+  # name, so "does this binary verify Access assertions" is answered by
+  # identity against the builds that do.
+  verifying = map (drv: drv.outPath) [
+    packages.share-server-access
+    packages.share-server-s3-access
+  ];
 in
 {
   # `identityHeader` named a header the service trusted. It no longer trusts
@@ -68,9 +76,51 @@ in
       type = lib.types.path;
       description = "cloudflared tunnel credentials, from sops/agenix.";
     };
+
+    packageVerifiesAccess = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Assert that `services.txcript-share.package` was built with
+        `--features cloudflare_access`, for a build this module cannot
+        recognise.
+
+        The identity this module selects exists only in a binary that has
+        that feature; one without it parses the generated configuration,
+        finds an identity kind it has never heard of, and restart-loops.
+        The check that prevents it compares against this flake's own
+        Access-capable builds, so set this if you package the binary
+        yourself.
+      '';
+    };
   };
 
   config = lib.mkIf (cfg.enable && config.services.txcript-share.enable) {
+    # The identity below is written unconditionally, but the code that
+    # implements it is compiled in only on some builds. A pinned package is
+    # the one way those two can disagree, and the failure is a restart loop
+    # at the far end of a deploy — so it is caught here instead.
+    assertions = [
+      {
+        assertion =
+          cfg.packageVerifiesAccess
+          || lib.elem config.services.txcript-share.package.outPath verifying;
+        message = ''
+          services.txcript-share.cloudflareAccess is enabled, so the service
+          is configured with `identity.kind = "cloudflare_access"`, but
+          services.txcript-share.package is a build without Cloudflare
+          Access verification compiled in. It would start, fail to parse its
+          configuration, and restart-loop.
+
+          Use the `share-server-access` package, or `share-server-s3-access`
+          alongside an S3 store — both are what this module picks when the
+          package is left alone. If you build the binary yourself with
+          `--features cloudflare_access`, set
+          `services.txcript-share.cloudflareAccess.packageVerifiesAccess`.
+        '';
+      }
+    ];
+
     # Selecting the identity source is all this module does to the service.
     #
     # The service verifies the assertion itself, so the tunnel is the ingress

@@ -68,7 +68,13 @@ all work without the binary knowing the difference.
 
 The service verifies the Access assertion itself, against the team's JWKS and
 `audFile`. The tunnel is the ingress; it is not what holds identity up, so an
-origin someone reaches another way is not a forgery hole.
+origin someone reaches another way is not a forgery hole. The module also
+picks the build that has the verifier compiled in, and fails evaluation
+rather than letting a pinned package restart-loop after the deploy.
+
+Setting up the Cloudflare side — team, application, AUD tag, service tokens,
+and the checks to run once against a real tenant — is
+[docs/cloudflare-access.md](../docs/cloudflare-access.md).
 
 ## Machine images
 
