@@ -34,9 +34,9 @@ rustPlatform.buildRustPackage {
   ];
   buildFeatures = features;
 
-  # The test suite runs in CI and in the dev shell, where it can reach a
-  # local MinIO for the S3 conformance cases. Repeating it inside every
-  # package build buys nothing and costs minutes.
+  # The test suite runs in CI and in the dev shell, the latter of which can
+  # reach a local Silo for the S3 conformance cases. Repeating it inside
+  # every package build buys nothing and costs minutes.
   doCheck = false;
 
   meta = {
