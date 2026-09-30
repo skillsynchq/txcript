@@ -54,6 +54,8 @@
           wasm-bindgen-cli
           nodejs
           bun
+          # Deploying the Cloudflare Worker in deploy/cloudflare.
+          wrangler
         ];
 
         shellFor = toolchain: extra: pkgs.mkShell {

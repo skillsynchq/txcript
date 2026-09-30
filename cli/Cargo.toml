@@ -21,9 +21,16 @@ name = "txcript"
 path = "src/main.rs"
 
 [features]
-default = ["mcp"]
+default = ["mcp", "share"]
 # `txcript mcp` and its rmcp/tokio dependencies.
 mcp = ["dep:rmcp", "dep:schemars", "dep:tokio"]
+# `txcript push` / `txcript pull` against a share service. On by default so a
+# release binary can talk to a deployment without being rebuilt; the HTTPS
+# transport it needs is already in the graph for the live web stores.
+share = ["txcript/share"]
+# Publishing straight to a bucket, with no service in between. Off by
+# default: it adds the AWS client tree to every build that enables it.
+share_s3 = ["txcript/share_s3"]
 
 [dependencies]
 base64 = "0.22.1"
