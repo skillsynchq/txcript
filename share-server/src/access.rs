@@ -1,32 +1,17 @@
 //! Cloudflare Access JWT verification, performed at the origin.
 //!
-//! [`ForwardedClientCert`](txcript_share_core::identity::ForwardedClientCert)
-//! trusts whatever a proxy writes into a header, which is only safe while
-//! that proxy is the *only* route to the service. Verifying the assertion
-//! here removes that requirement: Access in front is the gate, this is the
-//! lock behind it, and a request arriving by some other route still cannot
-//! forge an identity.
+//! Verifying here rather than trusting a header means a request that reaches
+//! the service by some other route than the proxy still cannot forge an
+//! identity.
 //!
-//! This mirrors `deploy/cloudflare/src/support.js`, which does the same job
-//! in the Worker — deliberately, down to how the principal id is derived.
-//! Both hosts can front the same bucket, so if the two disagreed by a byte,
-//! ownership of a transcript would depend on which host it was published
-//! through.
+//! The principal id must match the digest `deploy/cloudflare/src/support.js`
+//! computes: both hosts can front one bucket, so a disagreement would make
+//! ownership of a transcript depend on which host published it.
 //!
-//! # No I/O on the request path
-//!
-//! [`Identity`] is synchronous, because the implementation that keeps it
-//! honest — a client certificate subject forwarded by a proxy — does no I/O
-//! at all. Verifying a JWT needs a key set, and fetching one inside
-//! `principal()` is how a synchronous seam turns into a stalled server: the
-//! fetch lands on whichever thread is serving the request.
-//!
-//! So it does not happen there. A refresher thread owns the fetching, the
-//! request path reads the keys it published and returns, and an unknown
-//! `kid` is a *nudge* to that thread rather than a fetch of its own. What is
-//! left behind the trait is arithmetic: an RSA verification and a digest.
+//! [`Identity`] is synchronous, so fetching a key set inside `principal()`
+//! would stall whichever thread is serving the request. A refresher thread
+//! owns the fetching; the request path reads what it published.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,30 +30,17 @@ use txcript_share_core::{Principal, PrincipalId, PrincipalKind};
 /// wrong thing.
 pub const HEADER: &str = "cf-access-jwt-assertion";
 
-/// How long the refresher waits before fetching again unprompted.
+/// How long the refresher waits between fetches.
 const JWKS_TTL: Duration = Duration::from_hours(1);
 
-/// The floor between two fetches, once one has succeeded.
-///
-/// Without it, a forged header carrying a random `kid` costs one outbound
-/// request each — an amplifier pointed at Cloudflare. With it, a flood costs
-/// one request a minute, and costs the requests themselves nothing at all.
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
-/// The interval between attempts while fetching is failing.
-///
-/// A minute is right for a key set we hold and only want to keep current.
-/// It is wrong for one we do not hold at all: until a fetch succeeds every
-/// request is a 503, and the unit starts `After=network.target`, so the
-/// first attempt can easily land before there is a route out. Retrying an
-/// outage is not amplification — there is nothing yet to amplify.
+/// The interval between attempts while fetching is failing. The unit starts
+/// `After=network.target`, so the first attempt can land before there is a
+/// route out, and until one succeeds every request is a 503.
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long a key set stays usable once refreshing it starts failing.
-///
-/// During a JWKS outage the last known good keys still verify honest tokens,
-/// and refusing every request instead would be an outage of our own. The
-/// bound is what stops "indefinitely".
+/// How long a key set stays usable once refreshing it starts failing, so a
+/// JWKS outage does not become an outage of ours. The bound is what stops
+/// "indefinitely".
 const STALE_GRACE: Duration = Duration::from_hours(24);
 
 /// A key set is a few kilobytes. Anything larger is not one.
@@ -190,12 +162,9 @@ impl KeySet {
     }
 }
 
-/// What the request path and the refresher share: the keys, and a doorbell.
+/// The keys the request path reads and the refresher replaces.
 struct Shared {
     keys: RwLock<KeySet>,
-    /// Capacity one, so however many unknown `kid`s arrive at once, at most
-    /// one wake-up is pending and no request ever waits to report one.
-    nudge: SyncSender<()>,
 }
 
 impl Shared {
@@ -226,15 +195,11 @@ impl Shared {
     }
 }
 
-/// How often the refresher fetches: unprompted, after a nudge, and while
-/// fetching is failing.
-///
-/// A struct because the three move together and tests need all of them,
-/// while a deployment needs none.
+/// How often the refresher fetches, healthy and failing. Tests need both
+/// shorter; a deployment needs neither.
 #[derive(Debug, Clone, Copy)]
 struct Rate {
     ttl: Duration,
-    floor: Duration,
     retry: Duration,
 }
 
@@ -242,7 +207,6 @@ impl Default for Rate {
     fn default() -> Self {
         Self {
             ttl: JWKS_TTL,
-            floor: MIN_REFRESH_INTERVAL,
             retry: RETRY_INTERVAL,
         }
     }
@@ -280,13 +244,11 @@ impl CloudflareAccess {
     }
 
     fn refreshing(team: &str, audience: &str, source: Box<dyn Jwks>, rate: Rate) -> Self {
-        let (nudge, wake) = sync_channel(1);
         let shared = Arc::new(Shared {
             keys: RwLock::new(KeySet::default()),
-            nudge,
         });
         let healthy = shared.publish(source.fetch());
-        refresh_in_the_background(Arc::downgrade(&shared), source, wake, rate, healthy);
+        refresh_in_the_background(Arc::downgrade(&shared), source, rate, healthy);
         Self {
             // Access mints tokens for one team, and the key set is that
             // team's. Checking the issuer too costs nothing and refuses a
@@ -354,9 +316,8 @@ impl CloudflareAccess {
 
     /// The key a token names, from whatever the refresher last published.
     ///
-    /// Never fetches. A `kid` we do not have rings the doorbell and is
-    /// refused; if it is a rotation rather than a forgery, the refresher
-    /// has the new key moments later and the retry succeeds.
+    /// Never fetches: a `kid` we do not hold is refused, and a rotation is
+    /// picked up by the refresher within the TTL.
     fn key(&self, kid: &str) -> Result<Option<JsonWebKey>, String> {
         let set = self.shared.read();
         if set.usable_within(self.usable_for)
@@ -366,16 +327,10 @@ impl CloudflareAccess {
         }
         // Whether an unrecognised `kid` is the caller's problem or ours
         // turns on whether the key set is current, not on whether the last
-        // refresh happened to fail. Inside the TTL we hold what the team
-        // publishes, and a `kid` that is not in it is a 401 — including
-        // during a blip, or a forged flood would read as an outage. Past
-        // the TTL a refresh was due and did not land, so the honest answer
-        // is that we could not check: a 503.
-        let current = set.usable_within(self.current_for);
-        drop(set);
-
-        let _ = self.shared.nudge.try_send(());
-        if current {
+        // refresh happened to fail: inside the TTL we hold what the team
+        // publishes, so a `kid` missing from it is a 401 even during a blip.
+        // Past the TTL a refresh was due and did not land.
+        if set.usable_within(self.current_for) {
             Ok(None)
         } else {
             Err("the Access key set is unavailable".to_string())
@@ -383,8 +338,7 @@ impl CloudflareAccess {
     }
 }
 
-/// Fetch on a thread of its own: on the TTL, or when a request reports a
-/// `kid` the published set does not have.
+/// Fetch on a thread of its own, on the TTL.
 ///
 /// A thread rather than a task because the fetch is blocking, and this way
 /// it cannot occupy a runtime worker whatever runtime the host is using —
@@ -392,46 +346,18 @@ impl CloudflareAccess {
 fn refresh_in_the_background(
     shared: Weak<Shared>,
     source: Box<dyn Jwks>,
-    wake: Receiver<()>,
     rate: Rate,
     healthy: bool,
 ) {
     let refresher = move || {
-        // The constructor's fetch, and how it went.
-        let mut last = Instant::now();
         let mut healthy = healthy;
         loop {
-            // While fetching fails, the short interval: the floor exists to
-            // keep forged `kid`s from costing outbound requests, and with no
-            // usable key set there is nothing left to protect — every
-            // request is already a 503.
-            let (wait, floor) = if healthy {
-                (rate.ttl, rate.floor)
-            } else {
-                (rate.retry, rate.retry)
-            };
-            match wake.recv_timeout(wait.saturating_sub(last.elapsed())) {
-                Ok(()) => {
-                    // A nudge, which anyone can cause. Rotations are rare
-                    // and forgeries are not, so the rate is the floor
-                    // between fetches, not the rate the doorbell is rung.
-                    if let Some(remaining) = floor.checked_sub(last.elapsed()) {
-                        std::thread::sleep(remaining);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                // The verifier is gone, and with it the reason to refresh.
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            // Anything rung while waiting out the floor is about to be
-            // answered by the fetch below.
-            while wake.try_recv().is_ok() {}
-
+            std::thread::sleep(if healthy { rate.ttl } else { rate.retry });
+            // The verifier is gone, and with it the reason to refresh.
             let Some(shared) = shared.upgrade() else {
                 return;
             };
             healthy = shared.publish(source.fetch());
-            last = Instant::now();
         }
     };
 
@@ -709,7 +635,7 @@ mod tests {
         }
 
         /// The same for a fetch that *succeeded*, so a test can watch the
-        /// service recover without making the request that would nudge it.
+        /// service recover without asking it anything.
         fn awaits_served_key_set(&self, nth: usize) {
             awaits("served key set", nth, &self.served);
         }
@@ -745,18 +671,15 @@ mod tests {
         CloudflareAccess::with_keys(TEAM, AUD, Box::new(source))
     }
 
-    /// The same, with a refresher that answers a nudge at once rather than
-    /// waiting out the minute a deployment wants between fetches.
+    /// The same, refreshing fast enough that a test need not sit through a
+    /// deployment's intervals.
     fn eager_verifier(source: Arc<Published>) -> CloudflareAccess {
-        CloudflareAccess::refreshing(TEAM, AUD, Box::new(source), eagerly(JWKS_TTL))
+        CloudflareAccess::refreshing(TEAM, AUD, Box::new(source), eagerly())
     }
 
-    /// Nothing between fetches, and failures retried at once: the waiting
-    /// is what a test would otherwise have to sit through.
-    fn eagerly(ttl: Duration) -> Rate {
+    fn eagerly() -> Rate {
         Rate {
-            ttl,
-            floor: Duration::ZERO,
+            ttl: Duration::from_millis(20),
             retry: Duration::from_millis(20),
         }
     }
@@ -864,37 +787,28 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_is_recovered_from_without_waiting_for_the_ttl() {
+    fn a_rotation_is_picked_up_by_the_refresher() {
+        // A kid we do not hold is refused while we do not hold it, and
+        // verifies once the refresher has fetched the set containing it.
         let published = Published::new(vec![jwk("old", KEY_A_N)]);
         let identity = eager_verifier(published.clone());
         let key = key_pair(KEY_A);
+        let rotated = sign(&key, "new", &sso("alice@example.com"));
 
-        assert!(
-            label_of(&identity, &sign(&key, "old", &sso("alice@example.com")))
-                .is_ok_and(|who| who.is_some())
-        );
-        assert_eq!(published.fetches(), 1, "one fetch, at construction");
+        assert_eq!(label_of(&identity, &rotated), Ok(None));
 
         published.set(Ok(vec![jwk("new", KEY_A_N)]));
-        let after = sign(&key, "new", &sso("alice@example.com"));
+        published.awaits_served_key_set(2);
         assert_eq!(
-            label_of(&identity, &after),
-            Ok(None),
-            "a kid we do not hold is refused, not waited on"
-        );
-
-        // ... but it is also reported, and the refresher has the new key a
-        // moment later, so the retry succeeds rather than failing for the
-        // hour the TTL would otherwise cost.
-        published.awaits_fetch(2);
-        assert_eq!(
-            label_of(&identity, &after),
+            label_of(&identity, &rotated),
             Ok(Some("alice@example.com".to_string()))
         );
     }
 
     #[test]
-    fn repeated_unknown_kids_do_not_each_cost_a_fetch() {
+    fn an_unknown_kid_costs_no_outbound_request() {
+        // Fetching is the refresher's alone, so no volume of forged `kid`s
+        // can point this service's subrequests at Cloudflare.
         let published = Published::new(vec![jwk("k1", KEY_A_N)]);
         let identity = verifier(published.clone());
         let key = key_pair(KEY_A);
@@ -907,14 +821,7 @@ mod tests {
                 "an unknown kid is a 401, not an outage"
             );
         }
-        // Give the refresher every chance to act on the doorbell before the
-        // count is believed.
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            published.fetches(),
-            1,
-            "a forged kid must not be an origin-subrequest amplifier"
-        );
+        assert_eq!(published.fetches(), 1, "the one fetch at construction");
     }
 
     #[test]
@@ -942,7 +849,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             keys: vec![jwk("k1", KEY_A_N)],
         });
-        let identity = CloudflareAccess::refreshing(TEAM, AUD, Box::new(source), eagerly(JWKS_TTL));
+        let identity = CloudflareAccess::refreshing(TEAM, AUD, Box::new(source), eagerly());
         let forged = sign(&key_pair(KEY_A), "forged", &sso("mallory@x.com"));
 
         let started = Instant::now();
@@ -990,9 +897,8 @@ mod tests {
             Ok(Some("alice@example.com".to_string()))
         );
 
-        // Break the endpoint, then provoke a refresh against it.
+        // Break the endpoint and let the refresher fail against it.
         published.set(Err("connection refused".to_string()));
-        let _ = label_of(&identity, &sign(&key, "gone", &sso("alice@example.com")));
         published.awaits_fetch(2);
 
         assert_eq!(
@@ -1006,18 +912,15 @@ mod tests {
     fn a_failed_fetch_is_retried_without_waiting_out_the_ttl() {
         // The unit starts `After=network.target`, so the fetch at startup
         // can land before there is a route out. Until one succeeds every
-        // request is a 503, and waiting an hour to try again — or waiting
-        // for a request to ring the doorbell — is the outage rather than
-        // the protection against one.
+        // request is a 503, and waiting out the TTL to try again is the
+        // outage rather than the protection against one.
         let published = Published::failing();
         let identity =
-            CloudflareAccess::refreshing(TEAM, AUD, Box::new(published.clone()), eagerly(JWKS_TTL));
+            CloudflareAccess::refreshing(TEAM, AUD, Box::new(published.clone()), eagerly());
 
         // No requests at all: the refresher keeps trying on its own.
         published.awaits_fetch(3);
 
-        // Still no requests: the recovery has to be the refresher's doing,
-        // not a doorbell this test rang by asking.
         published.set(Ok(vec![jwk("k1", KEY_A_N)]));
         published.awaits_served_key_set(1);
         let token = sign(&key_pair(KEY_A), "k1", &sso("alice@example.com"));
@@ -1030,20 +933,15 @@ mod tests {
 
     #[test]
     fn an_unknown_kid_is_a_401_while_the_key_set_is_current() {
-        // Even while refreshing fails. A forged flood during a JWKS blip
-        // must not read as an outage of this service: we hold what the team
-        // published and that `kid` is not in it.
+        // We hold what the team publishes and that `kid` is not in it, so
+        // the refusal is the caller's — a forged flood must not read as an
+        // outage of this service.
         let published = Published::new(vec![jwk("k1", KEY_A_N)]);
-        let identity =
-            CloudflareAccess::refreshing(TEAM, AUD, Box::new(published.clone()), eagerly(JWKS_TTL));
+        let identity = verifier(published);
         let key = key_pair(KEY_A);
-        published.set(Err("connection refused".to_string()));
 
-        // The first sighting of the kid nudges the refresher, and that
-        // refresh is the one that fails.
         let forged = sign(&key, "forged", &sso("mallory@x.com"));
         assert_eq!(label_of(&identity, &forged), Ok(None));
-        published.awaits_fetch(2);
         assert_eq!(
             label_of(&identity, &sign(&key, "k1", &sso("alice@example.com"))),
             Ok(Some("alice@example.com".to_string())),
@@ -1063,7 +961,6 @@ mod tests {
             Box::new(published.clone()),
             Rate {
                 ttl: Duration::from_millis(1),
-                floor: Duration::ZERO,
                 // Long enough that the refresher goes quiet after the first
                 // failure instead of racing this test.
                 retry: Duration::from_secs(3600),

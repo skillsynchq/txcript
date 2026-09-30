@@ -109,21 +109,20 @@ host agree on who owns a transcript when both front one bucket.
 
 Fetching happens on a refresher thread, never on a request: `principal()`
 reads the key set that thread published and returns, so a certs endpoint that
-hangs costs a request nothing. The key set is fetched at startup, hourly
-after that, every 5s while fetching is failing — a service that comes up
-before its network must recover on its own — and whenever a request reports a
-`kid` the published set does not have, which is how a key rotation recovers in
-the moment rather than an hour later. That report is a doorbell, not a fetch,
-and once a fetch has succeeded the refresher keeps a minute between them, so a
-forged header carrying a random `kid` cannot turn into an outbound request
-each.
+hangs costs a request nothing, and no volume of forged `kid`s can turn into
+outbound requests. The key set is fetched at startup, hourly after that, and
+every 5s while fetching is failing — a service that comes up before its
+network must recover on its own.
+
+A rotation is therefore picked up within the hour. Cloudflare publishes a new
+key before it retires the old one, so tokens keep verifying across the change.
 
 Which refusal a caller gets turns on whether the key set is **current**, not
 on whether the last refresh happened to fail:
 
 | key set | `kid` we hold | `kid` we do not |
 |---|---|---|
-| fetched within the TTL | verify | 401 — we hold what the team publishes |
+| fetched within the hour | verify | 401 — we hold what the team publishes |
 | fetched longer ago | verify, for a day | 503 — we could not check |
 | never fetched | — | 503 |
 
@@ -159,7 +158,7 @@ checked.
 
 `src/access.rs` mints real RS256 tokens from a throwaway key and runs the
 shared `identity::conformance` suite against the verifier, plus the cases a
-suite cannot state: a rotation recovered from without waiting out the TTL, a
-flood of forged `kid`s that costs one fetch, a key set that keeps working when
+suite cannot state: a rotation picked up by the refresher, a flood of forged
+`kid`s that costs no fetch at all, a key set that keeps working when
 refreshing it starts failing, and a hung certs endpoint that costs the request
 path nothing.
