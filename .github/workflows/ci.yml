@@ -60,6 +60,20 @@ jobs:
       - run: cargo check -p txcript --lib --target wasm32-unknown-unknown --no-default-features --features wasm
       - run: cargo check -p txcript --lib --target wasm32-unknown-unknown --no-default-features --features wasm,search
 
+  # The Worker's I/O half. Its decision half is Rust, covered by the test job
+  # above; this is the JWT verification, request parsing, and metadata budget
+  # that `node --test` can reach without a wasm module to load.
+  worker:
+    name: Cloudflare Worker (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+        working-directory: deploy/cloudflare
+
   msrv:
     name: MSRV (1.96)
     runs-on: ubuntu-latest
@@ -82,7 +96,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: cargo publish --dry-run --locked -p txcript
+      # All three together: txcript's `share_s3` feature depends on the two
+      # support crates, and a dry-run of txcript alone cannot resolve them
+      # until they are on the registry. Given the set, cargo orders it
+      # itself — which is also how the release publishes them.
+      - run: cargo publish --dry-run --locked -p txcript-share-core -p txcript-share-store -p txcript
 
   npm-package:
     name: npm package (dry-run)
