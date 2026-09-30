@@ -1,10 +1,9 @@
 # `share` — a remote Store for publishing and listing transcripts
 
-Status: **design sketch**, for the *client* half. The service half is built:
-`share-core` decides, `share-store` defines the storage seams, and
-`deploy/cloudflare/` is a thin shell over both. What remains unbuilt is the
-`Store` implementation below, which lets `txcript list`/`view`/`continue`
-reach a share service.
+Status: **built.** The client `Store` is `src/harness/share.rs`, reached from
+the CLI as `txcript push` and `txcript pull`, and `share` joins aggregate
+discovery so `txcript list` includes what others published. This is the
+design record; to use it, see [deploy.md](../deploy.md).
 
 Two things it needs from the library first, neither of which exists yet:
 `http::Agent` has no plain-client constructor (it always applies the

@@ -167,7 +167,7 @@ export TXCRIPT_SHARE_HEADER_SECRET="CF-Access-Client-Secret: ..."
 ```
 
 Credentials are just a header map, so an Access service token needs no code.
-See [Sharing transcripts](share.md) for the client side.
+See [Deploying a share service](deploy.md) for the client side.
 
 ## 7. Verify it against the tenant
 

@@ -1,7 +1,9 @@
 # A share service: four designs and the seams under them
 
-Status: **design draft.** No code. `share-store.md` describes the *client*
-`Store` and the Worker prototype; this describes the *service* that backs it.
+Status: **built.** This is the design record — the reasoning, and the three
+designs it rejects — not a guide. The seams landed as `share-core`
+(decisions), `share-store` (storage), and two hosts: `share-server` and
+`deploy/cloudflare/`. To deploy one, see [deploy.md](../deploy.md).
 
 ## What this has to be
 

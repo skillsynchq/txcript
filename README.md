@@ -23,7 +23,7 @@ txcript is a library for converting agent sessions. Start a conversation in Clau
 
 Build session search, viewers, and editors against one transcript model. txcript handles the agent-specific formats, with a Rust API, a JavaScript package, and a CLI.
 
-[Try the CLI](#try-the-cli) · [Use the library](#use-the-library) · [Supported agents](#supported-agents) · [Documentation](#documentation)
+[Try the CLI](#try-the-cli) · [Use the library](#use-the-library) · [Supported agents](#supported-agents) · [Share with your team](#share-with-your-team) · [Documentation](#documentation)
 
 <p align="center">
   <img src="docs/assets/demo.gif" alt="An OpenCode session continued in Claude Code using txcript" width="680">
@@ -145,6 +145,30 @@ txcript continue ./run.json --with claude_code
 
 Simple also represents reasoning, tool calls, results, images, and metadata. It is the format `txcript export` writes.
 
+## Share with your team
+
+Publish a session so colleagues can read it, and list what they published:
+
+```sh
+txcript push <session-id>        # publish; prints the slug
+txcript list --from share        # everyone's published sessions
+txcript pull <slug> --with codex # continue someone else's work
+```
+
+This needs a share service, which you host. Two options: a Cloudflare Worker
+over R2, or a single binary you run yourself over the filesystem or any
+S3-compatible bucket. Both enforce the same rule — publish your own, read
+everyone's, modify only your own — through one implementation of the rules
+with no I/O, so it is tested as a pure function rather than against a server.
+
+Transcripts carry working-directory paths, branch names, and tool output, so a
+service must have something authenticating in front of it; HTTPS alone leaves
+them readable by anyone with the URL. Cloudflare Access is the documented
+gate, and the service verifies its assertion itself rather than trusting a
+header.
+
+See [Deploying a share service](docs/deploy.md).
+
 ## What carries over
 
 The common model represents messages, reasoning, tool calls and results, images, metadata, and token usage. What survives conversion depends on what the source records and the destination can represent. Agent-specific records and unsupported fields can be lost.
@@ -155,6 +179,7 @@ Conversion carries conversation history. The destination supplies its own system
 
 - [CLI reference](docs/usage.md#cli): commands, search, cropping, MCP, and shell integration.
 - [Rust API](https://docs.rs/txcript) and [JavaScript reference](docs/usage.md#npm-package).
+- [Deploying a share service](docs/deploy.md): publish and read sessions across a team, on Cloudflare or your own host.
 - [Transcript formats](docs/formats/README.md): storage layouts, mappings, and limitations, with sources and reverse-engineering notes.
 - [Development](docs/usage.md#development) and [test guide](tests/README.md).
 - [Contributing](CONTRIBUTING.md) · [Report a security vulnerability](SECURITY.md).

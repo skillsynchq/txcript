@@ -15,6 +15,9 @@ globs = ["build/*.wasm"]
 binding = "SHARE"
 bucket_name = "txcript-share"
 
+# Replace ACCESS_TEAM and ACCESS_AUD before deploying. Neither is a secret —
+# they identify your tenant and application, not a credential — so they live
+# here rather than in `wrangler secret`. See ../../docs/deploy.md.
 [vars]
 # Your Zero Trust team name: <team>.cloudflareaccess.com
 ACCESS_TEAM = "example-team"
