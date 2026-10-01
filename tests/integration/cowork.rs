@@ -516,7 +516,7 @@ fn from_common_regenerates_the_app_record_and_the_cli_transcript() {
     assert!(stamped.iter().all(|id| *id == Some(cli.as_str())));
 
     // The audit log is the app's own tamper-evident record; never forged.
-    assert!(native.body.audit.is_empty());
+    assert_eq!(native.body.audit.len(), 0);
 }
 
 #[test]
@@ -673,5 +673,5 @@ fn fingerprints_follow_the_transcript() {
     let after = store.fingerprints(std::slice::from_ref(&record)).unwrap();
     let key = record.to_string_lossy().into_owned();
     assert_ne!(before[&key], after[&key]);
-    assert!(!after[&key].is_empty());
+    assert_ne!(after[&key].len(), 0);
 }

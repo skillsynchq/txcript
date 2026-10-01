@@ -1260,7 +1260,7 @@ mod resume_template_tests {
         // command anyway.
         let (program, args) = super::resume_command(super::HarnessId::Share, "alice/sess-1");
         assert_eq!(program, "txcript");
-        assert!(args.is_empty());
+        assert_eq!(args, Vec::<String>::new());
     }
 
     #[test]

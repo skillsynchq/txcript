@@ -655,7 +655,7 @@ pub(crate) fn resolve_sessions_dir(config_dir: &str, env_prefix: &str) -> Option
     let env_dir = |suffix: &str| {
         std::env::var(format!("{env_prefix}_CODING_AGENT_{suffix}"))
             .ok()
-            .and_then(&expand)
+            .and_then(expand)
     };
     env_dir("SESSION_DIR").or_else(|| {
         env_dir("DIR")

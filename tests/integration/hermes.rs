@@ -233,7 +233,7 @@ fn from_common_with_empty_id_is_deterministic() {
     let second = hermes::Hermes::from_common(&common).unwrap();
     assert_eq!(first.body, second.body);
     assert_eq!(first.meta.id, second.meta.id);
-    assert!(!first.meta.id.is_empty());
+    assert_ne!(first.meta.id.len(), 0);
 }
 
 #[test]

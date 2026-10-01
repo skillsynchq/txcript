@@ -139,7 +139,7 @@ fn cold_and_hot_agree() {
 
     assert_eq!(hot.len(), 1);
     assert_eq!(hot[0].hits, cold);
-    assert!(!cold.is_empty());
+    assert_ne!(cold.len(), 0);
 }
 
 #[test]
@@ -170,7 +170,10 @@ fn tool_result_needs_opt_in() {
     let t = rich_transcript("a", 0);
 
     // Default origins exclude tool output.
-    assert!(search(&t, &Query::substring("websocket_reconnect ... FAILED")).is_empty());
+    assert_eq!(
+        search(&t, &Query::substring("websocket_reconnect ... FAILED")).len(),
+        0
+    );
 
     let mut q = Query::substring("websocket_reconnect ... FAILED");
     q.origins = Origin::ALL.to_vec();
@@ -210,20 +213,20 @@ fn smart_case_is_insensitive_until_uppercase() {
         meta("a", 0),
         vec![message(Role::User, vec![text("read the README first")])],
     );
-    assert!(!search(&t, &Query::substring("readme")).is_empty());
+    assert_ne!(search(&t, &Query::substring("readme")).len(), 0);
     // Uppercase in the pattern demands a case match: no "REadme" text exists.
-    assert!(search(&t, &Query::substring("REadme")).is_empty());
+    assert_eq!(search(&t, &Query::substring("REadme")).len(), 0);
 }
 
 #[test]
 fn fuzzy_uses_fzf_pattern_syntax() {
     let t = rich_transcript("a", 0);
     // Two atoms, both must match somewhere on the line.
-    assert!(!search(&t, &Query::fuzzy("cargo websocket")).is_empty());
+    assert_ne!(search(&t, &Query::fuzzy("cargo websocket")).len(), 0);
     // Negation atom rejects lines containing the term.
     let hits = search(&t, &Query::fuzzy("reconnect !handshake"));
     assert!(hits.iter().all(|h| !h.line.contains("handshake")));
-    assert!(!hits.is_empty());
+    assert_ne!(hits.len(), 0);
 }
 
 #[test]
@@ -365,7 +368,7 @@ fn substring_is_literal_and_folds_case() {
     );
     assert_eq!(search(&t, &Query::substring("--nocapture now")).len(), 1);
     // A literal with a space only matches the contiguous text.
-    assert!(search(&t, &Query::substring("run now")).is_empty());
+    assert_eq!(search(&t, &Query::substring("run now")).len(), 0);
 }
 
 #[test]
@@ -402,7 +405,7 @@ fn meta_hit_resolves_to_an_empty_fragment() {
     let t = rich_transcript("a", 0);
     let hits = search(&t, &Query::substring("relay-protocol-v6"));
     let fragment = t.fragment(&hits[0].span).expect("empty span is in bounds");
-    assert!(fragment.is_empty());
+    assert_eq!(fragment.len(), 0);
 }
 
 #[test]

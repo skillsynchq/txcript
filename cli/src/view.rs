@@ -906,7 +906,7 @@ mod tests {
             .render(60, Filters::default())
             .unwrap();
         assert!(plain.text.contains("▸ Image · image/png omitted"));
-        assert!(plain.transmissions.is_empty());
+        assert_eq!(plain.transmissions.len(), 0);
 
         let mut document = Document::new(common.clone(), span.clone(), false, Some(cells));
         let drawn = document.render(60, Filters::default()).unwrap();
@@ -921,7 +921,7 @@ mod tests {
         // A re-render reuses the placement: same rows, nothing new to send.
         let again = document.render(60, Filters::default()).unwrap();
         assert_eq!(again.text, drawn.text);
-        assert!(again.transmissions.is_empty());
+        assert_eq!(again.transmissions.len(), 0);
 
         // Compact output never carries images.
         let compact = text::to_text_fragment(&common, &span).unwrap();

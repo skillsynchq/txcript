@@ -66,7 +66,7 @@ fn grok_huge_prompt_index_does_not_size_an_allocation() {
     let common = grok::Grok::to_common(&transcript).unwrap();
     // The conversation log is empty, so no messages — the point is that we
     // got here at all instead of being OOM-killed or panicking.
-    assert!(common.body.is_empty());
+    assert_eq!(common.body.len(), 0);
 }
 
 /// Fixed in 9c64b83 ("Harden stores and CLI against hostile session files").

@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(encode_key(&plain(KeyCode::F(5)), false), b"\x1b[15~");
         assert_eq!(encode_key(&plain(KeyCode::F(12)), false), b"\x1b[24~");
         assert_eq!(encode_key(&plain(KeyCode::BackTab), false), b"\x1b[Z");
-        assert!(encode_key(&plain(KeyCode::CapsLock), false).is_empty());
+        assert_eq!(encode_key(&plain(KeyCode::CapsLock), false).len(), 0);
     }
 
     /// Wait up to two seconds for `done` to hold.

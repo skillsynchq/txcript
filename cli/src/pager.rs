@@ -2513,8 +2513,8 @@ mod tests {
             vec![0..7]
         );
         assert_eq!(find_all("héllo héllo", "héllo", false), vec![0..6, 7..13]);
-        assert!(find_all("short", "much longer", false).is_empty());
-        assert!(find_all("anything", "", false).is_empty());
+        assert_eq!(find_all("short", "much longer", false).len(), 0);
+        assert_eq!(find_all("anything", "", false).len(), 0);
     }
 
     #[test]
@@ -2689,7 +2689,7 @@ mod tests {
         press(&mut pager, KeyCode::Char('n'), 3);
         assert_eq!(pager.search.current, Some(0));
         press(&mut pager, KeyCode::Esc, 3);
-        assert!(pager.search.query.is_empty());
+        assert_eq!(pager.search.query, "");
         assert!(!pager.quit);
         press(&mut pager, KeyCode::Esc, 3);
         assert!(pager.quit);
@@ -2716,7 +2716,7 @@ mod tests {
         // Remove #3–10, keep everything else.
         edit.select(2..10);
         assert_eq!(edit.selection(), 2..10);
-        assert!(edit.cut().is_empty());
+        assert_eq!(edit.cut().len(), 0);
         assert!(!edit.selecting());
         assert_eq!(
             edit.kept_spans(),
@@ -2740,7 +2740,7 @@ mod tests {
         edit.jump_to(3);
         edit.mark_end();
         assert_eq!(edit.selection(), 1..4);
-        assert!(edit.keep_only().is_empty());
+        assert_eq!(edit.keep_only().len(), 0);
         assert_eq!(edit.kept_spans(), vec![txcript::Span(1..4)]);
 
         // `]` alone selects from the first message.
@@ -2777,7 +2777,7 @@ mod tests {
         edit.jump_to(1);
         edit.restore();
         edit.jump_to(2);
-        assert!(edit.restore().is_empty());
+        assert_eq!(edit.restore().len(), 0);
 
         edit.select(3..4);
         assert_eq!(edit.keep_only(), vec![4, 5]);
@@ -3120,7 +3120,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(cells, vec!["█", "▅", "█", "▅", "▃"]);
-        assert!(timeline(&kinds, &kept, 0, None, 4, false).spans.is_empty());
+        assert_eq!(timeline(&kinds, &kept, 0, None, 4, false).spans.len(), 0);
     }
 
     #[test]

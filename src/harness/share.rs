@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn anonymous_credentials_cannot_write() {
         assert!(!Anonymous.can_write());
-        assert!(Anonymous.headers().expect("no failure").is_empty());
+        assert_eq!(Anonymous.headers().expect("no failure"), Vec::new());
     }
 
     /// An unconfigured machine has no share store, and reaching that
