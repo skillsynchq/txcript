@@ -306,8 +306,14 @@ overwrite any other, and the client neither enforces that nor can.
 }
 ```
 
+This path is **not in the release binaries and not on crates.io** — it
+depends on two workspace crates that are deliberately unpublished, so it is
+built from a clone:
+
 ```sh
+git clone https://github.com/skillsynchq/txcript && cd txcript
 cargo install --path cli --features share_s3
+
 export TXCRIPT_SHARE_BUCKET=my-txcript-bucket
 export TXCRIPT_SHARE_OWNER=alice          # must match the prefix IAM allows
 export TXCRIPT_SHARE_ENDPOINT=…           # optional: R2, MinIO, Ceph

@@ -5,16 +5,13 @@ edition = "2024"
 rust-version = "1.96"
 description = "Object store and catalog seams for txcript's shared transcript service."
 license = "Apache-2.0"
-homepage = "https://github.com/skillsynchq/txcript"
-repository = "https://github.com/skillsynchq/txcript"
-keywords = ["transcript", "object-store", "s3"]
-categories = ["web-programming"]
+publish = false
 
 [dependencies]
 # Only the sans-IO core, for `Key`/`KeyPrefix`/`Precondition`. No S3 client,
 # no HTTP, no async runtime: the real backends are hosts' business, and this
 # crate defines the shape they must fit.
-txcript-share-core = { path = "../share-core", version = "0.1.0" }
+txcript-share-core = { path = "../share-core" }
 # For the shared metadata projection: both writers derive a listing's
 # attributes from a Simple document, and they must agree.
 serde_json = "1.0.150"

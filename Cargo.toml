@@ -58,10 +58,10 @@ futures-util = { version = "0.3.33", optional = true }
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time"], optional = true }
 wreq = { version = "6.0.0-rc.31", default-features = false, features = ["brotli", "deflate", "gzip", "stream", "tokio-rt", "webpki-roots", "zstd"], optional = true }
 wreq-util = { version = "3.0.0-rc.14", features = ["emulation-compression"], optional = true }
-txcript-share-store = { path = "share-store", version = "0.1.0", optional = true }
+txcript-share-store = { path = "share-store", optional = true }
 # `share-store` names these types in its public API (`ObjectStore` takes a
 # `Key`), so a consumer needs the crate by name.
-txcript-share-core = { path = "share-core", version = "0.1.0", optional = true }
+txcript-share-core = { path = "share-core", optional = true }
 aws-config = { version = "1.8", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 aws-sdk-s3 = { version = "1.123", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 uuid = { version = "1.23.4", features = ["v4", "v5"] }

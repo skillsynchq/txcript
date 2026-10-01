@@ -5,10 +5,9 @@ edition = "2024"
 rust-version = "1.96"
 description = "Sans-IO authorization core for txcript's shared transcript service."
 license = "Apache-2.0"
-homepage = "https://github.com/skillsynchq/txcript"
-repository = "https://github.com/skillsynchq/txcript"
-keywords = ["transcript", "authorization", "s3", "wasm"]
-categories = ["web-programming"]
+# Not published: this is the service's internal core, not part of the
+# txcript library's public surface.
+publish = false
 
 # Deliberately empty. This crate performs no I/O, has no async runtime, and
 # reaches no network — that is the property that lets the same rules run in a
