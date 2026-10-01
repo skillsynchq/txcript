@@ -309,7 +309,9 @@ mod tests {
             [identity]
             kind = "cloudflare_access"
             team = "example"
-            aud_file = "{}"
+            # A literal string: a Windows path's backslashes would otherwise
+            # read as TOML escapes.
+            aud_file = '{}'
             [store]
             kind = "memory"
             [policy]
