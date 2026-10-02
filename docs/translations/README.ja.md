@@ -125,6 +125,7 @@ writeFileSync("rollout.jsonl", output);
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | 対応 | ローカルゲートウェイ経由 |
 | [fx](../formats/fx.md) | `fx` | 対応 | 対応 |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | 対応 | 対応 |
+| [uji](../formats/uji.md) | `uji` | 対応 | 対応 |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | 対応 | 非対応 |
 | [Amp](../formats/amp.md) | `amp` | 対応 | 非対応 |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | オンラインアカウント | 非対応 |

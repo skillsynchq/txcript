@@ -100,13 +100,16 @@ required-features = ["search"]
 [features]
 # Explicit cloud Cowork reads reuse the Claude Desktop transport.
 cowork_remote = ["claude_chat"]
-default = ["opencode", "hermes", "claude_chat", "cowork_remote", "chatgpt", "search"]
+default = ["opencode", "hermes", "uji", "claude_chat", "cowork_remote", "chatgpt", "search"]
 # The OpenCode harness store reads OpenCode's SQLite database. The OpenCode
 # codec itself is always available; only the on-disk store needs rusqlite.
 opencode = ["dep:rusqlite"]
 # Hermes Agent's canonical session store is SQLite. The JSON export codec is
 # always available; only local discovery/loading needs rusqlite.
 hermes = ["dep:rusqlite"]
+# uji keeps its sessions in SQLite. The JSON text codec is always available;
+# only the database store needs rusqlite.
+uji = ["dep:rusqlite"]
 # Claude Chat is a live, read-only remote store. Its codec remains available
 # featureless; the feature adds browser-compatible HTTPS access and macOS
 # Claude Desktop cookie decryption.

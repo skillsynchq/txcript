@@ -125,6 +125,7 @@ writeFileSync("rollout.jsonl", output);
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | होय | स्थानिक गेटवेद्वारे |
 | [fx](../formats/fx.md) | `fx` | होय | होय |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | होय | होय |
+| [uji](../formats/uji.md) | `uji` | होय | होय |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | होय | नाही |
 | [Amp](../formats/amp.md) | `amp` | होय | नाही |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | ऑनलाइन खाते | नाही |

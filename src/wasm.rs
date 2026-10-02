@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use crate::common;
 use crate::harness::{
     amp, antigravity, campfire, chatgpt, claude_chat, claude_code, codex, cowork, cowork_remote,
-    cursor, cursor_desktop, fx, grok, grok_bot, hermes, opencode, pi, simple,
+    cursor, cursor_desktop, fx, grok, grok_bot, hermes, opencode, pi, simple, uji,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
@@ -32,10 +32,11 @@ use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 /// `hermes sessions export` JSON object for hermes, the thread JSON document
 /// for amp, the JSON dump of the conversation database for antigravity, the
 /// interchange JSON document for simple, the JSON bundle of the session
-/// record, transcript and audit log for cowork); `from`/`to` are harness
+/// record, transcript and audit log for cowork, the session row with its
+/// message rows for uji); `from`/`to` are harness
 /// names (`"claude_code"`, `"claude_chat"`, `"cowork_remote"`, `"chatgpt"`, `"codex"`, `"opencode"`, `"pi"`, `"campfire"`,
 /// `"cursor"`, `"cursor_desktop"`, `"grok"`, `"grok_bot"`, `"fx"`, `"hermes"`, `"amp"`,
-/// `"antigravity"`, `"simple"`, `"cowork"`). Returns the target harness's
+/// `"antigravity"`, `"simple"`, `"cowork"`, `"uji"`). Returns the target harness's
 /// native text.
 #[wasm_bindgen]
 pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
@@ -217,6 +218,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Antigravity => go::<antigravity::Antigravity>(text),
         HarnessId::Simple => go::<simple::Simple>(text),
         HarnessId::Cowork => go::<cowork::Cowork>(text),
+        HarnessId::Uji => go::<uji::Uji>(text),
     }
 }
 
@@ -243,6 +245,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Antigravity => go::<antigravity::Antigravity>(common),
         HarnessId::Simple => go::<simple::Simple>(common),
         HarnessId::Cowork => go::<cowork::Cowork>(common),
+        HarnessId::Uji => go::<uji::Uji>(common),
     }
 }
 

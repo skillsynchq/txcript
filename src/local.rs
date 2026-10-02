@@ -35,6 +35,8 @@ use crate::harness::cowork_remote;
 
 #[cfg(feature = "hermes")]
 use crate::harness::hermes;
+#[cfg(feature = "uji")]
+use crate::harness::uji;
 
 #[cfg(feature = "opencode")]
 use crate::harness::cursor_desktop;
@@ -63,7 +65,7 @@ enum Locator {
     ClaudeChatRemote(claude_chat::ClaudeChatRef),
     #[cfg(feature = "chatgpt")]
     ChatGptRemote(chatgpt::ChatGptRef),
-    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
     Id(String),
 }
 
@@ -157,6 +159,21 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
                     harness: HarnessId::Hermes,
                     meta: d.meta,
                     // The database doesn't surface a per-session mtime.
+                    updated_at: None,
+                    locator: Locator::Id(d.reference),
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "uji")]
+    {
+        on_store(HarnessId::Uji, out.len());
+        if let Some(store) = uji::UjiStore::default_db() {
+            for d in store.discover().unwrap_or_default() {
+                out.push(Session {
+                    harness: HarnessId::Uji,
+                    meta: d.meta,
                     updated_at: None,
                     locator: Locator::Id(d.reference),
                 });
@@ -334,7 +351,7 @@ impl Session {
             Locator::ChatGptRemote(reference) => {
                 format!("https://chatgpt.com/c/{}", reference.conversation_id)
             }
-            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
             Locator::Id(id) => format!("{} db session {id}", self.harness),
         }
     }
@@ -388,6 +405,10 @@ impl Session {
             #[cfg(feature = "hermes")]
             (HarnessId::Hermes, Locator::Id(id)) => {
                 hermes::Hermes::to_common(&required(hermes::HermesStore::default_root())?.load(id)?)
+            }
+            #[cfg(feature = "uji")]
+            (HarnessId::Uji, Locator::Id(id)) => {
+                uji::Uji::to_common(&required(uji::UjiStore::default_db())?.load(id)?)
             }
             #[cfg(feature = "opencode")]
             (HarnessId::CursorDesktop, Locator::Id(id)) => {
@@ -449,6 +470,8 @@ impl Session {
             (HarnessId::Hermes, Locator::Id(id)) => {
                 required(hermes::HermesStore::default_root())?.delete(id)
             }
+            #[cfg(feature = "uji")]
+            (HarnessId::Uji, Locator::Id(id)) => required(uji::UjiStore::default_db())?.delete(id),
             #[cfg(feature = "opencode")]
             (HarnessId::CursorDesktop, Locator::Id(id)) => {
                 required(cursor_desktop::CursorDesktopStore::default_root())?.delete(id)
@@ -513,6 +536,8 @@ pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
             HarnessId::Cowork => group.files(cowork::CoworkStore::default_root()),
             #[cfg(feature = "hermes")]
             HarnessId::Hermes => group.ids(hermes::HermesStore::default_root()),
+            #[cfg(feature = "uji")]
+            HarnessId::Uji => group.ids(uji::UjiStore::default_db()),
             #[cfg(feature = "opencode")]
             HarnessId::CursorDesktop => {
                 group.ids(cursor_desktop::CursorDesktopStore::default_root());
@@ -598,7 +623,7 @@ impl Group<'_> {
         }
     }
 
-    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
     fn ids<S>(self, store: Option<S>)
     where
         S: Store<Ref = String>,
@@ -633,7 +658,7 @@ impl Session {
             Locator::ClaudeChatRemote(_) => None,
             #[cfg(feature = "chatgpt")]
             Locator::ChatGptRemote(_) => None,
-            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
             Locator::Id(_) => None,
         }
     }
@@ -647,7 +672,7 @@ impl Session {
             Locator::CoworkRemote(_) => None,
             #[cfg(feature = "chatgpt")]
             Locator::ChatGptRemote(_) => None,
-            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
             Locator::Id(_) => None,
         }
     }
@@ -661,13 +686,13 @@ impl Session {
             Locator::CoworkRemote(_) => None,
             #[cfg(feature = "claude_chat")]
             Locator::ClaudeChatRemote(_) => None,
-            #[cfg(any(feature = "opencode", feature = "hermes"))]
+            #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
             Locator::Id(_) => None,
         }
     }
 
     /// The database id behind an id-backed session.
-    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
     fn id(&self) -> Option<&String> {
         match &self.locator {
             Locator::Id(id) => Some(id),
@@ -902,6 +927,7 @@ pub fn write_with(
                 .to_string(),
         }),
         HarnessId::OpenCode => write_opencode(common),
+        HarnessId::Uji => write_uji(common, root),
         // The desktop app reads one fixed database; a root override names an
         // alternate `User` directory rather than a session directory.
         HarnessId::CursorDesktop => write_cursor_desktop(common, root),
@@ -1087,6 +1113,35 @@ fn write_opencode(_: &Transcript<Common>) -> Result<Written> {
     })
 }
 
+/// uji keeps every session in one database: a root override names the
+/// directory that holds `uji.db`.
+#[cfg(feature = "uji")]
+fn write_uji(common: &Transcript<Common>, root: Option<&Path>) -> Result<Written> {
+    let store = match root {
+        Some(dir) => uji::UjiStore::new(dir.join("uji.db")),
+        None => required(uji::UjiStore::default_db())?,
+    };
+    let parent = store
+        .db_path
+        .parent()
+        .ok_or_else(|| artifact_error("uji database has no parent directory"))?;
+    let prepared = materialize_artifacts(common, &parent.join("txcript-artifacts"))?;
+    let native = uji::Uji::from_common(&prepared)?;
+    let saved = store.save(&native)?;
+    Ok(Written {
+        id: saved.id,
+        location: store.db_path.display().to_string(),
+    })
+}
+
+#[cfg(not(feature = "uji"))]
+fn write_uji(_: &Transcript<Common>, _: Option<&Path>) -> Result<Written> {
+    Err(Error::Unconvertible {
+        harness: "uji",
+        detail: "uji support not compiled in (enable the `uji` feature)".to_string(),
+    })
+}
+
 /// The command that resumes session `id` in `harness` — `(binary, args)`,
 /// for the caller to exec or spawn. Overridable per harness with
 /// `TRANSCRIPT_<HARNESS>_RESUME_CMD`, a template where `{id}` is substituted
@@ -1121,6 +1176,7 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             HarnessId::Grok => ("grok".into(), vec!["--resume".into(), id]),
             HarnessId::Fx => ("fx".into(), vec!["--resume".into(), id]),
             HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
+            HarnessId::Uji => ("uji".into(), vec!["resume".into(), "--id".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),
             HarnessId::Antigravity => ("agy".into(), vec![format!("--conversation={id}")]),
             // No per-session entry point: the Claude desktop app lists the
@@ -1235,7 +1291,7 @@ mod resume_template_tests {
         assert!(apply_resume_template("   ", "id").is_none());
     }
 
-    #[cfg(any(feature = "opencode", feature = "hermes"))]
+    #[cfg(any(feature = "opencode", feature = "hermes", feature = "uji"))]
     #[test]
     fn id_locator_location_formats_cleanly() {
         let session = super::Session {
