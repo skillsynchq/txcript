@@ -120,13 +120,13 @@ txcript = "0.14"
 # txcript = { version = "0.14", default-features = false }
 ```
 
-Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, and `search`.
+Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `uji`, `claude_chat`, `cowork_remote`, `chatgpt`, and `search`.
 
 Three layers, smallest to largest:
 
 - `Codec`: `to_common` / `from_common` per harness; `convert::<A, B>` chains them through the canonical model.
 - `TextCodec`: `from_text` / `to_text` to parse and render a harness's native session text, no I/O.
-- `Store`: discover/load/save against a real backend (session directories, or SQLite DBs for OpenCode, Hermes, both Cursors, and Antigravity).
+- `Store`: discover/load/save against a real backend (session directories, or SQLite DBs for OpenCode, Hermes, uji, both Cursors, and Antigravity).
 
 Convert in memory (no filesystem):
 
@@ -222,7 +222,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","claude_chat","cowork_remote","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","fx","hermes","amp","antigravity","simple","cowork"]
+harnesses(); // ["claude_code","claude_chat","cowork_remote","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","fx","hermes","amp","antigravity","simple","cowork","uji"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -258,6 +258,7 @@ const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" }))
 | `antigravity` | JSON dump of the conversation database, protobuf blobs hex-encoded |
 | `simple` | the [Simple](formats/simple.md) interchange JSON document |
 | `cowork` | JSON bundle of the session record, Claude Code transcript, and audit log |
+| `uji` | the session row with its message rows, each row's `data` decoded |
 
 To build the wasm from source instead:
 

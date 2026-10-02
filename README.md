@@ -119,6 +119,7 @@ Each name links to its format documentation. Use the ID with `--from` and `--wit
 | [Grok Bot](docs/formats/grok-bot.md) | `grok_bot` | Yes | Via local gateway |
 | [fx](docs/formats/fx.md) | `fx` | Yes | Yes |
 | [Antigravity](docs/formats/antigravity.md) | `antigravity` | Yes | Yes |
+| [uji](docs/formats/uji.md) | `uji` | Yes | Yes |
 | [Hermes Agent](docs/formats/hermes.md) | `hermes` | Yes | No |
 | [Amp](docs/formats/amp.md) | `amp` | Yes | No |
 | [Cloud Cowork](docs/formats/cowork-remote.md) | `cowork_remote` | Live account | No |
