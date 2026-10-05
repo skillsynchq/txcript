@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 
 use crate::common::{ArtifactSource, Block, Meta};
 use crate::harness::{
-    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, pi,
+    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, pi, qoder,
 };
 
 #[cfg(feature = "chatgpt")]
@@ -139,6 +139,12 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
     scan(
         HarnessId::Antigravity,
         antigravity::AntigravityStore::default_root(),
+        &mut out,
+    );
+    on_store(HarnessId::Qoder, out.len());
+    scan(
+        HarnessId::Qoder,
+        qoder::QoderStore::default_root(),
         &mut out,
     );
     on_store(HarnessId::Cowork, out.len());
@@ -384,6 +390,7 @@ impl Session {
             (HarnessId::Antigravity, Locator::Path(p)) => {
                 go(antigravity::AntigravityStore::default_root(), p)
             }
+            (HarnessId::Qoder, Locator::Path(p)) => go(qoder::QoderStore::default_root(), p),
             (HarnessId::Cowork, Locator::Path(p)) => go(cowork::CoworkStore::default_root(), p),
             #[cfg(feature = "hermes")]
             (HarnessId::Hermes, Locator::Id(id)) => {
@@ -443,6 +450,7 @@ impl Session {
             (HarnessId::Antigravity, Locator::Path(p)) => {
                 go(antigravity::AntigravityStore::default_root(), p)
             }
+            (HarnessId::Qoder, Locator::Path(p)) => go(qoder::QoderStore::default_root(), p),
             (HarnessId::Cowork, Locator::Path(p)) => go(cowork::CoworkStore::default_root(), p),
             // Errors: the Hermes store is read-only.
             #[cfg(feature = "hermes")]
@@ -510,6 +518,7 @@ pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
             HarnessId::Fx => group.files(fx::FxStore::default_root()),
             HarnessId::Amp => group.files(amp::AmpStore::default_root()),
             HarnessId::Antigravity => group.files(antigravity::AntigravityStore::default_root()),
+            HarnessId::Qoder => group.files(qoder::QoderStore::default_root()),
             HarnessId::Cowork => group.files(cowork::CoworkStore::default_root()),
             #[cfg(feature = "hermes")]
             HarnessId::Hermes => group.ids(hermes::HermesStore::default_root()),
@@ -870,6 +879,13 @@ pub fn write_with(
             common,
             |s| s.root,
         ),
+        HarnessId::Qoder => go(
+            qoder::QoderStore::default_root(),
+            qoder::QoderStore::new,
+            root,
+            common,
+            |s| s.root,
+        ),
         HarnessId::Cowork => {
             let store = match root { Some(dir) => cowork::CoworkStore::new(dir), None => required(cowork::CoworkStore::default_root())? };
             // Resolve the active account before writing any files.
@@ -1123,6 +1139,7 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),
             HarnessId::Antigravity => ("agy".into(), vec![format!("--conversation={id}")]),
+            HarnessId::Qoder => ("qodercli".into(), vec!["--resume".into(), id]),
             // No per-session entry point: the Claude desktop app lists the
             // session under Cowork once it restarts or rescans.
             HarnessId::Cowork if cfg!(target_os = "macos") => {

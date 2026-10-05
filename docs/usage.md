@@ -222,7 +222,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","claude_chat","cowork_remote","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","fx","hermes","amp","antigravity","simple","cowork"]
+harnesses(); // ["claude_code","claude_chat","cowork_remote","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","fx","hermes","amp","antigravity","qoder","simple","cowork"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -243,7 +243,7 @@ const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" }))
 
 | Harness | Session text |
 |---|---|
-| `claude_code`, `codex`, `pi`, `campfire` | session JSONL |
+| `claude_code`, `codex`, `pi`, `campfire`, `qoder` | session JSONL |
 | `cowork_remote` | a native document with `session` detail response and ordered `events` (source-only) |
 | `claude_chat` | one live conversation detail response (source-only; no account export arrays) |
 | `chatgpt` | one live conversation detail response (source-only; no account export arrays) |
