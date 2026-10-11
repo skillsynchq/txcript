@@ -69,9 +69,12 @@ txcript query                            # interactive picker; Enter continues
     [--model <substr>]                   #   only sessions using this model (case-insensitive substring)
     [--since <when>]                     #   only sessions started at or after <when>
     [--until <when>]                     #   only sessions started at or before <when>
+    [--tool-output]                      #   also search tool output
 ```
 
 A pattern matches literally and case-insensitively: `relay bug` finds lines containing that exact text, spaces and all.
+
+Tool output (command output, file contents a tool read, other tool responses) is not searched by default, since it is often long and full of incidental matches. Pass `--tool-output` to search it too.
 
 `--since` / `--until` accept RFC3339 timestamps (`2025-06-01T00:00:00Z`) or bare dates (`2025-06-01`); bare dates mean local midnight (for `--since`) or end of local day (for `--until`).
 
@@ -88,10 +91,10 @@ txcript mcp                              # stdio transport
 Exposes three read-only tools; their optional filters match the CLI:
 
 - `list_sessions(from?, cwd?, limit?, offset?)`
-- `search_sessions(pattern, from?, cwd?, git_branch?, model?, since?, until?)`
+- `search_sessions(pattern, from?, cwd?, git_branch?, model?, since?, until?, tool_output?)`
 - `read_session(id, from?)`
 
-<sub>\* Omitting `from` includes every harness; omitting `cwd` applies no directory filter. Sessions without a recorded working directory match only when `cwd` is omitted. `git_branch` is exact; `model` is a case-insensitive substring; `since`/`until` are RFC3339 strings or bare dates.</sub>
+<sub>\* Omitting `from` includes every harness; omitting `cwd` applies no directory filter. Sessions without a recorded working directory match only when `cwd` is omitted. `git_branch` is exact; `model` is a case-insensitive substring; `since`/`until` are RFC3339 strings or bare dates; `tool_output: true` matches `--tool-output`.</sub>
 
 `list_sessions` pages with `limit` and `offset` and reports the total before paging; the live Claude Chat and ChatGPT sources are never listed. `read_session` takes the same `#range` suffix as `view` and returns the same compact text; a read too large to return whole is refused with suggested sub-ranges. `--cache` applies to the server too.
 

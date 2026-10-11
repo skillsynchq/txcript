@@ -62,6 +62,9 @@ struct SearchSessionsRequest {
     /// Only sessions started at or before this time. RFC3339 string, e.g.
     /// `2025-12-31T23:59:59Z` or bare date `2025-12-31` (end of UTC day).
     until: Option<String>,
+    /// Also search tool output: command output, file contents read, and
+    /// other tool responses. Omit for false.
+    tool_output: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -306,7 +309,7 @@ impl SessionServer {
     /// Search local session content with the same matching, harness, and
     /// working-directory behavior as `txcript query <pattern>`.
     #[tool(
-        description = "Search local coding-agent sessions for a literal, case-insensitive pattern: it must appear in a line exactly as written, spaces included. Optional `from`, `cwd`, `git_branch`, `model`, `since`, and `until` filters match the txcript CLI flags; omitted filters search all sessions.",
+        description = "Search local coding-agent sessions for a literal, case-insensitive pattern: it must appear in a line exactly as written, spaces included. Tool output (command output, file contents read) is searched only when `tool_output` is true. Optional `from`, `cwd`, `git_branch`, `model`, `since`, and `until` filters match the txcript CLI flags; omitted filters search all sessions.",
         annotations(title = "Search sessions", read_only_hint = true)
     )]
     fn search_sessions(
@@ -337,7 +340,8 @@ impl SessionServer {
             self.cache.as_deref(),
         )
         .map_err(|error| ErrorData::internal_error(error, None))?;
-        let mut query = super::query::user_query(&request.pattern);
+        let mut query =
+            super::query::user_query(&request.pattern, request.tool_output.unwrap_or(false));
         // Match the CLI's one-shot output bounds.
         query.limit = Some(20);
         query.hits_per_doc = Some(3);
@@ -546,6 +550,11 @@ mod tests {
         assert!(search.input_schema["properties"].get("pattern").is_some());
         assert!(search.input_schema["properties"].get("from").is_some());
         assert!(search.input_schema["properties"].get("cwd").is_some());
+        assert!(
+            search.input_schema["properties"]
+                .get("tool_output")
+                .is_some()
+        );
         assert_eq!(
             search.input_schema["required"],
             serde_json::json!(["pattern"])

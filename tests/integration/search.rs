@@ -543,3 +543,429 @@ fn query_filter_cwd_path_prefix() {
     q.cwd = None;
     assert_eq!(index.query(&q).len(), 2);
 }
+
+// ── tool output ─────────────────────────────────────────────────────────────
+//
+// Tool output is indexed like every other origin but searched only when a
+// query selects `Origin::ToolResult` — what `txcript query --tool-output` and
+// the MCP `tool_output` argument do. These pin that the wider scope finds
+// tool output with the same literal, case-insensitive semantics as message
+// text, and changes nothing else.
+
+/// The query `txcript query` and the MCP search tool build (the CLI crate's
+/// `user_query`): one literal needle, case-insensitive, tool output searched
+/// only when asked.
+fn cli_query(pattern: &str, tool_output: bool) -> Query {
+    let mut q = Query::substring(pattern);
+    q.case = txcript::search::Case::Insensitive;
+    if tool_output {
+        q.origins = Origin::ALL.to_vec();
+    }
+    q
+}
+
+fn bash(id: &str, command: &str) -> Block {
+    Block::ToolUse {
+        id: id.to_string(),
+        tool: Tool::Bash {
+            command: command.to_string(),
+            workdir: None,
+            timeout_ms: None,
+            description: None,
+            run_in_background: false,
+        },
+    }
+}
+
+fn output(id: &str, out: &str) -> Block {
+    Block::ToolResult {
+        tool_use_id: id.to_string(),
+        content: ToolOutput::Text(out.to_string()),
+        is_error: false,
+    }
+}
+
+/// A session with `needle` in exactly one place: the user's words, the
+/// assistant's, or a tool's output.
+fn session_with(id: &str, secs: i64, place: Origin, needle: &str) -> Transcript<Common> {
+    let in_place = |origin: Origin, filler: &str| {
+        if origin == place {
+            format!("{filler} {needle} {filler}")
+        } else {
+            filler.to_string()
+        }
+    };
+    Transcript::new(
+        meta(id, secs),
+        vec![
+            message(
+                Role::User,
+                vec![text(&in_place(Origin::User, "please look"))],
+            ),
+            message(
+                Role::Assistant,
+                vec![
+                    text(&in_place(Origin::Assistant, "checking")),
+                    bash("t1", "make check"),
+                ],
+            ),
+            message(
+                Role::User,
+                vec![output("t1", &in_place(Origin::ToolResult, "ok"))],
+            ),
+        ],
+    )
+}
+
+#[test]
+fn message_text_matches_are_the_same_with_tool_output() {
+    for place in [Origin::User, Origin::Assistant] {
+        let t = session_with("a", 0, place, "quokka-7");
+        let narrow = search(&t, &cli_query("quokka-7", false));
+        let wide = search(&t, &cli_query("quokka-7", true));
+        assert_eq!(narrow.len(), 1, "{place:?}");
+        assert_eq!(narrow[0].origin, place);
+        assert_eq!(wide, narrow, "{place:?}");
+    }
+    // The other non-tool-output origins, from the shared fixture.
+    let t = rich_transcript("a", 0);
+    for pattern in [
+        "flaky websocket",
+        "races the handshake",
+        "--nocapture",
+        "relay-protocol-v6",
+    ] {
+        assert_eq!(
+            search(&t, &cli_query(pattern, true)),
+            search(&t, &cli_query(pattern, false)),
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
+fn text_only_in_tool_output_needs_tool_output() {
+    let t = session_with("a", 0, Origin::ToolResult, "quokka-7");
+    assert_eq!(search(&t, &cli_query("quokka-7", false)), Vec::new());
+
+    let hits = search(&t, &cli_query("quokka-7", true));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].origin, Origin::ToolResult);
+    assert_eq!(hits[0].line, "ok quokka-7 ok");
+    // Hot and cold agree under the wider scope too.
+    let mut index = Index::new();
+    index.insert(key(HarnessId::ClaudeCode, "a"), &t);
+    let hot = index.query(&cli_query("quokka-7", true));
+    assert_eq!(hot.len(), 1);
+    assert_eq!(hot[0].hits, hits);
+}
+
+#[test]
+fn only_the_tool_output_that_matches_is_hit() {
+    let t = Transcript::new(
+        meta("a", 0),
+        vec![
+            message(
+                Role::Assistant,
+                vec![
+                    bash("t1", "ls"),
+                    bash("t2", "cat Cargo.toml"),
+                    bash("t3", "git status"),
+                ],
+            ),
+            message(
+                Role::User,
+                vec![
+                    output("t1", "Cargo.toml\nsrc"),
+                    output("t2", "[package]\nname = \"wombat-engine\""),
+                    output("t3", "nothing to commit"),
+                ],
+            ),
+        ],
+    );
+    let hits = search(&t, &cli_query("wombat-engine", true));
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].span.clone(), hits[0].block), (Span(1..2), 1));
+    let fragment = t.fragment(&hits[0].span).unwrap();
+    match &fragment[0].content[hits[0].block] {
+        Block::ToolResult {
+            tool_use_id,
+            content: ToolOutput::Text(out),
+            ..
+        } => {
+            assert_eq!(tool_use_id, "t2");
+            assert!(out.contains(&hits[0].line));
+        }
+        other => panic!("expected t2's output, got {other:?}"),
+    }
+}
+
+#[test]
+fn tool_output_matches_inside_surrounding_text() {
+    let t = Transcript::new(
+        meta("a", 0),
+        vec![message(
+            Role::User,
+            vec![output(
+                "t1",
+                "running 3 tests\n  at parser::step (src/lexer.rs:42)   \ntest result: FAILED",
+            )],
+        )],
+    );
+    let hits = search(&t, &cli_query("lexer.rs:42", true));
+    assert_eq!(hits.len(), 1);
+    // The matched line, trailing whitespace trimmed, as for message text.
+    assert_eq!(hits[0].line, "  at parser::step (src/lexer.rs:42)");
+    assert_eq!(hits[0].highlights, vec![23..34]);
+}
+
+#[test]
+fn sessions_matching_by_tool_output_and_by_text_are_all_found() {
+    let mut index = Index::new();
+    let both = Transcript::new(
+        meta("both", 300),
+        vec![
+            message(Role::User, vec![text("why does kestrel-9 fail")]),
+            message(Role::User, vec![output("t1", "error: kestrel-9 timed out")]),
+        ],
+    );
+    index.insert(
+        key(HarnessId::ClaudeCode, "text"),
+        &session_with("text", 0, Origin::User, "kestrel-9"),
+    );
+    index.insert(
+        key(HarnessId::Codex, "tool"),
+        &session_with("tool", 200, Origin::ToolResult, "kestrel-9"),
+    );
+    index.insert(
+        key(HarnessId::ClaudeCode, "asst"),
+        &session_with("asst", 100, Origin::Assistant, "kestrel-9"),
+    );
+    index.insert(key(HarnessId::Pi, "both"), &both);
+    index.insert(
+        key(HarnessId::ClaudeCode, "none"),
+        &session_with("none", 400, Origin::User, "falcon"),
+    );
+    let ids =
+        |q: &Query| -> Vec<String> { index.query(q).iter().map(|m| m.key.id.clone()).collect() };
+
+    // A literal needle scores the same wherever it sits, so ties rank
+    // newest-first under either scope.
+    assert_eq!(
+        ids(&cli_query("kestrel-9", false)),
+        ["both", "asst", "text"]
+    );
+    assert_eq!(
+        ids(&cli_query("kestrel-9", true)),
+        ["both", "tool", "asst", "text"]
+    );
+    // A session matching both ways shows both lines, in transcript order.
+    let wide = index.query(&cli_query("kestrel-9", true));
+    let origins: Vec<Origin> = wide[0].hits.iter().map(|h| h.origin).collect();
+    assert_eq!(origins, [Origin::User, Origin::ToolResult]);
+}
+
+#[test]
+fn absent_text_and_empty_patterns_are_unchanged_by_tool_output() {
+    let mut index = Index::new();
+    index.insert(
+        key(HarnessId::ClaudeCode, "old"),
+        &session_with("old", 0, Origin::ToolResult, "quokka-7"),
+    );
+    index.insert(
+        key(HarnessId::Codex, "new"),
+        &session_with("new", 1000, Origin::User, "quokka-7"),
+    );
+
+    for tool_output in [false, true] {
+        let q = cli_query("not-in-any-session", tool_output);
+        assert_eq!(index.query(&q).len(), 0, "tool_output={tool_output}");
+        assert_eq!(
+            search(&session_with("a", 0, Origin::ToolResult, "quokka-7"), &q),
+            Vec::new()
+        );
+
+        // An empty pattern lists every document, newest first, with no hits;
+        // the one-shot search matches nothing.
+        let q = cli_query("   ", tool_output);
+        let listed = index.query(&q);
+        let ids: Vec<&str> = listed.iter().map(|m| m.key.id.as_str()).collect();
+        assert_eq!(ids, ["new", "old"]);
+        assert!(listed.iter().all(|m| m.hits.is_empty() && m.score == 0));
+        assert_eq!(
+            search(&session_with("a", 0, Origin::ToolResult, "quokka-7"), &q),
+            Vec::new()
+        );
+    }
+}
+
+/// Case folding and Unicode in tool output follow the rules for message
+/// text, whatever those are: one per-character case fold, no diacritic
+/// folding in substring mode, character-indexed highlights.
+#[test]
+fn tool_output_case_and_unicode_follow_message_text() {
+    let line = "Naïve ÉCHEC: 日本語 Überprüfung failed";
+    let as_text = Transcript::new(meta("a", 0), vec![message(Role::User, vec![text(line)])]);
+    let as_output = Transcript::new(
+        meta("b", 0),
+        vec![message(Role::User, vec![output("t1", line)])],
+    );
+    for (pattern, found) in [
+        ("naïve échec", true),
+        ("NAÏVE", true),
+        ("überprüfung", true),
+        ("日本語", true),
+        // Substring mode does not fold diacritics, in any origin.
+        ("naive", false),
+        ("echec", false),
+        ("ÜBERPRUFUNG", false),
+    ] {
+        let from_text = search(&as_text, &cli_query(pattern, true));
+        let from_output = search(&as_output, &cli_query(pattern, true));
+        assert_eq!(from_text.len(), usize::from(found), "{pattern}");
+        assert_eq!(from_output.len(), from_text.len(), "{pattern}");
+        for (t, o) in from_text.iter().zip(&from_output) {
+            assert_eq!((&t.line, &t.highlights), (&o.line, &o.highlights));
+            assert_eq!(o.origin, Origin::ToolResult);
+        }
+    }
+    let hits = search(&as_output, &cli_query("日本語 überprüfung", true));
+    assert_eq!(hits.len(), 1);
+    // "Naïve ÉCHEC: " is 13 characters; highlights count characters.
+    assert_eq!(hits[0].highlights, vec![13..28]);
+}
+
+/// Tool outputs that are empty, blank, JSON rather than text, or answer no
+/// known tool call neither panic nor produce stray hits.
+#[test]
+fn odd_tool_outputs_are_searched_safely() {
+    let result = |id: &str, content: ToolOutput, is_error: bool| Block::ToolResult {
+        tool_use_id: id.to_string(),
+        content,
+        is_error,
+    };
+    let t = Transcript::new(
+        meta("a", 0),
+        vec![
+            message(Role::Assistant, vec![bash("t1", "true")]),
+            message(
+                Role::User,
+                vec![
+                    result("t1", ToolOutput::Text(String::new()), false),
+                    result("t2", ToolOutput::Text(" \n\t\n".to_string()), true),
+                    result("t3", ToolOutput::Json(serde_json::Value::Null), false),
+                    result(
+                        "orphan",
+                        ToolOutput::Json(serde_json::json!({"rows": [{"name": "ibis-3"}]})),
+                        false,
+                    ),
+                ],
+            ),
+            // A tool result where a harness put it on the assistant turn.
+            message(
+                Role::Assistant,
+                vec![result(
+                    "t4",
+                    ToolOutput::Text("ibis-3 done".to_string()),
+                    false,
+                )],
+            ),
+        ],
+    );
+    let hits = search(&t, &cli_query("ibis-3", true));
+    let found: Vec<(usize, usize, Origin)> = hits
+        .iter()
+        .map(|h| (h.span.0.start, h.block, h.origin))
+        .collect();
+    assert_eq!(
+        found,
+        [(1, 3, Origin::ToolResult), (2, 0, Origin::ToolResult)]
+    );
+    assert_eq!(search(&t, &cli_query("ibis-3", false)), Vec::new());
+
+    let mut index = Index::new();
+    index.insert(key(HarnessId::ClaudeCode, "a"), &t);
+    assert_eq!(index.query(&cli_query("ibis-3", true))[0].hits, hits);
+}
+
+/// Several dozen generated sessions with large, uneven tool outputs —
+/// enough lines that `Index::query` shards scoring across threads and
+/// enough matches that it shards highlighting too. A third of the sessions
+/// mention the needle only in tool output, a third only in user text.
+#[test]
+fn many_sessions_with_large_tool_outputs() {
+    const SESSIONS: u64 = 96;
+    // Fixed-seed xorshift: output sizes and needle positions vary, the same
+    // way on every run.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let mut index = Index::new();
+    for i in 0..SESSIONS {
+        let id = format!("s{i:03}");
+        let lines = 600 + next(200);
+        let at = next(lines);
+        let out: String = (0..lines)
+            .map(|l| {
+                if i.is_multiple_of(3) && l == at {
+                    format!("warning: pelican-42 deprecated (line {l})\n")
+                } else {
+                    format!("   Compiling crate-{l} v0.{i}.0\n")
+                }
+            })
+            .collect();
+        let ask = if i % 3 == 1 {
+            "is pelican-42 still used?"
+        } else {
+            "build it"
+        };
+        let t = Transcript::new(
+            meta(&id, i64::try_from(i).unwrap()),
+            vec![
+                message(Role::User, vec![text(ask)]),
+                message(Role::Assistant, vec![bash("t1", "cargo build")]),
+                message(Role::User, vec![output("t1", &out)]),
+            ],
+        );
+        index.insert(key(HarnessId::ClaudeCode, &id), &t);
+    }
+    assert!(index.lines() >= 64 * 1024, "{} lines", index.lines());
+
+    let ids =
+        |q: &Query| -> Vec<String> { index.query(q).iter().map(|m| m.key.id.clone()).collect() };
+    // Equal literal scores: newest (highest-numbered) first.
+    let expect = |keep: &dyn Fn(u64) -> bool| -> Vec<String> {
+        (0..SESSIONS)
+            .rev()
+            .filter(|&i| keep(i))
+            .map(|i| format!("s{i:03}"))
+            .collect()
+    };
+
+    let narrow = cli_query("pelican-42", false);
+    assert_eq!(ids(&narrow), expect(&|i| i % 3 == 1));
+
+    let wide = cli_query("PELICAN-42", true);
+    let all = ids(&wide);
+    assert_eq!(all, expect(&|i| i % 3 != 2));
+    assert_eq!(ids(&wide), all, "repeat queries agree");
+    for m in index.query(&wide) {
+        let n: u64 = m.key.id[1..].parse().unwrap();
+        let origin = if n.is_multiple_of(3) {
+            Origin::ToolResult
+        } else {
+            Origin::User
+        };
+        assert_eq!(m.hits.len(), 1, "{}", m.key.id);
+        assert_eq!(m.hits[0].origin, origin, "{}", m.key.id);
+    }
+
+    // The CLI's 20-document cap keeps the top of the same ranking.
+    let mut capped = wide.clone();
+    capped.limit = Some(20);
+    assert_eq!(ids(&capped), all[..20]);
+}

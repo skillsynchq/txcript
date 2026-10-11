@@ -253,13 +253,18 @@ pub enum SessionCommand {
     /// Matching is literal and case-insensitive: the pattern must appear in a
     /// line exactly as typed, spaces included. A pattern prints ranked hits,
     /// labeled by what matched (user text, assistant text, thinking, tool use,
-    /// session metadata). The picker filters per keystroke; Enter continues the
-    /// selection, Esc cancels.
+    /// session metadata). Tool output is searched only with `--tool-output`.
+    /// The picker filters per keystroke; Enter continues the selection, Esc
+    /// cancels.
     Query {
         /// Text to find, matched literally; omit to pick interactively
         // Other: without a hint, generated completions fall back to filenames.
         #[arg(value_hint = clap::ValueHint::Other)]
         pattern: Option<String>,
+        /// Also search tool output: command output, file contents read, and
+        /// other tool responses
+        #[arg(long)]
+        tool_output: bool,
         /// Continue the picked session in this harness
         #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
         with: Option<HarnessId>,
@@ -413,6 +418,7 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
         }
         SessionCommand::Query {
             pattern,
+            tool_output,
             with,
             from,
             cwd,
@@ -422,6 +428,7 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             until,
         } => query::cmd_query(
             pattern,
+            tool_output,
             with,
             from,
             cwd.as_deref(),
@@ -2397,15 +2404,22 @@ mod query {
     /// is one literal needle, spaces included, matched case-insensitively.
     /// Fuzzy scoring matches any line whose characters contain the pattern in
     /// order, which turns up lines that only look like matches.
-    pub(super) fn user_query(pattern: &str) -> Query {
+    ///
+    /// Tool output is indexed either way but searched only when `tool_output`
+    /// is set: [`Origin::DEFAULT`] leaves it out, [`Origin::ALL`] puts it in.
+    pub(super) fn user_query(pattern: &str, tool_output: bool) -> Query {
         let mut q = Query::substring(pattern);
         q.case = Case::Insensitive;
+        if tool_output {
+            q.origins = Origin::ALL.to_vec();
+        }
         q
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn cmd_query(
         pattern: Option<String>,
+        tool_output: bool,
         with: Option<HarnessId>,
         from: Option<HarnessId>,
         cwd: Option<&Path>,
@@ -2421,10 +2435,10 @@ mod query {
                 if with.is_some() {
                     eprintln!("warning: --with ignored with a pattern");
                 }
-                one_shot(&index, &pattern);
+                one_shot(&index, &pattern, tool_output);
                 Ok(std::process::ExitCode::SUCCESS)
             }
-            None => match tui::pick(&index)? {
+            None => match tui::pick(&index, tool_output)? {
                 // Cancelled; terminal already restored, nothing to continue.
                 None => Ok(std::process::ExitCode::SUCCESS),
                 Some(key) => {
@@ -2628,9 +2642,9 @@ mod query {
     }
 
     /// Print ranked hits for a pattern, colorized when stdout is a terminal.
-    fn one_shot(index: &Index, pattern: &str) {
+    fn one_shot(index: &Index, pattern: &str, tool_output: bool) {
         use std::io::{IsTerminal, Write};
-        let mut q = user_query(pattern);
+        let mut q = user_query(pattern, tool_output);
         q.limit = Some(20);
         q.hits_per_doc = Some(3);
         let matches = index.query(&q);
@@ -2797,7 +2811,9 @@ mod query {
 
         /// Interactive picker over the index. Returns the chosen doc, or
         /// `None` on cancel. The terminal is fully restored either way.
-        pub(super) fn pick(index: &Index) -> Result<Option<DocKey>, String> {
+        /// `tool_output` widens every keystroke's search as in
+        /// [`super::user_query`].
+        pub(super) fn pick(index: &Index, tool_output: bool) -> Result<Option<DocKey>, String> {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                 // Raw mode and the alternate screen need real terminal stdio.
                 Err("interactive query needs a terminal (pass a pattern instead)".into())
@@ -2807,7 +2823,7 @@ mod query {
                 let mut selected = 0usize;
                 let mut stdin = Input::new(std::io::stdin().lock());
                 let (mut rows, mut cols) = term_size();
-                let mut results = query(index, &input, rows);
+                let mut results = query(index, &input, rows, tool_output);
                 let mut pending = None;
                 render(&input, &results, selected, index.len(), rows, cols);
 
@@ -2828,7 +2844,7 @@ mod query {
                             // results to appear.
                             render_input(&input);
                             (rows, cols) = term_size();
-                            results = query(index, &input, rows);
+                            results = query(index, &input, rows, tool_output);
                             render(&input, &results, selected, index.len(), rows, cols);
                         }
                         Key::Up | Key::Down => {
@@ -2840,7 +2856,7 @@ mod query {
 
                             let (new_rows, new_cols) = term_size();
                             if new_rows != rows {
-                                results = query(index, &input, new_rows);
+                                results = query(index, &input, new_rows, tool_output);
                                 selected = selected.min(results.len().saturating_sub(1));
                             }
                             (rows, cols) = (new_rows, new_cols);
@@ -2891,10 +2907,10 @@ mod query {
             }
         }
 
-        fn query<'a>(index: &'a Index, input: &str, rows: usize) -> Results<'a> {
+        fn query<'a>(index: &'a Index, input: &str, rows: usize, tool_output: bool) -> Results<'a> {
             let visible = rows.saturating_sub(2).max(1);
             let searching = !input.trim().is_empty();
-            let mut q = super::user_query(input);
+            let mut q = super::user_query(input, tool_output);
             q.limit = Some(visible);
             q.hits_per_doc = searching.then_some(visible);
             let docs = index.query(&q);
@@ -3276,7 +3292,7 @@ mod query {
     mod tui {
         use txcript::search::{DocKey, Index};
 
-        pub(super) fn pick(_: &Index) -> Result<Option<DocKey>, String> {
+        pub(super) fn pick(_: &Index, _: bool) -> Result<Option<DocKey>, String> {
             Err("the interactive picker is unix-only; pass a pattern instead".into())
         }
     }
@@ -3284,15 +3300,90 @@ mod query {
     #[cfg(test)]
     mod tests {
         use super::user_query;
-        use txcript::search::{Case, Mode};
+        use txcript::common::{Block, Message, Meta, Role, ToolOutput};
+        use txcript::search::{Case, DocKey, Index, Mode, Origin};
+        use txcript::{HarnessId, Transcript};
 
         #[test]
         fn patterns_are_literal_and_case_insensitive() {
-            let q = user_query("Cargo build");
-            assert_eq!(q.mode, Mode::Substring);
-            assert_eq!(q.case, Case::Insensitive);
-            // One needle, spaces included: the space is not an atom separator.
-            assert_eq!(q.pattern, "Cargo build");
+            for tool_output in [false, true] {
+                let q = user_query("Cargo build", tool_output);
+                assert_eq!(q.mode, Mode::Substring);
+                assert_eq!(q.case, Case::Insensitive);
+                // One needle, spaces included: the space is not an atom separator.
+                assert_eq!(q.pattern, "Cargo build");
+            }
+        }
+
+        #[test]
+        fn tool_output_flag_only_widens_the_origins() {
+            assert_eq!(user_query("x", false).origins, Origin::DEFAULT.to_vec());
+            assert_eq!(user_query("x", true).origins, Origin::ALL.to_vec());
+            // Everything else about the query is the same either way.
+            let (mut narrow, wide) = (user_query("x", false), user_query("x", true));
+            narrow.origins = wide.origins.clone();
+            assert_eq!(narrow, wide);
+        }
+
+        /// Text a tool printed, and nothing else in the session, is what the
+        /// flag exists to reach: `query`, its picker, and the MCP search tool
+        /// all build their query with `user_query`.
+        #[test]
+        fn text_only_in_tool_output_is_found_with_the_flag() {
+            let at = chrono::DateTime::UNIX_EPOCH;
+            let message = |role, content| Message {
+                role,
+                content,
+                timestamp: at,
+                model: None,
+                stop_reason: None,
+                usage: None,
+            };
+            let meta = Meta {
+                id: "s1".to_string(),
+                timestamp: at,
+                cwd: None,
+                git_branch: None,
+                title: None,
+                cli_version: None,
+                model: None,
+                lineage: None,
+            };
+            let transcript = Transcript::new(
+                meta,
+                vec![
+                    message(
+                        Role::User,
+                        vec![Block::Text {
+                            text: "run the build".to_string(),
+                        }],
+                    ),
+                    message(
+                        Role::User,
+                        vec![Block::ToolResult {
+                            tool_use_id: "t1".to_string(),
+                            content: ToolOutput::Text(
+                                "compiling\nerror: Linker_Fault in libfoo.a".to_string(),
+                            ),
+                            is_error: true,
+                        }],
+                    ),
+                ],
+            );
+            let mut index = Index::new();
+            let key = DocKey {
+                harness: HarnessId::ClaudeCode,
+                id: "s1".to_string(),
+                source: None,
+            };
+            index.insert(key, &transcript);
+
+            assert!(index.query(&user_query("linker_fault", false)).is_empty());
+            let found = index.query(&user_query("linker_fault", true));
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].hits.len(), 1);
+            assert_eq!(found[0].hits[0].origin, Origin::ToolResult);
+            assert_eq!(found[0].hits[0].line, "error: Linker_Fault in libfoo.a");
         }
     }
 }
