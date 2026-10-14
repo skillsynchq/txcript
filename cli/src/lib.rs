@@ -2351,17 +2351,13 @@ pub use query::{Sessions, build_index, doc_key};
 mod query {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    use txcript::search::{Case, DocKey, DocMatch, Extracted, Index, Origin, Query};
-    use txcript::{HarnessId, local};
+    use txcript::search::{Case, DocKey, Extracted, Found, Index, Origin, Query, Scan};
+    use txcript::{Common, HarnessId, Transcript, local};
 
-    /// One unit of index-building work, per session.
-    enum Work {
-        /// Parse the session from its store and extract it.
-        Parse(usize),
-        /// Deserialize the cached extraction.
-        Thaw(usize, Vec<u8>),
-    }
+    use super::cache::Cache;
 
     /// The sessions behind an index, keyed by the full [`DocKey`] — source
     /// included — so two sessions sharing a (harness, id), as Claude Code
@@ -2379,19 +2375,71 @@ mod query {
         }
     }
 
-    /// Build the same filtered index used by the CLI for the MCP search tool.
+    /// Which sessions a query reads: the CLI's `--from` and `--cwd`, and
+    /// the metadata filters.
+    pub(super) struct Scope<'a> {
+        pub from: Option<HarnessId>,
+        pub cwd: Option<&'a Path>,
+        pub git_branch: Option<&'a str>,
+        pub model: Option<&'a str>,
+        pub since: Option<chrono::DateTime<chrono::Utc>>,
+        pub until: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    impl Scope<'_> {
+        fn holds(&self, session: &local::Session) -> bool {
+            if !super::selected(session, self.from, self.cwd) {
+                return false;
+            }
+            if let Some(branch) = self.git_branch
+                && session.meta.git_branch.as_deref() != Some(branch)
+            {
+                return false;
+            }
+            if let Some(model) = self.model
+                && !session
+                    .meta
+                    .model
+                    .as_deref()
+                    .is_some_and(|m| m.to_lowercase().contains(&model.to_lowercase()))
+            {
+                return false;
+            }
+            if let Some(since) = self.since
+                && session.meta.timestamp < since
+            {
+                return false;
+            }
+            if let Some(until) = self.until
+                && session.meta.timestamp > until
+            {
+                return false;
+            }
+            true
+        }
+    }
+
+    /// One read of the sessions in a scope: with which cache, on how many
+    /// threads, and until when.
+    pub(super) struct Job<'a> {
+        pub scope: Scope<'a>,
+        /// The persistent search cache; `None` parses every session.
+        pub cache: Option<&'a Path>,
+        pub workers: usize,
+        /// Asked between sessions: once true, no further session is read.
+        pub cancelled: &'a (dyn Fn() -> bool + Sync),
+    }
+
+    /// Every core: for a person waiting on a terminal.
+    pub(super) fn every_core() -> usize {
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+    }
+
+    /// Half the cores: for a search an agent starts while its person works
+    /// on the same machine, which must not take the machine from them.
     #[cfg(feature = "mcp")]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn index_for(
-        from: Option<HarnessId>,
-        cwd: Option<&Path>,
-        git_branch: Option<&str>,
-        model: Option<&str>,
-        since: Option<chrono::DateTime<chrono::Utc>>,
-        until: Option<chrono::DateTime<chrono::Utc>>,
-        cache: Option<&Path>,
-    ) -> Result<Index, String> {
-        build_index(from, cwd, git_branch, model, since, until, cache).map(|(index, _)| index)
+    pub(super) fn half_the_cores() -> usize {
+        (every_core() / 2).max(1)
     }
 
     /// The query behind `txcript query` and the MCP search tool: the pattern
@@ -2401,6 +2449,15 @@ mod query {
     pub(super) fn user_query(pattern: &str) -> Query {
         let mut q = Query::substring(pattern);
         q.case = Case::Insensitive;
+        q
+    }
+
+    /// [`user_query`] with the bounds of a one-shot answer, at a terminal or
+    /// to an agent: the best twenty sessions, three lines of each.
+    pub(super) fn one_shot_query(pattern: &str) -> Query {
+        let mut q = user_query(pattern);
+        q.limit = Some(20);
+        q.hits_per_doc = Some(3);
         q
     }
 
@@ -2416,33 +2473,45 @@ mod query {
         until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<std::process::ExitCode, String> {
-        let (index, sessions) = build_index(from, cwd, git_branch, model, since, until, cache)?;
-        match pattern {
-            Some(pattern) => {
-                if with.is_some() {
-                    eprintln!("warning: --with ignored with a pattern");
-                }
-                one_shot(&index, &pattern);
-                Ok(std::process::ExitCode::SUCCESS)
+        if let Some(pattern) = pattern {
+            let job = Job {
+                scope: Scope {
+                    from,
+                    cwd,
+                    git_branch,
+                    model,
+                    since,
+                    until,
+                },
+                cache,
+                workers: every_core(),
+                cancelled: &|| false,
+            };
+            let found = find(&job, &one_shot_query(&pattern))?;
+            if with.is_some() {
+                eprintln!("warning: --with ignored with a pattern");
             }
-            None => match tui::pick(&index)? {
-                // Cancelled; terminal already restored, nothing to continue.
-                None => Ok(std::process::ExitCode::SUCCESS),
-                Some(key) => {
-                    let session = sessions
-                        .get(&key)
-                        .ok_or("internal error: picked session not found")?;
-                    drop(index);
-                    super::continue_session(
-                        session,
-                        with,
-                        None,
-                        None,
-                        with != Some(HarnessId::GrokBot),
-                        None,
-                    )
-                }
-            },
+            one_shot(&found, &pattern);
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        let (index, sessions) = build_index(from, cwd, git_branch, model, since, until, cache)?;
+        match tui::pick(&index)? {
+            // Cancelled; terminal already restored, nothing to continue.
+            None => Ok(std::process::ExitCode::SUCCESS),
+            Some(key) => {
+                let session = sessions
+                    .get(&key)
+                    .ok_or("internal error: picked session not found")?;
+                drop(index);
+                super::continue_session(
+                    session,
+                    with,
+                    None,
+                    None,
+                    with != Some(HarnessId::GrokBot),
+                    None,
+                )
+            }
         }
     }
 
@@ -2451,22 +2520,20 @@ mod query {
     /// `git_branch`, `model`, `since`, and `until` metadata filters so that
     /// only matching sessions are indexed and returned.
     ///
-    /// Sessions parse and extract on every core: workers pull the next
-    /// undrained session, parse it, extract its searchable lines, and send
-    /// the result back over a bounded channel; this thread folds arrivals
-    /// into the index as they land, so at most a few extracted documents are
-    /// ever in flight.
+    /// The whole index is held in memory, which is what a picker querying it
+    /// per keystroke needs; one query is answered without it (see `find`).
+    /// Sessions are read on every core, as `read_sessions` describes.
     ///
     /// With a `cache` path, sessions whose change cursor (see
     /// [`local::fingerprints`]) matches the cached one are thawed from the
-    /// cache instead of parsed, and the cache is brought up to date
-    /// afterwards. A cache that can't be opened is reported on stderr and
+    /// cache instead of parsed, and the cache is brought up to date as they
+    /// are read. A cache that can't be opened is reported on stderr and
     /// skipped: the index is built the stateless way.
     ///
     /// # Errors
     /// Returns an error when an explicitly selected live store cannot be
     /// discovered or read.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub fn build_index(
         from: Option<HarnessId>,
         cwd: Option<&Path>,
@@ -2476,10 +2543,142 @@ mod query {
         until: Option<chrono::DateTime<chrono::Utc>>,
         cache: Option<&Path>,
     ) -> Result<(Index, Sessions), String> {
-        let found = super::discover_with_spinner(from)?;
-        let spinner = super::spin::Spinner::start("indexing…");
-        let mut cache = cache.and_then(|path| match super::cache::Cache::open(path) {
-            Ok(cache) => Some(cache),
+        let job = Job {
+            scope: Scope {
+                from,
+                cwd,
+                git_branch,
+                model,
+                since,
+                until,
+            },
+            cache,
+            workers: every_core(),
+            cancelled: &|| false,
+        };
+        let mut arrived = Vec::new();
+        let read = read_sessions(
+            &job,
+            "indexing…",
+            || (),
+            |(), doc| doc,
+            |n, doc| arrived.push((n, doc)),
+        )?;
+        // Insert in discovery order, not arrival order: document order
+        // breaks full score-and-timestamp ties in query results, and it
+        // should not vary run to run.
+        arrived.sort_unstable_by_key(|&(n, _)| n);
+        let mut read: Vec<Option<local::Session>> = read.into_iter().map(Some).collect();
+        let mut index = Index::new();
+        let mut sessions = Sessions::new();
+        for (n, doc) in arrived {
+            // Only sessions that parsed are in the lookup, as in the index.
+            if let Some(session) = read[n].take() {
+                sessions.insert(doc_key(&session), session);
+            }
+            index.insert_extracted(doc);
+        }
+        Ok((index, sessions))
+    }
+
+    /// The documents [`Index::query`] would return for `query` over every
+    /// session in the job's scope, found without building the index: each
+    /// session is searched as it is read and then dropped, so memory follows
+    /// the largest sessions, not how many there are.
+    ///
+    /// # Errors
+    /// When an explicitly selected live store cannot be discovered or read,
+    /// or the job was cancelled before every session was searched.
+    pub(super) fn find(job: &Job<'_>, query: &Query) -> Result<Vec<Found>, String> {
+        let mut best = Best::new(query.limit);
+        read_sessions(
+            job,
+            "searching…",
+            || Scan::new(query),
+            |scan, doc| scan.search(&doc),
+            |n, found| {
+                if let Some(found) = found {
+                    best.push(n, found);
+                }
+            },
+        )?;
+        Ok(best.finish())
+    }
+
+    /// The best documents a search has found so far.
+    struct Best {
+        limit: Option<usize>,
+        /// Each with its session's place in discovery order.
+        found: Vec<(usize, Found)>,
+    }
+
+    impl Best {
+        fn new(limit: Option<usize>) -> Best {
+            Best {
+                limit,
+                found: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, n: usize, found: Found) {
+            self.found.push((n, found));
+            // Ranked and cut whenever twice the limit is held, so a pattern
+            // that matches every session keeps a few dozen results in
+            // memory, not one for each.
+            if let Some(limit) = self.limit
+                && self.found.len() >= limit.saturating_mul(2).max(16)
+            {
+                self.rank();
+            }
+        }
+
+        /// Order as [`Index::query`] does, best score first and ties newest
+        /// first, then by discovery order, which is the order an index is
+        /// filled in: results do not vary run to run. Cut to the limit.
+        fn rank(&mut self) {
+            self.found.sort_unstable_by(|(a_at, a), (b_at, b)| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| b.meta.timestamp.cmp(&a.meta.timestamp))
+                    .then_with(|| a_at.cmp(b_at))
+            });
+            if let Some(limit) = self.limit {
+                self.found.truncate(limit);
+            }
+        }
+
+        fn finish(mut self) -> Vec<Found> {
+            self.rank();
+            self.found.into_iter().map(|(_, found)| found).collect()
+        }
+    }
+
+    /// Read every session in the job's scope, handing each one's extraction
+    /// to `each` on the thread that read it and what `each` makes of it to
+    /// `arrive` on this one, with the session's place in the returned list.
+    /// `state` makes what `each` keeps between sessions, once per thread.
+    ///
+    /// Sessions are read as [`Pass::run`] describes. With a cache, the ones
+    /// whose change cursor (see [`local::fingerprints`]) matches the cached
+    /// one are thawed instead of parsed, and the cache is brought up to
+    /// date: parsed sessions are written as they arrive, and rows for
+    /// sessions that are gone are dropped at the end. A cache that can't be
+    /// opened is reported on stderr and skipped.
+    ///
+    /// # Errors
+    /// When an explicitly selected live store cannot be discovered or read,
+    /// or the job was cancelled before every session was read.
+    fn read_sessions<S, T: Send>(
+        job: &Job<'_>,
+        label: &str,
+        state: impl Fn() -> S + Sync,
+        each: impl Fn(&mut S, Extracted) -> T + Sync,
+        mut arrive: impl FnMut(usize, T),
+    ) -> Result<Vec<local::Session>, String> {
+        let found = super::discover_with_spinner(job.scope.from)?;
+        let spinner = super::spin::Spinner::start(label);
+        let cache = job.cache.and_then(|path| match Cache::open(path) {
+            Ok(cache) => Some(Mutex::new(cache)),
             Err(e) => {
                 eprintln!("warning: search cache unavailable ({e}); indexing without it");
                 None
@@ -2492,149 +2691,184 @@ mod query {
         } else {
             HashSet::new()
         };
-        let scoped: Vec<local::Session> =
-            found
-                .into_iter()
-                .filter(|session| {
-                    if !super::selected(session, from, cwd) {
-                        return false;
-                    }
-                    if let Some(branch) = git_branch
-                        && session.meta.git_branch.as_deref() != Some(branch)
-                    {
-                        return false;
-                    }
-                    if let Some(model_filter) = model
-                        && !session.meta.model.as_deref().is_some_and(|m| {
-                            m.to_lowercase().contains(&model_filter.to_lowercase())
-                        })
-                    {
-                        return false;
-                    }
-                    if let Some(since) = since
-                        && session.meta.timestamp < since
-                    {
-                        return false;
-                    }
-                    if let Some(until) = until
-                        && session.meta.timestamp > until
-                    {
-                        return false;
-                    }
-                    true
-                })
-                .collect();
-        let total = scoped.len();
-
+        let sessions: Vec<local::Session> = found
+            .into_iter()
+            .filter(|session| job.scope.holds(session))
+            .collect();
+        let total = sessions.len();
+        let keys: Vec<DocKey> = sessions.iter().map(doc_key).collect();
         // Cursors for the cache check. Empty cursors never hit, so a session
         // whose store can't say whether it changed is parsed every time.
         let cursors = cache
             .as_ref()
-            .map(|_| local::fingerprints(&scoped))
+            .map(|_| local::fingerprints(&sessions))
             .unwrap_or_default();
-        // One work item per session: thaw the cached bytes when the cursor
-        // still matches, parse the session otherwise. Only the SQLite read
-        // happens here; deserializing is CPU work like parsing, and the
-        // workers share it across cores the same way.
-        let work: Vec<Work> = (0..total)
-            .map(|i| {
-                cache
-                    .as_ref()
-                    .and_then(|cache| cache.get_raw(&doc_key(&scoped[i]), &cursors[i]))
-                    .map_or(Work::Parse(i), |bytes| Work::Thaw(i, bytes))
-            })
-            .collect();
-        let from_cache = work.iter().filter(|w| matches!(w, Work::Thaw(..))).count();
 
-        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        let mut index = Index::new();
-        // Which sessions parsed cleanly, by position in `scoped`; the lookup
-        // map is built from these after the workers release their borrow.
-        let mut indexed = vec![false; total];
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let (tx, rx) = std::sync::mpsc::sync_channel(workers * 2);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let tx = tx.clone();
-                let (next, scoped, work) = (&next, &scoped, &work);
-                scope.spawn(move || {
-                    std::iter::from_fn(|| {
-                        let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        work.get(n)
-                    })
-                    .filter_map(|item| match item {
-                        // Unreadable sessions are skipped, matching discover.
-                        Work::Parse(i) => scoped[*i].read().ok().map(|common| {
-                            (*i, Extracted::new(doc_key(&scoped[*i]), &common), true)
-                        }),
-                        // A row that no longer deserializes (a hand-edited
-                        // or truncated cache) is re-parsed and rewritten.
-                        Work::Thaw(i, bytes) => match serde_json::from_slice(bytes) {
-                            Ok(doc) => Some((*i, doc, false)),
-                            Err(_) => scoped[*i].read().ok().map(|common| {
-                                (*i, Extracted::new(doc_key(&scoped[*i]), &common), true)
-                            }),
-                        },
-                    })
-                    .for_each(|extracted| {
-                        // A send only fails when the receiver is gone, and
-                        // this thread's scope outlives it.
-                        let _ = tx.send(extracted);
-                    });
-                });
+        let mut arrived = 0;
+        Pass {
+            keys: &keys,
+            cursors: &cursors,
+            // Unreadable sessions are skipped, matching discover.
+            read: &|n| sessions[n].read().ok(),
+            cache: cache.as_ref(),
+            workers: job.workers,
+            cancelled: job.cancelled,
+        }
+        .run(state, each, |n, out| {
+            if arrived % 32 == 0 {
+                spinner.set(format!("{label} ({arrived}/{total})"));
             }
-            // Workers hold the remaining clones; the receive loop below ends
-            // when the last of them finishes.
-            drop(tx);
-            let mut arrived = Vec::with_capacity(total);
-            for (i, extracted, fresh) in rx {
-                if arrived.len() % 32 == 0 {
-                    spinner.set(match from_cache {
-                        0 => format!("indexing… ({}/{total})", arrived.len()),
-                        n => format!("indexing… ({}/{total}, {n} cached)", arrived.len()),
-                    });
-                }
-                arrived.push((i, extracted, fresh));
-                indexed[i] = true;
-            }
-            // Freshly parsed documents go into the cache before the index
-            // takes ownership of them. Best-effort: a cache write failure
-            // costs the next run a re-parse, not this run its results.
-            if let Some(cache) = cache.as_mut() {
-                let written = cache.put_many(
-                    arrived
-                        .iter()
-                        .filter(|(_, _, fresh)| *fresh)
-                        .map(|(i, doc, _)| (doc, cursors[*i].as_str())),
-                );
-                if let Err(e) = written.and_then(|()| cache.retain(&live)) {
-                    eprintln!("warning: search cache not updated: {e}");
-                }
-            }
-            // Insert in discovery order, not arrival order: document order
-            // breaks full score-and-timestamp ties in query results, and it
-            // should not vary run to run.
-            arrived.sort_unstable_by_key(|&(i, _, _)| i);
-            for (_, extracted, _) in arrived {
-                index.insert_extracted(extracted);
-            }
+            arrived += 1;
+            arrive(n, out);
         });
-        let sessions: Sessions = scoped
-            .into_iter()
-            .zip(&indexed)
-            .filter_map(|(session, &ok)| ok.then(|| (doc_key(&session), session)))
-            .collect();
+        let cancelled = (job.cancelled)();
+        if let Some(cache) = cache.as_ref().filter(|_| !cancelled)
+            && let Err(e) = lock(cache).retain(&live)
+        {
+            eprintln!("warning: search cache not updated: {e}");
+        }
         spinner.finish();
-        Ok((index, sessions))
+        if cancelled {
+            return Err("cancelled before every session was read".to_string());
+        }
+        Ok(sessions)
+    }
+
+    /// Rows of the cache written in one transaction: this many, or this
+    /// many bytes of them, whichever is reached first. What a first run
+    /// over a large history holds waiting to be written.
+    const BATCH_ROWS: usize = 64;
+    const BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+    /// One pass over sessions: what there is to read, with what, and until
+    /// when.
+    struct Pass<'a> {
+        /// The key each session's extraction is cached under, by position.
+        keys: &'a [DocKey],
+        /// Each session's change cursor, by position; empty without a cache.
+        cursors: &'a [String],
+        /// Parse the session at a position. `None` when it can't be read.
+        read: &'a (dyn Fn(usize) -> Option<Transcript<Common>> + Sync),
+        cache: Option<&'a Mutex<Cache>>,
+        workers: usize,
+        cancelled: &'a (dyn Fn() -> bool + Sync),
+    }
+
+    impl Pass<'_> {
+        /// Extract every session and hand each extraction to `each` on the
+        /// thread that made it, and what `each` returns to `arrive` on this
+        /// one, in the order they finish.
+        ///
+        /// Workers pull the next unread session, thaw or parse it, run
+        /// `each`, and send the result over a bounded channel, so at most a
+        /// few extractions are in memory at once unless `each` hands the
+        /// extraction itself back. A session that can't be read is skipped,
+        /// and nothing arrives for it. Once `cancelled` says so, no worker
+        /// starts another session.
+        fn run<S, T: Send>(
+            &self,
+            state: impl Fn() -> S + Sync,
+            each: impl Fn(&mut S, Extracted) -> T + Sync,
+            mut arrive: impl FnMut(usize, T),
+        ) {
+            let next = AtomicUsize::new(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel(self.workers.max(1) * 2);
+            std::thread::scope(|scope| {
+                for _ in 0..self.workers.max(1).min(self.keys.len()) {
+                    let tx = tx.clone();
+                    let (next, state, each) = (&next, &state, &each);
+                    scope.spawn(move || {
+                        let mut state = state();
+                        while !(self.cancelled)() {
+                            let n = next.fetch_add(1, Ordering::Relaxed);
+                            if n >= self.keys.len() {
+                                break;
+                            }
+                            let Some((doc, row)) = self.extract(n) else {
+                                continue;
+                            };
+                            // A send only fails when the receiver is gone,
+                            // and this thread's scope outlives it.
+                            let _ = tx.send((n, row, each(&mut state, doc)));
+                        }
+                    });
+                }
+                // Workers hold the remaining clones; the receive loop below
+                // ends when the last of them finishes.
+                drop(tx);
+                let mut rows: Vec<(usize, Vec<u8>)> = Vec::new();
+                let mut bytes = 0;
+                // Best-effort: a cache write failure costs the next run a
+                // re-parse, not this run its results. Said once.
+                let mut caching = true;
+                for (n, row, out) in rx {
+                    if let Some(row) = row.filter(|_| caching) {
+                        bytes += row.len();
+                        rows.push((n, row));
+                        if rows.len() >= BATCH_ROWS || bytes >= BATCH_BYTES {
+                            caching = self.store(&mut rows);
+                            bytes = 0;
+                        }
+                    }
+                    arrive(n, out);
+                }
+                self.store(&mut rows);
+            });
+        }
+
+        /// The extraction of the session at `n`, and the row to cache it
+        /// under when it had to be parsed: serialized here, on the worker,
+        /// so writing it is all the receiving thread does. `None` when the
+        /// session can't be read.
+        fn extract(&self, n: usize) -> Option<(Extracted, Option<Vec<u8>>)> {
+            let key = &self.keys[n];
+            let cached = self
+                .cache
+                .and_then(|cache| lock(cache).get_raw(key, self.cursor(n)));
+            // A row that no longer deserializes (a hand-edited or truncated
+            // cache) is re-parsed and rewritten.
+            if let Some(doc) = cached.and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+                return Some((doc, None));
+            }
+            let doc = Extracted::new(key.clone(), &(self.read)(n)?);
+            let row = self.cache.and_then(|_| serde_json::to_vec(&doc).ok());
+            Some((doc, row))
+        }
+
+        fn cursor(&self, n: usize) -> &str {
+            self.cursors.get(n).map_or("", String::as_str)
+        }
+
+        /// Write the waiting rows to the cache and forget them. Whether the
+        /// cache took them.
+        fn store(&self, rows: &mut Vec<(usize, Vec<u8>)>) -> bool {
+            let Some(cache) = self.cache.filter(|_| !rows.is_empty()) else {
+                return true;
+            };
+            let written = lock(cache).put_raw(
+                rows.iter()
+                    .map(|(n, row)| (&self.keys[*n], self.cursor(*n), row.as_slice())),
+            );
+            rows.clear();
+            match written {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("warning: search cache not updated: {e}");
+                    false
+                }
+            }
+        }
+    }
+
+    /// The cache, whatever became of the thread that last held it: a
+    /// transaction it left open was rolled back as it unwound.
+    fn lock(cache: &Mutex<Cache>) -> MutexGuard<'_, Cache> {
+        cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Print ranked hits for a pattern, colorized when stdout is a terminal.
-    fn one_shot(index: &Index, pattern: &str) {
+    fn one_shot(matches: &[Found], pattern: &str) {
         use std::io::{IsTerminal, Write};
-        let mut q = user_query(pattern);
-        q.limit = Some(20);
-        q.hits_per_doc = Some(3);
-        let matches = index.query(&q);
         if matches.is_empty() {
             println!("no matches for `{pattern}`");
         } else {
@@ -2642,7 +2876,7 @@ mod query {
             // A failed write means the reader is gone (`… | head`): stop
             // quietly instead of panicking the way `println!` would.
             let mut out = std::io::stdout().lock();
-            for m in &matches {
+            for m in matches {
                 if writeln!(out, "{}", doc_line(m, color)).is_err() {
                     return;
                 }
@@ -2672,7 +2906,7 @@ mod query {
         }
     }
 
-    fn doc_line(m: &DocMatch<'_>, color: bool) -> String {
+    fn doc_line(m: &Found, color: bool) -> String {
         let label = m
             .meta
             .title
@@ -3284,8 +3518,16 @@ mod query {
 
     #[cfg(test)]
     mod tests {
-        use super::user_query;
-        use txcript::search::{Case, Mode};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use chrono::{TimeZone, Utc};
+        use txcript::common::{Block, Message, Meta, Role};
+        use txcript::search::{Case, DocKey, Hit, Index, Mode, Query, Scan};
+        use txcript::{Common, HarnessId, Transcript};
+
+        use super::{Best, Pass, one_shot_query, user_query};
+        use crate::cache::Cache;
 
         #[test]
         fn patterns_are_literal_and_case_insensitive() {
@@ -3294,6 +3536,162 @@ mod query {
             assert_eq!(q.case, Case::Insensitive);
             // One needle, spaces included: the space is not an atom separator.
             assert_eq!(q.pattern, "Cargo build");
+        }
+
+        /// More sessions than one cache transaction holds. Most say
+        /// "needle", placed so their scores differ, and they start at one of
+        /// seven times, so the ranking has score-and-time ties for discovery
+        /// order to settle.
+        fn corpus() -> Vec<(DocKey, Transcript<Common>)> {
+            const SAID: [&str; 5] = [
+                "needle",
+                "there is a needle in here\nand a second needle\nNEEDLE, a third\nneedle four",
+                "xneedlex",
+                "nothing of the kind",
+                "the Needle",
+            ];
+            (0..150)
+                .map(|n: u32| {
+                    let at = Utc
+                        .timestamp_opt(1_780_000_000 + i64::from(n % 7) * 100, 0)
+                        .single()
+                        .unwrap_or_default();
+                    let meta = Meta {
+                        id: format!("s{n}"),
+                        timestamp: at,
+                        cwd: Some("/work/app".to_string()),
+                        git_branch: None,
+                        title: Some(format!("session {n}")),
+                        cli_version: None,
+                        model: None,
+                        lineage: None,
+                    };
+                    let said = Message {
+                        role: Role::User,
+                        content: vec![Block::Text {
+                            text: SAID[n as usize % SAID.len()].to_string(),
+                        }],
+                        timestamp: at,
+                        model: None,
+                        stop_reason: None,
+                        usage: None,
+                    };
+                    let key = DocKey {
+                        harness: HarnessId::Codex,
+                        id: format!("s{n}"),
+                        source: Some(format!("/sessions/s{n}.jsonl")),
+                    };
+                    (key, Transcript::new(meta, vec![said]))
+                })
+                .collect()
+        }
+
+        /// What `find` does with the sessions in hand: search each as it is
+        /// read and keep the best, as `(key, score, hits)`.
+        fn found(pass: &Pass<'_>, query: &Query) -> Vec<(DocKey, u32, Vec<Hit>)> {
+            let mut best = Best::new(query.limit);
+            pass.run(
+                || Scan::new(query),
+                |scan, doc| scan.search(&doc),
+                |n, found| {
+                    if let Some(found) = found {
+                        best.push(n, found);
+                    }
+                },
+            );
+            best.finish()
+                .into_iter()
+                .map(|found| (found.key, found.score, found.hits))
+                .collect()
+        }
+
+        #[test]
+        fn a_search_returns_what_an_index_of_the_same_sessions_would() {
+            let corpus = corpus();
+            let keys: Vec<DocKey> = corpus.iter().map(|(key, _)| key.clone()).collect();
+            let mut index = Index::new();
+            for (key, transcript) in &corpus {
+                index.insert(key.clone(), transcript);
+            }
+            let pass = Pass {
+                keys: &keys,
+                cursors: &[],
+                read: &|n| Some(corpus[n].1.clone()),
+                cache: None,
+                workers: 4,
+                cancelled: &|| false,
+            };
+
+            let mut few = one_shot_query("needle");
+            few.limit = Some(5);
+            let mut newest = user_query("  ");
+            newest.limit = Some(3);
+            for query in [one_shot_query("needle"), few, user_query("needle"), newest] {
+                let indexed: Vec<_> = index
+                    .query(&query)
+                    .into_iter()
+                    .map(|m| (m.key.clone(), m.score, m.hits))
+                    .collect();
+                assert!(!indexed.is_empty(), "{query:?} matches something");
+                assert_eq!(found(&pass, &query), indexed, "{query:?}");
+            }
+        }
+
+        #[test]
+        fn a_second_search_parses_only_the_sessions_that_changed() {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = Mutex::new(Cache::open(&dir.path().join("cache.sqlite")).unwrap());
+            let corpus = corpus();
+            let keys: Vec<DocKey> = corpus.iter().map(|(key, _)| key.clone()).collect();
+            let mut cursors: Vec<String> = (0..corpus.len()).map(|n| format!("{n}:1")).collect();
+            let parsed = AtomicUsize::new(0);
+            let query = one_shot_query("needle");
+            let search = |cursors: &[String]| {
+                let pass = Pass {
+                    keys: &keys,
+                    cursors,
+                    read: &|n| {
+                        parsed.fetch_add(1, Ordering::Relaxed);
+                        Some(corpus[n].1.clone())
+                    },
+                    cache: Some(&cache),
+                    workers: 3,
+                    cancelled: &|| false,
+                };
+                found(&pass, &query)
+            };
+
+            let first = search(&cursors);
+            assert_eq!(parsed.swap(0, Ordering::Relaxed), corpus.len());
+
+            let second = search(&cursors);
+            assert_eq!(parsed.swap(0, Ordering::Relaxed), 0, "all from the cache");
+            assert_eq!(second, first);
+
+            cursors[7] = "7:2".to_string();
+            assert_eq!(search(&cursors), first);
+            assert_eq!(parsed.load(Ordering::Relaxed), 1, "only the changed one");
+        }
+
+        #[test]
+        fn a_cancelled_search_starts_no_further_session() {
+            let corpus = corpus();
+            let keys: Vec<DocKey> = corpus.iter().map(|(key, _)| key.clone()).collect();
+            let read = AtomicUsize::new(0);
+            let mut arrived = 0;
+            Pass {
+                keys: &keys,
+                cursors: &[],
+                read: &|n| {
+                    read.fetch_add(1, Ordering::Relaxed);
+                    Some(corpus[n].1.clone())
+                },
+                cache: None,
+                workers: 1,
+                cancelled: &|| read.load(Ordering::Relaxed) >= 3,
+            }
+            .run(|| (), |(), doc| drop(doc), |_, ()| arrived += 1);
+            assert_eq!(arrived, 3);
         }
     }
 }

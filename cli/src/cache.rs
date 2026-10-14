@@ -119,6 +119,32 @@ impl Cache {
         &mut self,
         docs: impl IntoIterator<Item = (&'a Extracted, &'a str)>,
     ) -> Result<(), String> {
+        self.put(docs.into_iter().map(|(doc, cursor)| {
+            let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
+            Ok((doc.key(), cursor, bytes))
+        }))
+    }
+
+    /// [`Cache::put_many`] for a caller that serialized the documents
+    /// itself, on other threads: each row is its key, its cursor, and
+    /// `serde_json::to_vec` of its [`Extracted`].
+    ///
+    /// # Errors
+    /// When the transaction can't be started or committed, or a row can't
+    /// be written.
+    pub fn put_raw<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = (&'a DocKey, &'a str, &'a [u8])>,
+    ) -> Result<(), String> {
+        self.put(rows.into_iter().map(Ok))
+    }
+
+    /// Write each `(key, cursor, serialized document)` row in one
+    /// transaction, which a row that failed to serialize rolls back.
+    fn put<'a, B: AsRef<[u8]>>(
+        &mut self,
+        rows: impl Iterator<Item = Result<(&'a DocKey, &'a str, B), String>>,
+    ) -> Result<(), String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         {
             let mut insert = tx
@@ -127,16 +153,15 @@ impl Cache {
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
                 .map_err(|e| e.to_string())?;
-            for (doc, cursor) in docs {
-                let key = doc.key();
-                let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (key, cursor, bytes) = row?;
                 insert
                     .execute(params![
                         key.harness.as_str(),
                         key.id,
                         source_of(key),
                         cursor,
-                        bytes
+                        bytes.as_ref()
                     ])
                     .map_err(|e| e.to_string())?;
             }

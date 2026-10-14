@@ -60,6 +60,8 @@ wreq = { version = "6.0.0-rc.31", default-features = false, features = ["brotli"
 wreq-util = { version = "3.0.0-rc.14", features = ["emulation-compression"], optional = true }
 uuid = { version = "1.23.4", features = ["v4", "v5"] }
 wasm-bindgen = { version = "0.2.126", optional = true }
+# Decoding the rollouts Codex compresses; the library Codex writes them with.
+zstd = { version = "0.13.3", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aes = { version = "0.8.4", optional = true }
@@ -72,6 +74,8 @@ sha2 = { version = "0.10.9", optional = true }
 criterion = "0.8.2"
 proptest = "1.11.0"
 tempfile = "3.27.0"
+# Tests write compressed rollouts the way Codex does.
+zstd = { version = "0.13.3", default-features = false }
 
 # cdylib for the WASM/C-ABI output; rlib so the cli crate and tests still
 # link it. Library name follows the package: `use txcript::…`, WASM artifact
@@ -100,7 +104,7 @@ required-features = ["search"]
 [features]
 # Explicit cloud Cowork reads reuse the Claude Desktop transport.
 cowork_remote = ["claude_chat"]
-default = ["opencode", "hermes", "uji", "claude_chat", "cowork_remote", "chatgpt", "search"]
+default = ["opencode", "hermes", "uji", "claude_chat", "cowork_remote", "chatgpt", "search", "codex_zstd"]
 # The OpenCode harness store reads OpenCode's SQLite database. The OpenCode
 # codec itself is always available; only the on-disk store needs rusqlite.
 opencode = ["dep:rusqlite"]
@@ -134,6 +138,11 @@ chatgpt = [
     "dep:wreq",
     "dep:wreq-util",
 ]
+# Codex compresses a rollout it hasn't written to for a week, to
+# `.jsonl.zst`. The Codex store reads plain rollouts without this feature and
+# leaves the compressed ones out of discovery; with it, both list and load.
+# zstd is a C library, so the wasm build goes without.
+codex_zstd = ["dep:zstd"]
 # Fuzzy/substring search over transcripts (`txcript::search`). nucleo-matcher
 # is pure Rust (helix's matcher) and compiles to wasm32; combine with `wasm`
 # to expose the bindings.

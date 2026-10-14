@@ -8,12 +8,14 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
+use rmcp::service::RequestContext;
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router, transport::stdio,
+    ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use serde::{Deserialize, Serialize};
 use txcript::common::Meta;
-use txcript::search::{DocMatch, Hit, Origin};
+use txcript::search::{Found, Hit, Origin};
 use txcript::{HarnessId, Span, local, text};
 
 /// Ceiling on one `read_session` response, in rendered bytes. Reads over it
@@ -123,9 +125,9 @@ struct SearchMatch {
 }
 
 impl SearchMatch {
-    fn new(found: &DocMatch<'_>) -> Self {
+    fn new(found: &Found) -> Self {
         Self {
-            session: SessionSummary::new(found.key.harness, found.meta),
+            session: SessionSummary::new(found.key.harness, &found.meta),
             score: found.score,
             hits: found.hits.iter().map(SearchHit::from).collect(),
         }
@@ -173,14 +175,14 @@ fn origin_name(origin: Origin) -> &'static str {
 #[derive(Clone)]
 pub struct SessionServer {
     tool_router: ToolRouter<Self>,
-    /// Persistent search cache for `search_sessions`; `None` rebuilds the
-    /// index from scratch on every call.
+    /// Persistent search cache for `search_sessions`; `None` parses every
+    /// session on every call.
     cache: Option<PathBuf>,
 }
 
 impl SessionServer {
     /// Create the session server. `cache` has the same semantics as the CLI's
-    /// global `--cache`: `None` rebuilds the search index on each call.
+    /// global `--cache`: `None` parses every session on each search.
     #[must_use]
     pub fn new(cache: Option<PathBuf>) -> Self {
         let mut tool_router = Self::tool_router();
@@ -305,16 +307,22 @@ impl SessionServer {
 
     /// Search local session content with the same matching, harness, and
     /// working-directory behavior as `txcript query <pattern>`.
+    ///
+    /// The server runs beside whatever its person is doing, so the search
+    /// keeps to half the cores and holds no index: each session is searched
+    /// as it is read. It runs off the async threads, so the server goes on
+    /// hearing the client, and stops reading sessions once the client
+    /// cancels the request or is gone.
     #[tool(
         description = "Search local coding-agent sessions for a literal, case-insensitive pattern: it must appear in a line exactly as written, spaces included. Optional `from`, `cwd`, `git_branch`, `model`, `since`, and `until` filters match the txcript CLI flags; omitted filters search all sessions.",
         annotations(title = "Search sessions", read_only_hint = true)
     )]
-    fn search_sessions(
+    async fn search_sessions(
         &self,
         Parameters(request): Parameters<SearchSessionsRequest>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<SearchResults>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
-        let cwd = request.cwd.as_deref().map(Path::new);
         let since = request
             .since
             .as_deref()
@@ -327,21 +335,28 @@ impl SessionServer {
             .map(super::parse_until)
             .transpose()
             .map_err(|e| ErrorData::invalid_params(format!("`until`: {e}"), None))?;
-        let index = super::query::index_for(
-            from,
-            cwd,
-            request.git_branch.as_deref(),
-            request.model.as_deref(),
-            since,
-            until,
-            self.cache.as_deref(),
-        )
+        let cache = self.cache.clone();
+        let cancelled = context.ct;
+        let found = tokio::task::spawn_blocking(move || {
+            let job = super::query::Job {
+                scope: super::query::Scope {
+                    from,
+                    cwd: request.cwd.as_deref().map(Path::new),
+                    git_branch: request.git_branch.as_deref(),
+                    model: request.model.as_deref(),
+                    since,
+                    until,
+                },
+                cache: cache.as_deref(),
+                workers: super::query::half_the_cores(),
+                cancelled: &|| cancelled.is_cancelled(),
+            };
+            super::query::find(&job, &super::query::one_shot_query(&request.pattern))
+        })
+        .await
+        .map_err(|error| ErrorData::internal_error(format!("searching: {error}"), None))?
         .map_err(|error| ErrorData::internal_error(error, None))?;
-        let mut query = super::query::user_query(&request.pattern);
-        // Match the CLI's one-shot output bounds.
-        query.limit = Some(20);
-        query.hits_per_doc = Some(3);
-        let matches = index.query(&query).iter().map(SearchMatch::new).collect();
+        let matches = found.iter().map(SearchMatch::new).collect();
         Ok(Json(SearchResults { matches }))
     }
 

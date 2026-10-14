@@ -95,6 +95,8 @@ Exposes three read-only tools; their optional filters match the CLI:
 
 `list_sessions` pages with `limit` and `offset` and reports the total before paging; the live Claude Chat and ChatGPT sources are never listed. `read_session` takes the same `#range` suffix as `view` and returns the same compact text; a read too large to return whole is refused with suggested sub-ranges. `--cache` applies to the server too.
 
+`search_sessions` runs beside whatever its person is doing on the machine: it reads sessions on half the cores, holds each only while it is searched, and stops when the client cancels the call or disconnects.
+
 
 ### Shell integration
 
@@ -116,11 +118,13 @@ txcript completion fish > ~/.config/fish/completions/txcript.fish
 [dependencies]
 txcript = "0.14"
 # Codecs only: drops the SQLite-backed stores, the live Claude Chat and
-# ChatGPT sources, and search. Every codec stays available.
+# ChatGPT sources, search, and reading Codex's compressed rollouts. Every
+# codec stays available.
 # txcript = { version = "0.14", default-features = false }
 ```
 
-Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `uji`, `claude_chat`, `cowork_remote`, `chatgpt`, and `search`.
+Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `uji`, `claude_chat`, `cowork_remote`, `chatgpt`, `search`, and `codex_zstd` (the rollouts Codex compresses to `.jsonl.zst`).
+
 
 Three layers, smallest to largest:
 

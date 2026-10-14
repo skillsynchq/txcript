@@ -935,7 +935,7 @@ mod remote {
             };
             assert!(store.load(&reference).is_err());
             assert!(store.delete(&reference).is_err());
-            assert!(handle.join().unwrap().is_empty());
+            assert_eq!(handle.join().unwrap(), [] as [String; 0]);
             assert_eq!(CoworkRemote::NAME, "cowork_remote");
         }
     }

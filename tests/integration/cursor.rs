@@ -197,7 +197,7 @@ fn from_common_writes_cursor_resume_state_turns() {
     let turn_refs = len_fields(&root.data, 8);
 
     assert_eq!(turn_refs.len(), 1);
-    assert!(len_fields(&root.data, 1).is_empty());
+    assert_eq!(len_fields(&root.data, 1), [] as [Vec<u8>; 0]);
 
     let turn_id = hex_encode_test(&turn_refs[0]);
     let turn_blob = native

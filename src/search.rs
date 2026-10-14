@@ -1,12 +1,15 @@
 //! Fuzzy and substring search over transcripts (feature `search`).
 //!
-//! Two entry points, sharing [`Query`] and [`Hit`]:
+//! Three entry points, sharing [`Query`] and [`Hit`]:
 //!
 //! - [`search`] — one-shot, stateless: the matching lines of a single
 //!   [`Transcript<Common>`].
 //! - [`Index`] — [`Index::insert`] transcripts once, then [`Index::query`]
 //!   per keystroke. Text is extracted and pre-converted to UTF-32 at insert;
 //!   queries scan without parsing or transcoding.
+//! - [`Scan`] — one query over many transcripts with no index: each is
+//!   searched and dropped, so memory follows the largest transcript instead
+//!   of the corpus.
 //!
 //! Matching is [nucleo](https://github.com/helix-editor/nucleo), helix's
 //! matcher, with smart case and Latin diacritic folding. [`Mode::Fuzzy`]
@@ -256,6 +259,18 @@ impl fmt::Display for DocKey {
 pub struct DocMatch<'i> {
     pub key: &'i DocKey,
     pub meta: &'i Meta,
+    /// The best line score in the document.
+    pub score: u32,
+    /// Matching lines, in transcript order.
+    pub hits: Vec<Hit>,
+}
+
+/// One document's result from [`Scan::search`]: a [`DocMatch`] that owns its
+/// key and metadata, for a caller that does not keep the document.
+#[derive(Debug, Clone)]
+pub struct Found {
+    pub key: DocKey,
+    pub meta: Meta,
     /// The best line score in the document.
     pub score: u32,
     /// Matching lines, in transcript order.
@@ -647,6 +662,67 @@ fn path_under(session_cwd: &str, dir: &str) -> bool {
     canon(p_cwd).starts_with(canon(p_dir))
 }
 
+// ── scan ───────────────────────────────────────────────────────────────
+
+/// One query run over documents one at a time, with no index: each
+/// [`Extracted`] is searched and can then be dropped, so memory follows the
+/// largest document instead of the corpus. A caller that queries the same
+/// documents again and again (a picker) wants an [`Index`].
+///
+/// Holds the matcher's scratch space: use one per thread.
+pub struct Scan {
+    query: Query,
+    pattern: Compiled,
+    mask: u8,
+    matcher: Matcher,
+    indices: Vec<u32>,
+}
+
+impl Scan {
+    #[must_use]
+    pub fn new(query: &Query) -> Scan {
+        Scan {
+            pattern: query.compile(),
+            mask: query.origin_mask(),
+            query: query.clone(),
+            matcher: Matcher::new(Config::DEFAULT),
+            indices: Vec::new(),
+        }
+    }
+
+    /// What [`Index::query`] returns for an index holding only `doc`:
+    /// `None` when the query's filters leave the document out or none of
+    /// its lines match. [`Query::limit`] counts documents, so it is the
+    /// caller's to apply: [`Index::query`] ranks by `score`, then newest
+    /// first.
+    #[must_use]
+    pub fn search(&mut self, doc: &Extracted) -> Option<Found> {
+        let Extracted(doc) = doc;
+        if !doc.selected(&self.query) {
+            return None;
+        }
+        let (score, hits) = if pattern_is_empty(&self.pattern, &self.query) {
+            // Empty pattern: every selected document, with no hits.
+            (0, Vec::new())
+        } else {
+            let (best, hit_lines) = score_doc(doc, &self.pattern, self.mask, &mut self.matcher)?;
+            let hits = select_hits(hit_lines, self.query.hits_per_doc)
+                .into_iter()
+                .filter_map(|(l, _)| {
+                    doc.lines[l].hit(&self.pattern, &mut self.matcher, &mut self.indices)
+                })
+                .collect();
+            (best, hits)
+        };
+        Some(Found {
+            key: doc.key.clone(),
+            meta: doc.meta.clone(),
+            score,
+            hits,
+        })
+    }
+}
+
 /// Pass-1 result for one document: its index, best line score, and each
 /// matched line with its score.
 type Scored = (usize, u32, Vec<(usize, u32)>);
@@ -664,23 +740,34 @@ fn score_docs(
         // Documents outside the query's harness filter are not scored.
         .filter(|(_, doc)| doc.selected(query))
         .filter_map(|(d, doc)| {
-            let hit_lines: Vec<(usize, u32)> = doc
-                .lines
-                .iter()
-                .enumerate()
-                // Lines from origins the query did not select are not scored.
-                .filter(|(_, line)| line.origin.bit() & mask != 0)
-                .filter_map(|(l, line)| {
-                    pattern
-                        .score(line.text.slice(..), &mut matcher)
-                        .map(|score| (l, score))
-                })
-                .collect();
-            let best = hit_lines.iter().map(|&(_, score)| score).max();
-            // A document with no matching line does not survive pass 1.
-            best.map(|best| (base + d, best, hit_lines))
+            score_doc(doc, pattern, mask, &mut matcher)
+                .map(|(best, hit_lines)| (base + d, best, hit_lines))
         })
         .collect()
+}
+
+/// One document's best line score and each matched line with its score.
+/// `None` when no line matches: the document does not survive pass 1.
+fn score_doc(
+    doc: &Doc,
+    pattern: &Compiled,
+    mask: u8,
+    matcher: &mut Matcher,
+) -> Option<(u32, Vec<(usize, u32)>)> {
+    let hit_lines: Vec<(usize, u32)> = doc
+        .lines
+        .iter()
+        .enumerate()
+        // Lines from origins the query did not select are not scored.
+        .filter(|(_, line)| line.origin.bit() & mask != 0)
+        .filter_map(|(l, line)| {
+            pattern
+                .score(line.text.slice(..), matcher)
+                .map(|score| (l, score))
+        })
+        .collect();
+    let best = hit_lines.iter().map(|&(_, score)| score).max()?;
+    Some((best, hit_lines))
 }
 
 /// Reduce a doc's matched lines to the ones worth materializing: the

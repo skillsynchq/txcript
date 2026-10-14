@@ -4,7 +4,7 @@
 
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
-use txcript::search::{DocKey, Hit, Index, Origin, Query, search};
+use txcript::search::{DocKey, Extracted, Hit, Index, Origin, Query, Scan, search};
 use txcript::{Common, HarnessId, Span, Transcript};
 
 fn meta(id: &str, secs: i64) -> Meta {
@@ -140,7 +140,7 @@ fn cold_and_hot_agree() {
 
     assert_eq!(hot.len(), 1);
     assert_eq!(hot[0].hits, cold);
-    assert!(!cold.is_empty());
+    assert_ne!(cold, [] as [Hit; 0]);
 }
 
 #[test]
@@ -171,7 +171,10 @@ fn tool_result_needs_opt_in() {
     let t = rich_transcript("a", 0);
 
     // Default origins exclude tool output.
-    assert!(search(&t, &Query::substring("websocket_reconnect ... FAILED")).is_empty());
+    assert_eq!(
+        search(&t, &Query::substring("websocket_reconnect ... FAILED")),
+        [] as [Hit; 0]
+    );
 
     let mut q = Query::substring("websocket_reconnect ... FAILED");
     q.origins = Origin::ALL.to_vec();
@@ -211,20 +214,20 @@ fn smart_case_is_insensitive_until_uppercase() {
         meta("a", 0),
         vec![message(Role::User, vec![text("read the README first")])],
     );
-    assert!(!search(&t, &Query::substring("readme")).is_empty());
+    assert_ne!(search(&t, &Query::substring("readme")), [] as [Hit; 0]);
     // Uppercase in the pattern demands a case match: no "REadme" text exists.
-    assert!(search(&t, &Query::substring("REadme")).is_empty());
+    assert_eq!(search(&t, &Query::substring("REadme")), [] as [Hit; 0]);
 }
 
 #[test]
 fn fuzzy_uses_fzf_pattern_syntax() {
     let t = rich_transcript("a", 0);
     // Two atoms, both must match somewhere on the line.
-    assert!(!search(&t, &Query::fuzzy("cargo websocket")).is_empty());
+    assert_ne!(search(&t, &Query::fuzzy("cargo websocket")), [] as [Hit; 0]);
     // Negation atom rejects lines containing the term.
     let hits = search(&t, &Query::fuzzy("reconnect !handshake"));
     assert!(hits.iter().all(|h| !h.line.contains("handshake")));
-    assert!(!hits.is_empty());
+    assert_ne!(hits, [] as [Hit; 0]);
 }
 
 #[test]
@@ -366,7 +369,7 @@ fn substring_is_literal_and_folds_case() {
     );
     assert_eq!(search(&t, &Query::substring("--nocapture now")).len(), 1);
     // A literal with a space only matches the contiguous text.
-    assert!(search(&t, &Query::substring("run now")).is_empty());
+    assert_eq!(search(&t, &Query::substring("run now")), [] as [Hit; 0]);
 }
 
 #[test]
@@ -403,7 +406,7 @@ fn meta_hit_resolves_to_an_empty_fragment() {
     let t = rich_transcript("a", 0);
     let hits = search(&t, &Query::substring("relay-protocol-v6"));
     let fragment = t.fragment(&hits[0].span).expect("empty span is in bounds");
-    assert!(fragment.is_empty());
+    assert_eq!(fragment, []);
 }
 
 #[test]
@@ -542,4 +545,66 @@ fn query_filter_cwd_path_prefix() {
     // No filter → both.
     q.cwd = None;
     assert_eq!(index.query(&q).len(), 2);
+}
+
+/// [`Scan`] answers as [`Index::query`] does, one document at a time: it is
+/// what a single query runs on when no index is worth building.
+#[test]
+fn a_scan_agrees_with_the_index() {
+    let said = |id: &str, secs: i64, body: &str| {
+        Transcript::new(meta(id, secs), vec![message(Role::User, vec![text(body)])])
+    };
+    let docs = [
+        (key(HarnessId::ClaudeCode, "a"), rich_transcript("a", 0)),
+        (key(HarnessId::Codex, "b"), rich_transcript("b", 500)),
+        (
+            key(HarnessId::Codex, "c"),
+            said("c", 900, "a websocket\nWEBSOCKET again\nxwebsocketx"),
+        ),
+        (
+            key(HarnessId::ClaudeCode, "d"),
+            said("d", 500, "nothing of the kind"),
+        ),
+    ];
+    let mut index = Index::new();
+    for (key, transcript) in &docs {
+        index.insert(key.clone(), transcript);
+    }
+
+    let mut one_line = Query::substring("websocket");
+    one_line.hits_per_doc = Some(1);
+    let mut codex = Query::fuzzy("websocket");
+    codex.harnesses = Some(vec![HarnessId::Codex]);
+    let mut tools = Query::substring("test");
+    tools.origins = vec![Origin::ToolUse, Origin::ToolResult];
+    let queries = [
+        Query::substring("websocket"),
+        Query::fuzzy("reconect"),
+        Query::fuzzy("  "),
+        Query::substring("no such text"),
+        one_line,
+        codex,
+        tools,
+    ];
+    let mut matched = 0;
+    for query in queries {
+        let mut scan = Scan::new(&query);
+        let mut found: Vec<_> = docs
+            .iter()
+            .filter_map(|(key, transcript)| scan.search(&Extracted::new(key.clone(), transcript)))
+            .collect();
+        // The index's order: best score, then newest, then insertion,
+        // which a stable sort of documents in insertion order keeps.
+        found.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.meta.timestamp.cmp(&a.meta.timestamp))
+        });
+        let scanned: Vec<_> = found.iter().map(|f| (&f.key, f.score, &f.hits)).collect();
+        let indexed = index.query(&query);
+        let indexed: Vec<_> = indexed.iter().map(|m| (m.key, m.score, &m.hits)).collect();
+        assert_eq!(scanned, indexed, "{query:?}");
+        matched += indexed.len();
+    }
+    assert!(matched > 8, "the queries match documents: {matched}");
 }

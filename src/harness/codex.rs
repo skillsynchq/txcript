@@ -12,10 +12,14 @@
 //! `from_common` emits both `response_item` and `event_msg` logs so Codex can
 //! resume and replay the session. It also emits `turn_context`, `token_count`,
 //! and `task_complete` records for model and usage metadata.
+//!
+//! Codex compresses a rollout it hasn't written to for a week, in place, to
+//! `rollout-<ts>-<id>.jsonl.zst`, and expands it again when the session is
+//! resumed. The store reads both; it always writes the plain form.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
@@ -933,10 +937,10 @@ impl Store for CodexStore {
             // mean pulling every byte of every rollout on the machine
             // through a JSON probe to learn nothing more.
             let has_id = |l: &Line| l.payload.get("id").and_then(Value::as_str).is_some();
-            let file = fs::File::open(path).ok()?;
+            let rollout = open_rollout(path).ok()?;
             let mut first: Option<Line> = None;
             let mut found_id = false;
-            for line in BufReader::new(file).lines().map_while(std::io::Result::ok) {
+            for line in rollout.lines().map_while(io::Result::ok) {
                 if line.trim().is_empty() || !is_session_meta(&line) {
                     continue;
                 }
@@ -955,7 +959,7 @@ impl Store for CodexStore {
             found_id.then(|| {
                 let mut meta = meta_from_lines(std::slice::from_ref(&first));
                 if meta.id.is_empty() {
-                    meta.id = jsonl::file_id(path);
+                    meta.id = file_id(path);
                 }
                 Discovered {
                     meta,
@@ -966,9 +970,9 @@ impl Store for CodexStore {
     }
 
     fn load(&self, reference: &PathBuf) -> Result<Transcript<Codex>> {
-        let mut transcript = Codex::from_text(&fs::read_to_string(reference)?)?;
+        let mut transcript = Codex::from_text(&read_rollout(reference)?)?;
         if transcript.meta.id.is_empty() {
-            transcript.meta.id = jsonl::file_id(reference);
+            transcript.meta.id = file_id(reference);
         }
         Ok(transcript)
     }
@@ -993,10 +997,11 @@ impl Store for CodexStore {
     }
 
     /// Removes a Codex rollout log. Guarded on shape and containment:
-    /// the reference must be a `.jsonl` file resolving within `sessions_dir`
-    /// or the configured `archived_sessions_dir`. Neither root itself is deletable.
+    /// the reference must be a `.jsonl` or `.jsonl.zst` file resolving within
+    /// `sessions_dir` or the configured `archived_sessions_dir`. Neither root
+    /// itself is deletable.
     fn delete(&self, reference: &PathBuf) -> Result<()> {
-        if reference.extension().is_none_or(|ext| ext != "jsonl") {
+        if reference.extension().is_none_or(|ext| ext != "jsonl") && !is_compressed(reference) {
             return Err(Error::Malformed {
                 harness: Codex::NAME,
                 detail: format!("not a codex session file: {}", reference.display()),
@@ -1155,13 +1160,78 @@ fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>) {
                 collect_rollouts(&path, out);
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
                 && name.starts_with("rollout-")
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                && (has_extension(&path, "jsonl") || lists_compressed(&path))
             {
                 out.push(path);
             }
         }
+    }
+}
+
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+}
+
+/// Whether `path` names a rollout Codex has compressed: `….jsonl.zst`, per
+/// upstream `codex-rs/rollout/src/compression.rs`.
+fn is_compressed(path: &Path) -> bool {
+    has_extension(path, "zst")
+        && path
+            .file_stem()
+            .is_some_and(|stem| has_extension(Path::new(stem), "jsonl"))
+}
+
+/// Whether discovery lists a compressed rollout. Codex reads the plain file
+/// when both forms are on disk, which they are for a moment while it
+/// compresses or expands one, so only that one lists and the session doesn't
+/// appear twice. Without the feature nothing could read it, so it isn't a
+/// session.
+fn lists_compressed(path: &Path) -> bool {
+    cfg!(feature = "codex_zstd") && is_compressed(path) && !path.with_extension("").exists()
+}
+
+/// A rollout's lines, decoded as they're read when Codex has compressed it.
+fn open_rollout(path: &Path) -> io::Result<Box<dyn BufRead>> {
+    let file = fs::File::open(path)?;
+    if is_compressed(path) {
+        decoded(file)
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+#[cfg(feature = "codex_zstd")]
+fn decoded(file: fs::File) -> io::Result<Box<dyn BufRead>> {
+    Ok(Box::new(BufReader::new(zstd::stream::read::Decoder::new(
+        file,
+    )?)))
+}
+
+#[cfg(not(feature = "codex_zstd"))]
+fn decoded(_: fs::File) -> io::Result<Box<dyn BufRead>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a compressed rollout needs txcript's `codex_zstd` feature",
+    ))
+}
+
+/// A whole rollout as text.
+fn read_rollout(path: &Path) -> io::Result<String> {
+    if !is_compressed(path) {
+        return fs::read_to_string(path);
+    }
+    let mut text = String::new();
+    open_rollout(path)?.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// The id a rollout's file name carries, in either form.
+fn file_id(path: &Path) -> String {
+    if is_compressed(path) {
+        jsonl::file_id(&path.with_extension(""))
+    } else {
+        jsonl::file_id(path)
     }
 }
 
