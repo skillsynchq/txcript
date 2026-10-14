@@ -69,7 +69,7 @@ mod pager;
 mod view;
 
 pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
-     amp, antigravity, simple, cowork, cowork_remote";
+     amp, antigravity, simple, cowork, cowork_remote, uji";
 
 /// The `txcript` binary's command line.
 #[derive(Parser)]
@@ -1324,6 +1324,7 @@ mod style {
             HarnessId::Antigravity => "\x1b[94m", // bright blue
             HarnessId::Simple => "\x1b[92m",     // bright green
             HarnessId::Cowork => "\x1b[38;5;208m", // orange
+            HarnessId::Uji => "\x1b[38;5;180m",  // tan
         }
     }
 }
@@ -1943,12 +1944,12 @@ fn fresh_identity(
     if out.is_some() {
         return;
     }
-    // Codex stamps its rollouts with v7 UUIDs; matching the shape keeps the
-    // copy out of any version-aware code path. v4 everywhere else. Harnesses
+    // Codex and uji stamp their sessions with v7 UUIDs; matching the shape
+    // keeps the copy out of any version-aware code path. v4 everywhere else. Harnesses
     // that need a different spelling (opencode's `ses_` prefix) re-shape this
     // themselves in `from_common`.
     common.meta.id = match target {
-        HarnessId::Codex => uuid::Uuid::now_v7().to_string(),
+        HarnessId::Codex | HarnessId::Uji => uuid::Uuid::now_v7().to_string(),
         _ => uuid::Uuid::new_v4().to_string(),
     };
     common.meta.timestamp = chrono::Utc::now();

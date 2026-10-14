@@ -125,6 +125,7 @@ Jeder Name führt zur Dokumentation des jeweiligen Formats. Verwende die ID mit 
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | Ja | Über lokales Gateway |
 | [fx](../formats/fx.md) | `fx` | Ja | Ja |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | Ja | Ja |
+| [uji](../formats/uji.md) | `uji` | Ja | Ja |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | Ja | Nein |
 | [Amp](../formats/amp.md) | `amp` | Ja | Nein |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | Online-Konto | Nein |

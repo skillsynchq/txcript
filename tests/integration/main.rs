@@ -26,6 +26,7 @@ mod pi;
 mod properties;
 mod simple;
 mod store_delete;
+mod uji;
 
 #[cfg(feature = "search")]
 mod search;

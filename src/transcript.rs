@@ -462,10 +462,11 @@ pub enum HarnessId {
     Antigravity,
     Simple,
     Cowork,
+    Uji,
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 18] = [
+    pub const ALL: [HarnessId; 19] = [
         HarnessId::ClaudeCode,
         HarnessId::ClaudeChat,
         HarnessId::CoworkRemote,
@@ -484,6 +485,7 @@ impl HarnessId {
         HarnessId::Antigravity,
         HarnessId::Simple,
         HarnessId::Cowork,
+        HarnessId::Uji,
     ];
 
     /// The stable lowercase name, matching the corresponding [`Harness::NAME`].
@@ -508,6 +510,7 @@ impl HarnessId {
             HarnessId::Antigravity => "antigravity",
             HarnessId::Simple => "simple",
             HarnessId::Cowork => "cowork",
+            HarnessId::Uji => "uji",
         }
     }
 }
@@ -555,6 +558,7 @@ impl FromStr for HarnessId {
                 Ok(HarnessId::Antigravity)
             }
             "simple" | "simple_json" | "simple-json" => Ok(HarnessId::Simple),
+            "uji" => Ok(HarnessId::Uji),
             "cowork" | "claude_cowork" | "claude-cowork" | "claude_desktop" | "claude-desktop" => {
                 Ok(HarnessId::Cowork)
             }

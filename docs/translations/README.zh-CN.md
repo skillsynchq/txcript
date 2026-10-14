@@ -125,6 +125,7 @@ writeFileSync("rollout.jsonl", output);
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | 支持 | 通过本地网关 |
 | [fx](../formats/fx.md) | `fx` | 支持 | 支持 |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | 支持 | 支持 |
+| [uji](../formats/uji.md) | `uji` | 支持 | 支持 |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | 支持 | 不支持 |
 | [Amp](../formats/amp.md) | `amp` | 支持 | 不支持 |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | 在线账户 | 不支持 |

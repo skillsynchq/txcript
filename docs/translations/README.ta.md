@@ -125,6 +125,7 @@ writeFileSync("rollout.jsonl", output);
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | ஆம் | உள்ளூர் நுழைவாயில் வழியாக |
 | [fx](../formats/fx.md) | `fx` | ஆம் | ஆம் |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | ஆம் | ஆம் |
+| [uji](../formats/uji.md) | `uji` | ஆம் | ஆம் |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | ஆம் | இல்லை |
 | [Amp](../formats/amp.md) | `amp` | ஆம் | இல்லை |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | இணையக் கணக்கு | இல்லை |
