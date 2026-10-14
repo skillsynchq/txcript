@@ -4,7 +4,7 @@
 
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
-use txcript::harness::{amp, antigravity, campfire, claude_code, codex, grok, grok_bot, pi};
+use txcript::harness::{amp, antigravity, campfire, claude_code, codex, grok, grok_bot, pi, qoder};
 use txcript::{Codec, Common, Store, Transcript};
 
 #[cfg(feature = "opencode")]
@@ -348,4 +348,30 @@ fn codex_active_delete_works_when_archive_directory_is_missing() {
     let store = codex::CodexStore::new(&sessions).with_archived_sessions_dir(&archived);
     roundtrip(&store);
     assert!(!archived.exists());
+}
+
+#[test]
+fn qoder_delete_roundtrip() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    roundtrip(&qoder::QoderStore::new(dir.path().to_path_buf()));
+}
+
+#[test]
+fn qoder_delete_refuses_a_non_session_path() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+    let store = qoder::QoderStore::new(dir.path().to_path_buf());
+    assert!(
+        store
+            .delete(&dir.path().join("somewhere/else.jsonl"))
+            .is_err()
+    );
+    // Existing files that are not sessions are refused and left alone.
+    let notes = dir.path().join("notes.txt");
+    let loose = dir.path().join("loose.jsonl");
+    std::fs::write(&notes, "keep").unwrap_or_else(|e| panic!("write: {e}"));
+    std::fs::write(&loose, "{}\n").unwrap_or_else(|e| panic!("write: {e}"));
+    for path in [&notes, &loose] {
+        assert!(store.delete(path).is_err());
+        assert!(path.exists());
+    }
 }
