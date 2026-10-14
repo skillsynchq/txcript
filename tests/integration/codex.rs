@@ -773,3 +773,148 @@ fn discover_resolves_lineage_from_session_meta() {
 
     assert!(by_id("plain").meta.lineage.is_none());
 }
+
+// ── lineage write-back ──────────────────────────────────────────────────
+
+/// A Codex thread id, the only shape Codex accepts in `forked_from_id`.
+const PARENT: &str = "019a1b2c-3d4e-7f60-8a7b-9c0d1e2f3a4b";
+
+fn with_lineage(parent: &str, relation: common::Relation) -> Transcript<Common> {
+    let mut common = sample_common();
+    common.meta.lineage = Some(common::Lineage {
+        parent: parent.into(),
+        relation,
+    });
+    common
+}
+
+fn rollout_text(common: &Transcript<Common>) -> String {
+    use txcript::TextCodec;
+    codex::Codex::to_text(&codex::Codex::from_common(common).unwrap()).unwrap()
+}
+
+fn session_meta_payload(text: &str) -> serde_json::Value {
+    let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(first["type"], "session_meta");
+    first["payload"].clone()
+}
+
+/// A fork writes `forked_from_id`, and the codec fixpoint now holds for it:
+/// the lineage comes back along with every message and tool call.
+#[test]
+fn from_common_writes_a_fork_as_forked_from_id() {
+    let common = with_lineage(PARENT, common::Relation::Fork);
+    let text = rollout_text(&common);
+    assert_eq!(session_meta_payload(&text)["forked_from_id"], PARENT);
+
+    let back = codex::Codex::to_common(&codex::Codex::from_common(&common).unwrap()).unwrap();
+    assert_eq!(common, back);
+}
+
+/// Through a real store: save, then `discover` and `load` both read the fork.
+#[test]
+fn a_written_fork_is_discovered_and_loaded_as_a_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = codex::CodexStore::new(dir.path());
+    let common = with_lineage(PARENT, common::Relation::Fork);
+    let saved = store
+        .save(&codex::Codex::from_common(&common).unwrap())
+        .unwrap();
+
+    let found = store.discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].meta.lineage, common.meta.lineage);
+    let loaded = codex::Codex::to_common(&store.load(&saved.reference).unwrap()).unwrap();
+    assert_eq!(loaded.meta.lineage, common.meta.lineage);
+    assert_eq!(loaded.body, common.body);
+}
+
+/// Writing the field touches nothing else: drop `forked_from_id` from the
+/// fork's `session_meta` and the rollout is byte-for-byte the one written
+/// without lineage.
+#[test]
+fn forked_from_id_is_the_only_difference_lineage_makes() {
+    let plain = rollout_text(&sample_common());
+    assert!(!plain.contains("forked_from_id"));
+
+    let forked = rollout_text(&with_lineage(PARENT, common::Relation::Fork));
+    let (forked_meta, forked_rest) = forked.split_once('\n').unwrap();
+    let (plain_meta, plain_rest) = plain.split_once('\n').unwrap();
+    assert_eq!(forked_rest, plain_rest);
+
+    let mut forked_meta: serde_json::Value = serde_json::from_str(forked_meta).unwrap();
+    let removed = forked_meta["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("forked_from_id");
+    assert_eq!(removed, Some(serde_json::json!(PARENT)));
+    let plain_meta: serde_json::Value = serde_json::from_str(plain_meta).unwrap();
+    assert_eq!(forked_meta, plain_meta);
+}
+
+/// Lineage Codex can't represent is left out, and the rollout is exactly the
+/// one written without lineage. A spawn would need `source.subagent`, which
+/// makes the thread a subagent; Codex has no continue field; and Codex
+/// rejects a `session_meta` whose `forked_from_id` isn't a UUID.
+#[test]
+fn lineage_codex_cannot_represent_is_not_written() {
+    let plain = rollout_text(&sample_common());
+    for (parent, relation) in [
+        (PARENT, common::Relation::Spawn),
+        (PARENT, common::Relation::Continue),
+        ("origin", common::Relation::Fork),
+        ("", common::Relation::Fork),
+    ] {
+        let text = rollout_text(&with_lineage(parent, relation));
+        assert_eq!(text, plain, "{relation:?} of {parent:?}");
+    }
+}
+
+/// Writing, reading back, and writing again yields the same rollout, with
+/// the field written once.
+#[test]
+fn writing_a_fork_twice_is_idempotent() {
+    use txcript::TextCodec;
+    let first = rollout_text(&with_lineage(PARENT, common::Relation::Fork));
+    let reread = codex::Codex::to_common(&codex::Codex::from_text(&first).unwrap()).unwrap();
+    let second = rollout_text(&reread);
+    assert_eq!(first, second);
+    assert_eq!(second.matches("forked_from_id").count(), 1);
+}
+
+/// `session_meta` is rebuilt from `Meta` on every `from_common`, so a native
+/// rollout's own parent fields never leak through. Re-pointing the lineage
+/// replaces `forked_from_id` rather than adding a second one, and a native
+/// spawn (`source.subagent` plus `forked_from_id`; spawn wins on read) is
+/// written back as a plain session, as before this change.
+#[test]
+fn from_common_writes_only_the_lineage_meta_carries() {
+    use txcript::TextCodec;
+    let other = "019a1b2c-3d4e-7f60-8a7b-000000000001";
+    let forked = format!(
+        "{}\n",
+        r#"{"timestamp":"2026-01-02T03:04:05.000Z","type":"session_meta","payload":{"id":"019a1b2c-3d4e-7f60-8a7b-000000000002","forked_from_id":"019a1b2c-3d4e-7f60-8a7b-9c0d1e2f3a4b"}}"#,
+    );
+    let mut common = codex::Codex::to_common(&codex::Codex::from_text(&forked).unwrap()).unwrap();
+    common.meta.lineage = Some(common::Lineage {
+        parent: other.into(),
+        relation: common::Relation::Fork,
+    });
+    let text = rollout_text(&common);
+    assert_eq!(text.matches("forked_from_id").count(), 1);
+    assert_eq!(session_meta_payload(&text)["forked_from_id"], other);
+
+    let spawned = format!(
+        "{}\n",
+        r#"{"timestamp":"2026-01-02T03:04:05.000Z","type":"session_meta","payload":{"id":"019a1b2c-3d4e-7f60-8a7b-000000000003","forked_from_id":"019a1b2c-3d4e-7f60-8a7b-9c0d1e2f3a4b","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019a1b2c-3d4e-7f60-8a7b-9c0d1e2f3a4b"}}}}}"#,
+    );
+    let common = codex::Codex::to_common(&codex::Codex::from_text(&spawned).unwrap()).unwrap();
+    assert_eq!(
+        common.meta.lineage.as_ref().map(|l| l.relation),
+        Some(common::Relation::Spawn)
+    );
+    let payload = session_meta_payload(&rollout_text(&common));
+    assert!(payload.get("forked_from_id").is_none());
+    assert!(payload.get("parent_thread_id").is_none());
+    assert_eq!(payload["source"], "cli");
+}

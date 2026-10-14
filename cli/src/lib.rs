@@ -54,6 +54,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use txcript::common::{Lineage, Relation};
 use txcript::harness::{amp, chatgpt, claude_chat, cowork_remote, simple};
 use txcript::{Codec, Common, HarnessId, Store, TextCodec, Transcript, local};
 
@@ -1095,8 +1096,12 @@ mod crop_command_tests {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{Common, HarnessId, Transcript, ensure_resumable_source, fresh_identity};
+    use super::{
+        Codec, Common, HarnessId, Lineage, Relation, TextCodec, Transcript,
+        ensure_resumable_source, fresh_identity,
+    };
     use txcript::common::Meta;
+    use txcript::harness::codex;
 
     pub(crate) fn transcript() -> Transcript<Common> {
         Transcript::new(
@@ -1118,7 +1123,12 @@ mod identity_tests {
     fn a_copy_into_a_live_store_becomes_its_own_session() {
         let mut copy = transcript();
         let (id, ts) = (copy.meta.id.clone(), copy.meta.timestamp);
-        fresh_identity(&mut copy, HarnessId::ClaudeCode, None);
+        fresh_identity(
+            &mut copy,
+            HarnessId::ClaudeCode,
+            HarnessId::ClaudeCode,
+            None,
+        );
         // Writing under the source id would land on the source's own file.
         assert_ne!(copy.meta.id, id);
         assert!(copy.meta.timestamp > ts, "the copy is filed under today");
@@ -1130,7 +1140,7 @@ mod identity_tests {
     #[test]
     fn codex_copies_get_the_v7_shape_codex_mints_itself() {
         let mut copy = transcript();
-        fresh_identity(&mut copy, HarnessId::Codex, None);
+        fresh_identity(&mut copy, HarnessId::Codex, HarnessId::Codex, None);
         assert_eq!(&copy.meta.id[14..15], "7");
     }
 
@@ -1141,10 +1151,121 @@ mod identity_tests {
         fresh_identity(
             &mut copy,
             HarnessId::Codex,
+            HarnessId::Codex,
             Some(std::path::Path::new("/tmp/x")),
         );
         assert_eq!(copy.meta.id, id);
         assert_eq!(copy.meta.timestamp, ts);
+    }
+
+    fn lineage(parent: &str, relation: Relation) -> Lineage {
+        Lineage {
+            parent: parent.into(),
+            relation,
+        }
+    }
+
+    #[test]
+    fn a_copy_into_the_source_harness_is_a_fork_of_the_source() {
+        let mut copy = transcript();
+        let source_id = copy.meta.id.clone();
+        fresh_identity(&mut copy, HarnessId::Codex, HarnessId::Codex, None);
+        assert_eq!(copy.meta.lineage, Some(lineage(&source_id, Relation::Fork)));
+    }
+
+    #[test]
+    fn the_source_lineage_is_replaced_not_inherited() {
+        // A spawned session's link names its own parent; the copy's link
+        // names the session it was copied from.
+        let mut copy = transcript();
+        copy.meta.lineage = Some(lineage(
+            "019a0000-0000-7000-8000-000000000000",
+            Relation::Spawn,
+        ));
+        let source_id = copy.meta.id.clone();
+        fresh_identity(&mut copy, HarnessId::Codex, HarnessId::Codex, None);
+        assert_eq!(copy.meta.lineage, Some(lineage(&source_id, Relation::Fork)));
+    }
+
+    #[test]
+    fn a_copy_into_another_harness_carries_no_lineage() {
+        // The source id, and any parent the source names, belong to the
+        // source's harness; neither can be the parent of a Codex session.
+        let mut copy = transcript();
+        copy.meta.lineage = Some(lineage(
+            "019a0000-0000-7000-8000-000000000000",
+            Relation::Fork,
+        ));
+        fresh_identity(&mut copy, HarnessId::Pi, HarnessId::Codex, None);
+        assert_eq!(copy.meta.lineage, None);
+    }
+
+    #[test]
+    fn a_copy_of_a_copy_names_only_its_direct_source() {
+        let mut first = transcript();
+        fresh_identity(&mut first, HarnessId::Codex, HarnessId::Codex, None);
+        let first_id = first.meta.id.clone();
+        let mut second = first.clone();
+        fresh_identity(&mut second, HarnessId::Codex, HarnessId::Codex, None);
+        assert_eq!(
+            second.meta.lineage,
+            Some(lineage(&first_id, Relation::Fork))
+        );
+    }
+
+    #[test]
+    fn a_source_without_an_id_gives_no_lineage() {
+        // A Simple document read from stdin may carry no id at all.
+        let mut copy = transcript();
+        copy.meta.id.clear();
+        fresh_identity(&mut copy, HarnessId::Simple, HarnessId::Simple, None);
+        assert_eq!(copy.meta.lineage, None);
+    }
+
+    #[test]
+    fn an_out_export_keeps_the_source_lineage() {
+        let mut copy = transcript();
+        copy.meta.lineage = Some(lineage(
+            "019a0000-0000-7000-8000-000000000000",
+            Relation::Fork,
+        ));
+        let before = copy.meta.lineage.clone();
+        fresh_identity(
+            &mut copy,
+            HarnessId::Codex,
+            HarnessId::Codex,
+            Some(std::path::Path::new("/tmp/x")),
+        );
+        assert_eq!(copy.meta.lineage, before);
+    }
+
+    /// The whole path a `#range` continue into Codex takes: new identity,
+    /// then `from_common`. The rollout names its source as `forked_from_id`,
+    /// which reads back as the same fork.
+    #[test]
+    fn a_codex_copy_writes_its_source_as_forked_from_id() {
+        let mut copy = transcript();
+        let source_id = copy.meta.id.clone();
+        fresh_identity(&mut copy, HarnessId::Codex, HarnessId::Codex, None);
+        let text = codex::Codex::to_text(&codex::Codex::from_common(&copy).unwrap()).unwrap();
+        assert!(text.contains(&format!(r#""forked_from_id":"{source_id}""#)));
+        let reread = codex::Codex::from_text(&text).unwrap();
+        assert_eq!(
+            reread.meta.lineage,
+            Some(lineage(&source_id, Relation::Fork))
+        );
+    }
+
+    #[test]
+    fn a_cross_harness_codex_copy_writes_no_forked_from_id() {
+        let mut copy = transcript();
+        copy.meta.lineage = Some(lineage(
+            "019a0000-0000-7000-8000-000000000000",
+            Relation::Fork,
+        ));
+        fresh_identity(&mut copy, HarnessId::Pi, HarnessId::Codex, None);
+        let text = codex::Codex::to_text(&codex::Codex::from_common(&copy).unwrap()).unwrap();
+        assert!(!text.contains("forked_from_id"));
     }
 
     #[test]
@@ -1408,7 +1529,7 @@ fn crop_loaded(
         .common
         .crop_to(&outcome.spans)
         .map_err(|error| error.to_string())?;
-    fresh_identity(&mut cropped, target, None);
+    fresh_identity(&mut cropped, source, target, None);
     stamp_live_cwd(&mut cropped, None);
     let cropped_id = write_and_report(source, target, &cropped, None, None)?;
     let edited = match outcome.edited {
@@ -1657,7 +1778,7 @@ fn continue_document(
         Some(req) => fragment::sliced(&common, req)?,
         None => common,
     };
-    fresh_identity(&mut copy, target, out);
+    fresh_identity(&mut copy, HarnessId::Simple, target, out);
     if copy.meta.id.is_empty() {
         // An `--out` export keeps the source identity — which stdin may not
         // carry at all. The target store still needs a file name.
@@ -1815,7 +1936,7 @@ fn continue_amp_server_thread(
         (None, true) => id.to_string(),
         (None, false) => {
             let mut copy = common.clone();
-            fresh_identity(&mut copy, target, out);
+            fresh_identity(&mut copy, HarnessId::Amp, target, out);
             stamp_live_cwd(&mut copy, out);
             write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
         }
@@ -1823,7 +1944,7 @@ fn continue_amp_server_thread(
         // a subset of itself in place.
         (Some(req), _) => {
             let mut copy = fragment::sliced(&common, req)?;
-            fresh_identity(&mut copy, target, out);
+            fresh_identity(&mut copy, HarnessId::Amp, target, out);
             stamp_live_cwd(&mut copy, out);
             write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
         }
@@ -1852,14 +1973,14 @@ fn continue_session(
         (None, true) => found.meta.id.clone(),
         (None, false) => {
             let mut common = found.read().map_err(|e| e.to_string())?;
-            fresh_identity(&mut common, target, out);
+            fresh_identity(&mut common, found.harness, target, out);
             stamp_live_cwd(&mut common, out);
             write_and_report(found.harness, target, &common, out, metadata)?
         }
         (Some(req), _) => {
             let common = found.read().map_err(|e| e.to_string())?;
             let mut copy = fragment::sliced(&common, req)?;
-            fresh_identity(&mut copy, target, out);
+            fresh_identity(&mut copy, found.harness, target, out);
             stamp_live_cwd(&mut copy, out);
             write_and_report(found.harness, target, &copy, out, metadata)?
         }
@@ -1882,7 +2003,7 @@ fn continue_loaded_remote(
         Some(request) => fragment::sliced(&common, request)?,
         None => common,
     };
-    fresh_identity(&mut copy, target, out);
+    fresh_identity(&mut copy, source, target, out);
     stamp_live_cwd(&mut copy, out);
     let resume_id = write_and_report(source, target, &copy, out, metadata)?;
     launch(target, &resume_id, cwd.as_deref(), resume)
@@ -1933,16 +2054,29 @@ fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), S
 /// cross-harness copy would be filed under the original's date instead of
 /// today's.
 ///
+/// The copy's lineage is replaced too, since the source's own link no longer
+/// describes it. A copy into the source's harness is a fork of the source: a
+/// new session holding some or all of its history, the source left as it
+/// was. A copy into another harness gets no lineage, because
+/// [`Lineage::parent`](txcript::common::Lineage::parent) names a session in
+/// the same harness.
+///
 /// `--out` is exempt: it redirects to a scratch root rather than a live store,
 /// where preserving the source identity makes the write a faithful export.
 fn fresh_identity(
     common: &mut Transcript<Common>,
+    source: HarnessId,
     target: HarnessId,
     out: Option<&std::path::Path>,
 ) {
     if out.is_some() {
         return;
     }
+    let parent = std::mem::take(&mut common.meta.id);
+    common.meta.lineage = (source == target && !parent.is_empty()).then_some(Lineage {
+        parent,
+        relation: Relation::Fork,
+    });
     // Codex stamps its rollouts with v7 UUIDs; matching the shape keeps the
     // copy out of any version-aware code path. v4 everywhere else. Harnesses
     // that need a different spelling (opencode's `ses_` prefix) re-shape this

@@ -535,6 +535,11 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
     {
         obj.insert("git".into(), json!({ "branch": branch }));
     }
+    if let Some(parent) = forked_from_id(meta)
+        && let Value::Object(obj) = &mut payload
+    {
+        obj.insert("forked_from_id".into(), json!(parent));
+    }
     lines.push(meta_line(&meta.timestamp, "session_meta", payload));
 
     // Only pending patch calls need custom-tool results. Completed IDs can
@@ -1146,6 +1151,20 @@ fn lineage_from_session_meta(payload: &Value) -> Option<Lineage> {
             parent: parent.to_string(),
             relation: Relation::Fork,
         })
+}
+
+/// The `forked_from_id` to write for `meta.lineage`, the inverse of
+/// [`lineage_from_session_meta`]'s fork case. Only a fork is written: a
+/// spawn's `source.subagent` would turn the rollout into a subagent thread,
+/// and Codex has no continue field. Codex parses `forked_from_id` as a thread
+/// id (a UUID) and rejects the whole `session_meta` otherwise, so a parent
+/// that isn't one is left out.
+fn forked_from_id(meta: &Meta) -> Option<&str> {
+    meta.lineage
+        .as_ref()
+        .filter(|lineage| lineage.relation == Relation::Fork)
+        .map(|lineage| lineage.parent.as_str())
+        .filter(|parent| uuid::Uuid::parse_str(parent).is_ok())
 }
 
 fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>) {

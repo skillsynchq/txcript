@@ -42,11 +42,10 @@ pub struct Meta {
     pub model: Option<String>,
     /// How this session relates to another, when its own records say so.
     ///
-    /// Read-side only: a harness's discovery and load paths fill this from
-    /// whatever header or early record carries the signal (see
-    /// `docs/formats/*.md` for the per-harness field). No codec's
-    /// `from_common` writes it back into a native session yet — round-
-    /// tripping provenance into native formats is a separate, later change.
+    /// A harness's discovery and load paths fill this from whatever header
+    /// or early record carries the signal (see `docs/formats/*.md` for the
+    /// per-harness field). Only Codex's `from_common` writes it back, and
+    /// only a fork (as `forked_from_id`); every other codec ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
 }
