@@ -309,6 +309,37 @@ fn codex_delete_archived_session_with_or_without_active_directory() {
     }
 }
 
+/// A session Codex has compressed is still the user's to delete, and no
+/// other `.zst` file is a session.
+#[cfg(feature = "codex_zstd")]
+#[test]
+fn codex_delete_removes_a_compressed_rollout() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = codex::CodexStore::new(dir.path());
+    let native = codex::Codex::from_common(&small_common("cold-session")).unwrap();
+    let saved = store.save(&native).unwrap();
+
+    // What Codex leaves behind: `<name>.jsonl.zst`, the plain file gone.
+    let mut name = saved.reference.clone().into_os_string();
+    name.push(".zst");
+    let reference = std::path::PathBuf::from(name);
+    let plain = std::fs::read(&saved.reference).unwrap();
+    std::fs::write(&reference, zstd::stream::encode_all(&plain[..], 3).unwrap()).unwrap();
+    std::fs::remove_file(&saved.reference).unwrap();
+
+    let found = store.discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].reference, reference);
+    store.delete(&reference).unwrap();
+    assert!(!reference.exists());
+    assert!(store.discover().unwrap().is_empty());
+
+    let other = dir.path().join("notes.zst");
+    std::fs::write(&other, b"not a session").unwrap();
+    assert!(store.delete(&other).is_err());
+    assert!(other.exists());
+}
+
 #[test]
 fn codex_active_delete_works_when_archive_directory_is_missing() {
     let dir = tempfile::tempdir().unwrap();

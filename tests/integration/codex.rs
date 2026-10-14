@@ -241,6 +241,64 @@ fn discover_without_archived_dir_only_finds_active_sessions() {
     assert_eq!(found[0].meta.id, "sess-1");
 }
 
+/// Codex reads the plain rollout when a compressed copy sits beside it, as
+/// one does for a moment while Codex compresses or expands a session.
+/// Discovery lists that one, so the session appears once.
+#[cfg(feature = "codex_zstd")]
+#[test]
+fn discover_lists_a_rollout_once_when_both_forms_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let rollout = format!(
+        "{}\n",
+        r#"{"timestamp":"2026-01-02T03:04:05.000Z","type":"session_meta","payload":{"id":"sess-1"}}"#,
+    );
+    let plain = dir.path().join("rollout-2026-01-02T03-04-05-sess-1.jsonl");
+    std::fs::write(&plain, &rollout).unwrap();
+    std::fs::write(
+        dir.path()
+            .join("rollout-2026-01-02T03-04-05-sess-1.jsonl.zst"),
+        zstd::stream::encode_all(rollout.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let found = codex::CodexStore::new(dir.path()).discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].reference, plain);
+}
+
+/// A rollout with no id inside takes its file name's, and a compressed
+/// rollout's name is the plain name with `.zst` after it: both forms of one
+/// session must come out with the same id.
+#[cfg(feature = "codex_zstd")]
+#[test]
+fn load_names_a_compressed_rollout_as_its_plain_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let rollout = format!(
+        "{}\n",
+        r#"{"timestamp":"2026-01-02T03:04:06.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+    );
+    let plain = dir.path().join("rollout-2026-01-02T03-04-05-sess-1.jsonl");
+    let compressed = dir
+        .path()
+        .join("rollout-2026-01-02T03-04-05-sess-2.jsonl.zst");
+    std::fs::write(&plain, &rollout).unwrap();
+    std::fs::write(
+        &compressed,
+        zstd::stream::encode_all(rollout.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let store = codex::CodexStore::new(dir.path());
+    assert_eq!(
+        store.load(&plain).unwrap().meta.id,
+        "rollout-2026-01-02T03-04-05-sess-1"
+    );
+    assert_eq!(
+        store.load(&compressed).unwrap().meta.id,
+        "rollout-2026-01-02T03-04-05-sess-2"
+    );
+}
+
 /// Shaped at codex's granularity: each assistant block is its own message
 /// (codex stores one `response_item` per line), every assistant turn carries a
 /// model, only the final text turn carries usage, and `stop_reason` is None

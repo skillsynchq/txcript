@@ -118,11 +118,12 @@ txcript completion fish > ~/.config/fish/completions/txcript.fish
 [dependencies]
 txcript = "0.14"
 # Codecs only: drops the SQLite-backed stores, the live Claude Chat and
-# ChatGPT sources, and search. Every codec stays available.
+# ChatGPT sources, search, and reading Codex's compressed rollouts. Every
+# codec stays available.
 # txcript = { version = "0.14", default-features = false }
 ```
 
-Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, and `search`.
+Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, `search`, and `codex_zstd` (the rollouts Codex compresses to `.jsonl.zst`).
 
 Three layers, smallest to largest:
 

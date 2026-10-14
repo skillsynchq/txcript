@@ -7,6 +7,8 @@
 //! belong in `tests/integration/`; see `tests/README.md`.
 
 mod claude_tool_result;
+#[cfg(feature = "codex_zstd")]
+mod codex_compressed;
 mod codex_pairing;
 
 use chrono::{DateTime, Utc};
