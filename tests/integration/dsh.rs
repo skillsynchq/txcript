@@ -594,3 +594,175 @@ fn assistant_timestamps_survive_a_common_round_trip() {
     let common = dsh::Dsh::to_common(&native).unwrap();
     assert_eq!(common.body[0].timestamp, ts("2024-01-01T00:00:46.000Z"));
 }
+
+fn message(role: common::Role, at: &str, content: Vec<Block>) -> common::Message {
+    common::Message {
+        role,
+        content,
+        timestamp: ts(at),
+        model: None,
+        stop_reason: None,
+        usage: None,
+    }
+}
+
+fn tool_use(id: &str) -> Block {
+    Block::ToolUse {
+        id: id.into(),
+        tool: common::Tool::from_canonical("bash", json!({ "command": "ls" })),
+    }
+}
+
+/// Two turns: the first answers one tool call and moves to a second step;
+/// the second leaves its call unanswered.
+fn tool_session() -> txcript::Transcript<Common> {
+    use common::Role::{Assistant, User};
+    let mut transcript = common_sample();
+    transcript.body.extend([
+        message(
+            Assistant,
+            "2024-01-01T00:00:47.000Z",
+            vec![tool_use("call-1")],
+        ),
+        message(
+            User,
+            "2024-01-01T00:00:48.000Z",
+            vec![Block::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: common::ToolOutput::Text("a\nb".into()),
+                is_error: false,
+            }],
+        ),
+        message(
+            Assistant,
+            "2024-01-01T00:00:49.000Z",
+            vec![Block::Text {
+                text: "two files".into(),
+            }],
+        ),
+        message(
+            User,
+            "2024-01-01T00:00:50.000Z",
+            vec![Block::Text {
+                text: "again".into(),
+            }],
+        ),
+        message(
+            Assistant,
+            "2024-01-01T00:00:51.000Z",
+            vec![tool_use("call-2")],
+        ),
+    ]);
+    transcript
+}
+
+fn event_types(body: &dsh::DshSession) -> Vec<&str> {
+    body.events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn from_common_writes_the_v4_turn_and_step_lifecycle() {
+    let native = dsh::Dsh::from_common(&tool_session()).unwrap();
+    assert_eq!(native.body.header["version"], json!(4));
+    assert_eq!(native.body.header["isSeeded"], json!(false));
+    assert_eq!(
+        event_types(&native.body),
+        [
+            "session/title",
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "assistant/message",
+            "tool/call",
+            "tool/result",
+            "step/end",
+            "step/start",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+            "turn/start",
+            "step/start",
+            "user/message",
+            "assistant/message",
+            "tool/result",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    for (seq, event) in native.body.events.iter().enumerate() {
+        assert_eq!(event["seq"], json!(seq));
+    }
+    let events = &native.body.events;
+    // A result cites the `tool/call` that started it, and is a tool-role
+    // message rather than a wrapped block.
+    assert_eq!(events[7]["sourceEventSeqs"], json!([6]));
+    assert_eq!(events[7]["data"]["message"]["role"], json!("tool"));
+    assert_eq!(events[7]["data"]["message"]["toolCallId"], json!("call-1"));
+    // An unanswered call is closed with dsh's own not-started repair, and
+    // the turn it ends is recorded as interrupted.
+    assert_eq!(
+        events[17]["data"]["message"]["id"],
+        json!("interrupted-tool-result-call-2-17")
+    );
+    assert_eq!(
+        events[17]["data"]["error"]["code"],
+        json!("TOOL_NOT_STARTED")
+    );
+    assert!(events[17].get("sourceEventSeqs").is_none());
+    assert_eq!(events[19]["data"]["reason"]["kind"], json!("interrupted"));
+    assert_eq!(events[12]["data"]["reason"]["kind"], json!("completed"));
+    // Every model source names a provider and model, and the stream is
+    // present but empty.
+    assert_eq!(events[5]["data"]["stream"], json!([]));
+    assert_eq!(
+        events[5]["data"]["message"]["source"]["model"],
+        json!("deepseek-v4-flash")
+    );
+}
+
+#[test]
+fn from_common_round_trips_tool_calls_and_results() {
+    let native = dsh::Dsh::from_common(&tool_session()).unwrap();
+    let common = dsh::Dsh::to_common(&native).unwrap();
+    let blocks: Vec<&Block> = common.body.iter().flat_map(|m| &m.content).collect();
+    assert!(matches!(blocks[1], Block::ToolUse { id, .. } if id == "call-1"));
+    assert!(matches!(
+        blocks[2],
+        Block::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "call-1"
+    ));
+    assert!(matches!(
+        blocks.last().unwrap(),
+        Block::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "call-2"
+    ));
+}
+
+#[test]
+fn save_names_the_log_for_its_header_version() {
+    let root = tempfile::tempdir().unwrap();
+    let store = dsh::DshStore::new(root.path());
+    // Fix the root to plaintext so the test does not depend on `dsh_zstd`.
+    write_session(
+        &root.path().join("--elsewhere--").join("session-other"),
+        &sample_body(),
+    );
+
+    let native = dsh::Dsh::from_common(&tool_session()).unwrap();
+    let saved = store.save(&native).unwrap();
+    assert!(saved.reference.join("session.v4.jsonl").is_file());
+
+    // A re-save replaces the session, so another generation beside it goes.
+    std::fs::write(saved.reference.join("session.v1.jsonl"), "stale").unwrap();
+    store.save(&native).unwrap();
+    assert!(!saved.reference.join("session.v1.jsonl").exists());
+
+    // A native body keeps its own version, and so its own file name.
+    let mut older = native.clone();
+    older.body.header["version"] = json!(1);
+    store.save(&older).unwrap();
+    assert!(saved.reference.join("session.v1.jsonl").is_file());
+    assert!(!saved.reference.join("session.v4.jsonl").exists());
+}

@@ -119,6 +119,7 @@ each is a hard requirement on the writer:
 | `assertZstdHeaderFrame` | the first Zstandard frame decodes to exactly one line — the header |
 | `assertStoredIdentity` | the header's own `id` and `cwd` name the path the log was found at |
 | `checkRootEncoding` | one root never mixes `.jsonl` with `.jsonl.zstd` |
+| generation selection | the file name's `.vN` matches the header's `version` |
 
 A duplicate session id across two project directories is rejected the same way.
 
@@ -139,10 +140,14 @@ makes it injective over lone surrogates.
 
 ### What `save` writes
 
-`<root>/<project>/<encoded id>/session.jsonl.zstd` — a checksummed Zstandard
-frame holding the header line, then one holding the event lines. The header is
-stamped with the id and cwd that built the path, because a copy given a new
-identity would otherwise keep pointing at the original's.
+`<root>/<project>/<encoded id>/session.v4.jsonl.zstd` — a checksummed Zstandard
+frame holding the header line, then one holding the event lines. A native dsh
+body keeps its own version, and the file is named for it (`session.jsonl.zstd`
+for v0); dsh migrates an older generation itself when it next opens the
+session. Any other generation in the directory is removed, since the saved log
+replaces the whole session and a newer one beside it would be the one read. The
+header is stamped with the id and cwd that built the path, because a copy given
+a new identity would otherwise keep pointing at the original's.
 
 The physical encoding follows whatever the root already uses; only an empty
 root falls back to dsh's own default of `zstd`. Re-saving a session whose cwd
@@ -150,6 +155,36 @@ changed removes the copy under the old project directory, since leaving it
 would be the duplicate-id corruption above — but only after the replacement is
 on disk, so a failed save leaves the previous copy in place. The log itself is
 written to a temporary file and renamed into place.
+
+### From Common
+
+A Common conversation is written as format v4, laid out as the turn and step
+lifecycle dsh's own reader checks. Each human message opens a turn and its
+first step. A model response joins the open step, or opens the next one once a
+tool result has answered it. Each tool call is recorded as started
+(`tool/call`) immediately before its result, which cites that call in
+`sourceEventSeqs`.
+
+A few events exist only because dsh requires them:
+
+- **System head** — the first step starts with an empty `system/message`. dsh
+  appends its current system prompt when it resumes a session, and accepts
+  that only behind a system message heading the surface; without one, the log
+  dsh itself extends fails its next load.
+- **Unanswered calls** — a tool call with no result in Common is closed the
+  way dsh closes an interrupted one: an error result with its exact
+  `TOOL_NOT_STARTED` repair id and wording, and a turn ending `interrupted`.
+  A result whose call is not open in the current step has nothing dsh would
+  accept it against, and is left out.
+- **Model source** — every assistant message names a provider and model.
+  Common records no provider, so it is `txcript`; the model is the message's,
+  else the session's, else `unknown`.
+- **Stream** — an assistant message embeds its provider stream, which dsh
+  replays against the message when it verifies a log. Common has no stream,
+  and an empty one is the form dsh skips.
+
+A Common title is recorded as a `user` title: dsh's `fallback` kind claims the
+title was derived from a cited prompt.
 
 `delete` removes the session directory. dsh's persistence seam has no delete
 API, but it also keeps no index — an absent directory is simply not scanned.
@@ -174,9 +209,15 @@ parent — and against a session recorded by dsh around 2026-08-14 in format v0,
 read both as v0 and after the official catalog migrated it to v4: the two
 generations project to identical Common messages.
 
-The writer was checked by running the official backend's `listArtifacts` and
-`loadStored` against a txcript-written root. Compressing the log as one frame
-instead of two — which txcript itself still reads — makes that check fail with
-dsh's `first frame is not exactly one header line`.
+The writer was checked against the official format catalog under its
+strictest settings (`recovery: 'strict'`, `validation: 'current'`) with
+sessions converted from Claude Code, Codex, and OpenCode, the largest about
+14,000 events. A converted session was then resumed twice with
+`dsh --profile headless --session-id`: dsh answered from the imported history,
+and the log it extended still passed the same check after each turn. An earlier
+layout without the system head passed the first resume and then failed the
+second — the reason the head exists. Compressing the log as one frame instead
+of two — which txcript itself still reads — makes dsh's own check fail with
+`first frame is not exactly one header line`.
 
 Last verified: 2026-10-15, against `@deepseek-ai/dsh` 0.2.0-rc.2.

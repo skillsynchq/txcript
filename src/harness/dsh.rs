@@ -36,10 +36,11 @@ use crate::error::{Error, Result};
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
 
-/// On-disk format version stamped into every newly-written `SessionHeader`.
-/// Official readers refuse any other value; txcript still loads the native
-/// body so unknown future logs are not silently dropped.
-const SESSION_FORMAT_VERSION: u64 = 0;
+/// On-disk format version stamped into every header txcript writes from
+/// Common. Official readers migrate older versions and refuse newer ones;
+/// txcript still loads the native body so unknown future logs are not silently
+/// dropped.
+const SESSION_FORMAT_VERSION: u64 = 4;
 
 /// The `dsh` harness marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,11 +174,14 @@ impl Store for DshStore {
         stamp_identity(&mut body.header, &id, cwd.as_deref());
 
         let compressed = self.root_compresses();
-        let (name, other) = if compressed {
-            ("session.jsonl.zstd", "session.jsonl")
-        } else {
-            ("session.jsonl", "session.jsonl.zstd")
-        };
+        // dsh rejects a log whose file name and header disagree on the
+        // version, so a native body is written under its own generation.
+        let version = body
+            .header
+            .get("version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let name = log_file_name(version, compressed);
         let bytes = if compressed {
             encode_log(&body)?
         } else {
@@ -189,14 +193,15 @@ impl Store for DshStore {
         // temporary name carries no `.jsonl`, so dsh never mistakes it for a
         // log of either encoding.
         let tmp = dir.join(".txcript-save.tmp");
-        if let Err(error) = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, dir.join(name))) {
+        if let Err(error) = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, dir.join(&name)))
+        {
             let _ = fs::remove_file(&tmp);
             return Err(error.into());
         }
-        // The opposite encoding in the same session directory is the same
-        // poison as one elsewhere in the root, and a re-save that switched
-        // encodings would leave it behind.
-        let _ = fs::remove_file(dir.join(other));
+        // The saved log replaces the whole session. A newer generation left
+        // beside it would be the one dsh (and txcript) read, and the opposite
+        // encoding is the same poison as one elsewhere in the root.
+        retire_other_generations(&dir, &name);
         // Only now that the replacement is on disk: a copy under another
         // project directory is the last one left if this save had failed.
         self.retire_other_copies(&id, &dir);
@@ -279,11 +284,8 @@ impl DshStore {
                 continue;
             };
             for session_dir in sessions.flatten().map(|entry| entry.path()) {
-                if session_dir.join("session.jsonl.zstd").is_file() {
-                    return true;
-                }
-                if session_dir.join("session.jsonl").is_file() {
-                    return false;
+                if let Some(log) = log_path(&session_dir) {
+                    return log.extension().is_some_and(|ext| ext == "zstd");
                 }
             }
         }
@@ -487,6 +489,36 @@ fn log_path(session_dir: &Path) -> Option<PathBuf> {
 
 /// The format generation a canonical log file name carries, or `None` for
 /// anything else in the directory (the lock file, in-flight `.tmp` files).
+/// dsh's canonical generation name: version 0 carries no `.vN`.
+fn log_file_name(version: u64, compressed: bool) -> String {
+    let stem = if version == 0 {
+        "session.jsonl".to_string()
+    } else {
+        format!("session.v{version}.jsonl")
+    };
+    if compressed {
+        format!("{stem}.zstd")
+    } else {
+        stem
+    }
+}
+
+/// Remove every log in `dir` other than `keep`. Best effort, like
+/// [`DshStore::retire_other_copies`].
+fn retire_other_generations(dir: &Path, keep: &str) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name != keep && log_generation(&name).is_some() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn log_generation(name: &str) -> Option<u64> {
     let stem = name.strip_prefix("session")?;
     let stem = stem.strip_suffix(".zstd").unwrap_or(stem);
@@ -978,7 +1010,16 @@ const NS: Uuid = Uuid::from_bytes([
     0x4d, 0x73, 0x68, 0x2d, 0x74, 0x78, 0x63, 0x72, 0x69, 0x70, 0x74, 0x2d, 0x64, 0x73, 0x68, 0x31,
 ]);
 
-#[allow(clippy::too_many_lines)]
+/// What dsh itself writes for a tool call the model asked for but that never
+/// started. The official validator accepts an unanswered call only as this
+/// exact repair, so a Common call without a result is closed the same way.
+const NOT_STARTED_TEXT: &str = "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.";
+
+/// dsh requires a provider and model on every assistant source; Common
+/// records neither provider nor, always, a model.
+const IMPORTED_PROVIDER: &str = "txcript";
+const UNKNOWN_MODEL: &str = "unknown";
+
 fn body_from_common(transcript: &Transcript<Common>) -> DshSession {
     let created = transcript.meta.timestamp.timestamp_millis();
     let id = if transcript.meta.id.is_empty() {
@@ -991,156 +1032,364 @@ fn body_from_common(transcript: &Transcript<Common>) -> DshSession {
         "version": SESSION_FORMAT_VERSION,
         "id": id,
         "createdAt": created,
+        "isSeeded": false,
         "delegationDepth": 0,
     });
     if let Some(cwd) = &transcript.meta.cwd {
         header["cwd"] = json!(cwd);
     }
-    let mut events = Vec::new();
-    let mut seq = 0_u64;
+    let model = transcript.meta.model.as_deref().unwrap_or(UNKNOWN_MODEL);
+    let mut log = LogWriter::new(&id, created);
     if let Some(title) = &transcript.meta.title {
-        events.push(json!({
+        // A `fallback` title must cite the human message it was derived
+        // from; this one was set elsewhere, which dsh records as `user`.
+        log.push(json!({
             "type": "session/title",
-            "seq": seq,
             "time": created,
-            "data": { "title": title, "source": { "kind": "fallback" } }
+            "data": { "title": title, "messageSeqs": [], "source": { "kind": "user" } }
         }));
-        seq += 1;
     }
     for (index, message) in transcript.body.iter().enumerate() {
-        let time = message.timestamp.timestamp_millis();
         if message.role == Role::User {
-            let texts: Vec<Value> = message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    Block::Text { text } => Some(json!({"type": "text", "text": text})),
-                    _ => None,
-                })
-                .collect();
-            if !texts.is_empty() {
-                let msg_id = Uuid::new_v5(&NS, format!("{id}:{index}:user").as_bytes()).to_string();
-                events.push(json!({
-                    "type": "user/message",
-                    "seq": seq,
-                    "time": time,
-                    "data": {
-                        "role": "user",
-                        "id": msg_id,
-                        "content": texts,
-                        "source": { "kind": "user" }
-                    },
-                    "surfaceOp": "append"
-                }));
-                seq += 1;
-            }
-            for block in &message.content {
-                if let Block::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                {
-                    let text = match content {
-                        ToolOutput::Text(text) => text.clone(),
-                        ToolOutput::Json(value) => value.to_string(),
-                    };
-                    events.push(json!({
-                        "type": "tool/result",
-                        "seq": seq,
-                        "time": time,
-                        "data": {
-                            "turn": 1,
-                            "step": 1,
-                            "message": {
-                                "role": "user",
-                                "source": { "kind": "tool", "callId": tool_use_id },
-                                "content": [{
-                                    "type": "tool-result",
-                                    "toolCallId": tool_use_id,
-                                    "isError": is_error,
-                                    "content": [{ "type": "text", "text": text }]
-                                }]
-                            }
-                        },
-                        // `sourceEventSeqs` is omitted, not empty: dsh rejects
-                        // an empty array on anything but `assistant/message`.
-                        "surfaceOp": "append"
-                    }));
-                    seq += 1;
-                }
-            }
+            log.user(index, message);
         } else {
-            let mut content = Vec::new();
-            for block in &message.content {
-                match block {
-                    Block::Text { text } => content.push(json!({"type": "text", "text": text})),
-                    Block::Thinking { text, .. } => {
-                        content.push(json!({"type": "reasoning", "text": text}));
-                    }
-                    Block::ToolUse { id: call_id, tool } => {
-                        let (name, input) = tool.to_canonical();
-                        let arguments =
-                            serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                        content.push(json!({
-                            "type": "tool-call",
-                            "id": call_id,
-                            "name": name,
-                            "arguments": arguments
-                        }));
-                    }
-                    Block::ToolResult { .. } | Block::Image { .. } | Block::Artifact { .. } => {}
-                }
-            }
-            if content.is_empty() {
-                continue;
-            }
-            let msg_id =
-                Uuid::new_v5(&NS, format!("{id}:{index}:assistant").as_bytes()).to_string();
-            let mut source = json!({ "kind": "model" });
-            if let Some(model) = &message.model {
-                source["model"] = json!(model);
-            }
-            let mut data = json!({
-                "turn": 1,
-                "step": index + 1,
-                "message": {
-                    "role": "assistant",
-                    "id": msg_id,
-                    "content": content,
-                    "source": source
-                }
-            });
-            if let Some(usage) = &message.usage {
-                let mut tokens = json!({
-                    "inputTokens": usage.input_tokens,
-                    "outputTokens": usage.output_tokens,
-                });
-                if let Some(read) = usage.cache_read_input_tokens {
-                    tokens["cacheReadTokens"] = json!(read);
-                }
-                if let Some(write) = usage.cache_creation_input_tokens {
-                    tokens["cacheWriteTokens"] = json!(write);
-                }
-                data["usage"] = tokens;
-            }
-            // dsh only ever writes `interrupted: true`; absence means a
-            // completed turn.
-            if message.stop_reason == Some(StopReason::Aborted) {
-                data["interrupted"] = json!(true);
-            }
-            events.push(json!({
-                "type": "assistant/message",
-                "seq": seq,
-                "time": time,
-                "data": data,
-                "surfaceOp": "append"
-            }));
-            seq += 1;
+            log.assistant(index, message, model);
         }
     }
-    let _ = seq;
+    let events = log.finish();
     DshSession { header, events }
+}
+
+/// Lays Common messages out as dsh's turn/step lifecycle, which the official
+/// reader checks: a human message opens a turn and its first step, a model
+/// response after tool results opens the next step, and every tool call is
+/// started (`tool/call`) and answered (`tool/result`) before its step ends.
+struct LogWriter<'a> {
+    id: &'a str,
+    events: Vec<Value>,
+    time: i64,
+    turn: u64,
+    turn_open: bool,
+    step: u64,
+    step_state: StepState,
+    interrupted: bool,
+    /// Calls advertised in the open step and not yet answered, in order:
+    /// `(id, name, arguments)`.
+    pending: Vec<(String, String, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepState {
+    Closed,
+    Open,
+    /// A tool result has answered the step since its last model response.
+    Answered,
+}
+
+impl<'a> LogWriter<'a> {
+    fn new(id: &'a str, time: i64) -> Self {
+        Self {
+            id,
+            events: Vec::new(),
+            time,
+            turn: 0,
+            turn_open: false,
+            step: 0,
+            step_state: StepState::Closed,
+            interrupted: false,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, mut event: Value) -> u64 {
+        let seq = self.events.len() as u64;
+        event["seq"] = json!(seq);
+        self.events.push(event);
+        seq
+    }
+
+    fn user(&mut self, index: usize, message: &Message) {
+        self.time = message.timestamp.timestamp_millis();
+        for block in &message.content {
+            if let Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+            {
+                self.tool_result(index, tool_use_id, content, *is_error);
+            }
+        }
+        let texts: Vec<Value> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(json!({"type": "text", "text": text})),
+                _ => None,
+            })
+            .collect();
+        if texts.is_empty() {
+            return;
+        }
+        self.close_turn();
+        self.open_turn();
+        self.open_step();
+        let msg_id = Uuid::new_v5(&NS, format!("{}:{index}:user", self.id).as_bytes()).to_string();
+        self.push(json!({
+            "type": "user/message",
+            "time": self.time,
+            "data": {
+                "role": "user",
+                "id": msg_id,
+                "content": texts,
+                "source": { "kind": "user" }
+            },
+            "surfaceOp": "append"
+        }));
+    }
+
+    /// A result whose call is not pending in the open step has nothing dsh
+    /// would accept it against, and is left out.
+    fn tool_result(&mut self, index: usize, call_id: &str, content: &ToolOutput, is_error: bool) {
+        let Some(position) = self.pending.iter().position(|(id, ..)| id == call_id) else {
+            return;
+        };
+        let (_, name, arguments) = self.pending.remove(position);
+        let call_seq = self.push(json!({
+            "type": "tool/call",
+            "time": self.time,
+            "data": {
+                "turn": self.turn,
+                "step": self.step,
+                "callId": call_id,
+                "name": name,
+                "arguments": arguments
+            }
+        }));
+        let text = match content {
+            ToolOutput::Text(text) => text.clone(),
+            ToolOutput::Json(value) => value.to_string(),
+        };
+        let msg_id = Uuid::new_v5(
+            &NS,
+            format!("{}:{index}:result:{call_id}", self.id).as_bytes(),
+        )
+        .to_string();
+        self.push(json!({
+            "type": "tool/result",
+            "time": self.time,
+            "data": {
+                "turn": self.turn,
+                "step": self.step,
+                "message": {
+                    "role": "tool",
+                    "id": msg_id,
+                    "toolCallId": call_id,
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": is_error,
+                    "source": { "kind": "tool", "callId": call_id }
+                }
+            },
+            "sourceEventSeqs": [call_seq],
+            "surfaceOp": "append"
+        }));
+        self.step_state = StepState::Answered;
+    }
+
+    fn assistant(&mut self, index: usize, message: &Message, default_model: &str) {
+        let mut content = Vec::new();
+        let mut calls = Vec::new();
+        for block in &message.content {
+            match block {
+                Block::Text { text } => content.push(json!({"type": "text", "text": text})),
+                Block::Thinking { text, .. } => {
+                    content.push(json!({"type": "reasoning", "text": text}));
+                }
+                Block::ToolUse { id: call_id, tool } => {
+                    let (name, input) = tool.to_canonical();
+                    let arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                    content.push(json!({
+                        "type": "tool-call",
+                        "id": call_id,
+                        "name": name,
+                        "arguments": arguments
+                    }));
+                    calls.push((call_id.clone(), name, arguments));
+                }
+                Block::ToolResult { .. } | Block::Image { .. } | Block::Artifact { .. } => {}
+            }
+        }
+        if content.is_empty() {
+            return;
+        }
+        self.time = message.timestamp.timestamp_millis();
+        if !self.turn_open {
+            self.open_turn();
+        }
+        // A response after a tool result is a new model call, so a new step.
+        if self.step_state == StepState::Answered {
+            self.close_step();
+        }
+        self.open_step();
+        let msg_id =
+            Uuid::new_v5(&NS, format!("{}:{index}:assistant", self.id).as_bytes()).to_string();
+        let model = message.model.as_deref().unwrap_or(default_model);
+        let mut data = json!({
+            "turn": self.turn,
+            "step": self.step,
+            "message": {
+                "role": "assistant",
+                "id": msg_id,
+                "content": content,
+                "source": { "kind": "model", "provider": IMPORTED_PROVIDER, "model": model }
+            },
+            // The provider stream is not recorded in Common. dsh replays an
+            // embedded stream against the message it produced, and skips
+            // that check only for an empty one.
+            "stream": []
+        });
+        if let Some(usage) = &message.usage {
+            let mut tokens = json!({
+                "inputTokens": usage.input_tokens,
+                "outputTokens": usage.output_tokens,
+            });
+            if let Some(read) = usage.cache_read_input_tokens {
+                tokens["cacheReadTokens"] = json!(read);
+            }
+            if let Some(write) = usage.cache_creation_input_tokens {
+                tokens["cacheWriteTokens"] = json!(write);
+            }
+            data["usage"] = tokens;
+        }
+        // dsh only ever writes `interrupted: true`; absence means a
+        // completed response.
+        if message.stop_reason == Some(StopReason::Aborted) {
+            data["interrupted"] = json!(true);
+            self.interrupted = true;
+        }
+        self.push(json!({
+            "type": "assistant/message",
+            "time": self.time,
+            "data": data,
+            "surfaceOp": "append"
+        }));
+        for call in calls {
+            if !self.pending.iter().any(|(id, ..)| *id == call.0) {
+                self.pending.push(call);
+            }
+        }
+    }
+
+    fn open_turn(&mut self) {
+        self.turn += 1;
+        self.turn_open = true;
+        self.step = 0;
+        self.interrupted = false;
+        self.push(json!({
+            "type": "turn/start",
+            "time": self.time,
+            "data": { "turn": self.turn }
+        }));
+    }
+
+    fn open_step(&mut self) {
+        if self.step_state != StepState::Closed {
+            return;
+        }
+        self.step += 1;
+        self.step_state = StepState::Open;
+        self.push(json!({
+            "type": "step/start",
+            "time": self.time,
+            "data": { "turn": self.turn, "step": self.step }
+        }));
+        if self.turn == 1 && self.step == 1 {
+            self.system_head();
+        }
+    }
+
+    /// dsh appends its current system prompt to the history of a session it
+    /// resumes, and accepts that only behind a system message heading the
+    /// surface; without one, the resumed log fails dsh's next load. Common has
+    /// no system prompt to put there, so the head is empty.
+    fn system_head(&mut self) {
+        let msg_id = Uuid::new_v5(&NS, format!("{}:system", self.id).as_bytes()).to_string();
+        self.push(json!({
+            "type": "system/message",
+            "time": self.time,
+            "data": {
+                "turn": self.turn,
+                "step": self.step,
+                "message": {
+                    "role": "system",
+                    "id": msg_id,
+                    "content": [],
+                    "source": { "kind": "system-prompt" }
+                }
+            },
+            "surfaceOp": "append"
+        }));
+    }
+
+    /// Close the open step, answering each unanswered call with dsh's own
+    /// not-started repair.
+    fn close_step(&mut self) {
+        if self.step_state == StepState::Closed {
+            return;
+        }
+        for (call_id, ..) in std::mem::take(&mut self.pending) {
+            let seq = self.events.len();
+            self.push(json!({
+                "type": "tool/result",
+                "time": self.time,
+                "data": {
+                    "turn": self.turn,
+                    "step": self.step,
+                    "message": {
+                        "role": "tool",
+                        "id": format!("interrupted-tool-result-{call_id}-{seq}"),
+                        "toolCallId": call_id,
+                        "content": [{ "type": "text", "text": NOT_STARTED_TEXT }],
+                        "isError": true,
+                        "source": { "kind": "tool", "callId": call_id }
+                    },
+                    "error": { "name": "ToolNotStartedError", "code": "TOOL_NOT_STARTED" }
+                },
+                "surfaceOp": "append"
+            }));
+            self.interrupted = true;
+        }
+        self.push(json!({
+            "type": "step/end",
+            "time": self.time,
+            "data": { "turn": self.turn, "step": self.step }
+        }));
+        self.step_state = StepState::Closed;
+    }
+
+    fn close_turn(&mut self) {
+        if !self.turn_open {
+            return;
+        }
+        self.close_step();
+        let reason = if self.interrupted {
+            "interrupted"
+        } else {
+            "completed"
+        };
+        self.push(json!({
+            "type": "turn/end",
+            "time": self.time,
+            "data": { "turn": self.turn, "reason": { "kind": reason } }
+        }));
+        self.turn_open = false;
+    }
+
+    fn finish(mut self) -> Vec<Value> {
+        self.close_turn();
+        self.events
+    }
 }
 
 #[cfg(test)]
