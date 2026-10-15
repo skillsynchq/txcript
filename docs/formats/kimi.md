@@ -99,7 +99,9 @@ line, sitting one level above `sessions/`:
 **It is the only discovery path.** Kimi does not scan the sessions directory,
 so a session written without an index record is invisible to `kimi session
 list` and `kimi --session`. Removal is a `deleted` tombstone rather than a
-rewrite, which is how txcript's `delete` retires a session too.
+rewrite, which is how txcript's `delete` retires a session too. Before
+removing anything, `delete` requires a `state.json` and refuses any path that
+doesn't resolve, symlinks included, to `<sessions>/<workspace>/<session>`.
 
 Kimi validates each record on read: `sessionDir` must be absolute, must sit
 inside the sessions directory, and its last path segment must equal

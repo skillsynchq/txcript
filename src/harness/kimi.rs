@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::common::{Block, Lineage, Message, Meta, Relation, Role, StopReason, Tool, ToolOutput};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
 
@@ -222,8 +222,31 @@ impl Store for KimiStore {
     }
 
     fn delete(&self, reference: &PathBuf) -> Result<()> {
-        let id = session_id_from_path(reference);
-        fs::remove_dir_all(reference)?;
+        if !reference.join("state.json").is_file() {
+            return Err(Error::Malformed {
+                harness: Kimi::NAME,
+                detail: format!("not a kimi session directory: {}", reference.display()),
+            });
+        }
+        // Resolve symlinks before checking containment, and require the exact
+        // `<workspace>/<session>` depth so neither the root nor a workspace
+        // directory can be removed wholesale.
+        let canon = reference.canonicalize()?;
+        let root = self.sessions_dir.canonicalize()?;
+        let contained = canon
+            .strip_prefix(&root)
+            .is_ok_and(|rest| rest.components().count() == 2);
+        if !contained {
+            return Err(Error::Malformed {
+                harness: Kimi::NAME,
+                detail: format!(
+                    "refusing to delete outside the sessions root: {}",
+                    reference.display()
+                ),
+            });
+        }
+        let id = session_id_from_path(&canon);
+        fs::remove_dir_all(canon)?;
         // The index is append-only, so a removal is a tombstone record rather
         // than a rewrite — matching how Kimi itself retires a session.
         self.append_index(&json!({"sessionId": id, "deleted": true}))
