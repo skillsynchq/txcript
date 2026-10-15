@@ -1,17 +1,20 @@
 //! `dsh` sessions: `$DSH_HOME/sessions` (default `~/.dsh/sessions`).
 //!
 //! Official persistence writes one append-only JSONL log per session, Zstandard
-//! framed by default (`session.jsonl.zstd`). The first line is a `type: session`
-//! header; the rest are `SessionEvent` records (and packed `*-chunks` rows).
-//! There is no documented session-import CLI, the on-disk format is version 0
-//! with no migration, and the persistence seam has no delete API, so
-//! [`DshStore`] is read-only: sessions can be discovered, loaded, searched,
-//! exported, and converted into another harness, but txcript never writes
-//! `~/.dsh/sessions`.
+//! framed by default, named for its format generation
+//! (`session[.vN].jsonl[.zstd]`; currently `session.v4.jsonl.zstd`). The first
+//! line is a `type: session` header; the rest are `SessionEvent` records (and,
+//! in v0–v1, packed `*-chunks` rows). The reader understands generations 0
+//! through 4 directly. There is no documented session-import CLI and the
+//! persistence seam has no delete API, so [`DshStore`] is read-only: sessions
+//! can be discovered, loaded, searched, exported, and converted into another
+//! harness, but txcript never writes `~/.dsh/sessions`.
 //!
 //! Native body retains the header and every log line as raw JSON, including
 //! packed chunk rows and unknown event types. The Common projection uses the
-//! ordered surface (`user/message`, `assistant/message`, `tool/result`).
+//! ordered surface (`system/message`, `developer/message`, `user/message`,
+//! `assistant/message`, `tool/result`), minus the environment context dsh
+//! injects as user messages.
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::common::{Block, Message, Meta, Role, StopReason, Tool, ToolOutput, Usage};
+use crate::common::{
+    Block, Lineage, Message, Meta, Relation, Role, StopReason, Tool, ToolOutput, Usage,
+};
 use crate::error::{Error, Result};
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
@@ -142,7 +147,7 @@ impl Store for DshStore {
     fn load(&self, reference: &PathBuf) -> Result<Transcript<Dsh>> {
         let log = log_path(reference).ok_or_else(|| Error::Malformed {
             harness: Dsh::NAME,
-            detail: format!("no session.jsonl in {}", reference.display()),
+            detail: format!("no session log in {}", reference.display()),
         })?;
         let body = load_body(&log)?;
         let mut meta = meta_from_body(&body);
@@ -178,13 +183,39 @@ fn read_only_error() -> Error {
     }
 }
 
+/// The live log in a session directory. dsh names each format generation
+/// `session[.vN].jsonl[.zstd]` (no `.vN` is version 0) and, when it migrates
+/// a session, publishes the new generation beside the old one rather than
+/// replacing it, so the numerically highest generation is the current one.
 fn log_path(session_dir: &Path) -> Option<PathBuf> {
-    let zstd = session_dir.join("session.jsonl.zstd");
-    if zstd.is_file() {
-        return Some(zstd);
+    fs::read_dir(session_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let generation = log_generation(&name)?;
+            let path = entry.path();
+            let compressed = path.extension().is_some_and(|ext| ext == "zstd");
+            path.is_file().then_some(((generation, compressed), path))
+        })
+        .max_by_key(|(key, _)| *key)
+        .map(|(_, path)| path)
+}
+
+/// The format generation a canonical log file name carries, or `None` for
+/// anything else in the directory (the lock file, in-flight `.tmp` files).
+fn log_generation(name: &str) -> Option<u64> {
+    let stem = name.strip_prefix("session")?;
+    let stem = stem.strip_suffix(".zstd").unwrap_or(stem);
+    let stem = stem.strip_suffix(".jsonl")?;
+    if stem.is_empty() {
+        return Some(0);
     }
-    let plain = session_dir.join("session.jsonl");
-    plain.is_file().then_some(plain)
+    let digits = stem.strip_prefix(".v")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn load_body(path: &Path) -> Result<DshSession> {
@@ -322,9 +353,28 @@ fn meta_from_body(body: &DshSession) -> Meta {
         title,
         cli_version: None,
         model,
-        // Not yet read from the header's `parentSession`.
-        lineage: None,
+        lineage: lineage_from_header(header),
     }
+}
+
+/// `parentSession` is the id of the session this one was seeded from. A
+/// subagent run also carries `origin: "subagent"`; a user fork carries no
+/// origin. dsh resumes a session under its own id, so there is no
+/// continuation link.
+fn lineage_from_header(header: &Value) -> Option<Lineage> {
+    let parent = header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty())?;
+    let relation = if header.get("origin").and_then(Value::as_str) == Some("subagent") {
+        Relation::Spawn
+    } else {
+        Relation::Fork
+    };
+    Some(Lineage {
+        parent: parent.to_string(),
+        relation,
+    })
 }
 
 fn first_event_time(events: &[Value]) -> Option<DateTime<Utc>> {
@@ -366,8 +416,9 @@ fn replacement_range(
         let seq = seq.and_then(Value::as_u64)?;
         surface.iter().position(|(node, _)| *node == Some(seq))
     };
-    let start = position(op.get("start"))?;
-    let end = position(op.get("end"))?;
+    // v3 renamed the endpoints from `start`/`end` to `startSeq`/`endSeq`.
+    let start = position(op.get("startSeq").or_else(|| op.get("start")))?;
+    let end = position(op.get("endSeq").or_else(|| op.get("end")))?;
     (start <= end).then_some((start, end))
 }
 
@@ -384,7 +435,16 @@ fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message>
         let Some(kind) = event.get("type").and_then(Value::as_str) else {
             continue;
         };
-        if !matches!(kind, "user/message" | "assistant/message" | "tool/result") {
+        // System and developer messages (v3+) never become Common messages,
+        // but they are surface nodes a replacement span is counted across.
+        if !matches!(
+            kind,
+            "system/message"
+                | "developer/message"
+                | "user/message"
+                | "assistant/message"
+                | "tool/result"
+        ) {
             continue;
         }
         let seq = event.get("seq").and_then(Value::as_u64);
@@ -409,6 +469,9 @@ fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message>
         let timestamp = event_time(event, fallback);
         match event.get("type").and_then(Value::as_str) {
             Some("user/message") => {
+                if is_environment_injection(event.get("data")) {
+                    continue;
+                }
                 let blocks = user_text_blocks(event.get("data"));
                 if !blocks.is_empty() {
                     messages.push(user_message(blocks, timestamp));
@@ -463,6 +526,42 @@ fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message>
         }
     }
     messages
+}
+
+/// Message sources dsh regenerates from its own environment on every request —
+/// runtime and sandbox snapshots, the skill catalog, instruction files,
+/// clocks. They ride on `user/message` but are not part of the conversation,
+/// and would misdescribe any other harness a session is continued in. Every
+/// other source stays, unknown ones included: a compaction checkpoint, for
+/// one, carries the only remaining copy of the history it replaced.
+const ENVIRONMENT_SOURCES: &[&str] = &[
+    "runtime-context",
+    "skill-catalog",
+    "agent-instructions",
+    "time-context",
+    "tmux-context",
+    "repeat-tool-reminder",
+    "model-selection",
+    "plan-mode",
+];
+
+fn is_environment_injection(message: Option<&Value>) -> bool {
+    let Some(source) = message.and_then(|message| message.get("source")) else {
+        return false;
+    };
+    let kind = match source.get("kind").and_then(Value::as_str) {
+        // Before v4 a producer was `{ kind: "plugin", plugin }`; v4 renamed
+        // the system-prompt plugin's non-system messages `runtime-context`
+        // and kept every other first-party name.
+        Some("plugin") => match source.get("plugin").and_then(Value::as_str) {
+            Some("@deepseek-ai/dsh-system-prompt") => "runtime-context",
+            Some(plugin) => plugin,
+            None => return false,
+        },
+        Some(kind) => kind,
+        None => return false,
+    };
+    ENVIRONMENT_SOURCES.contains(&kind)
 }
 
 fn user_message(content: Vec<Block>, timestamp: DateTime<Utc>) -> Message {
@@ -553,10 +652,17 @@ fn assistant_blocks(content: Option<&Value>) -> Vec<Block> {
 
 fn tool_result_block(data: Option<&Value>) -> Option<Block> {
     let message = data.and_then(|value| value.get("message"))?;
-    let parts = message.get("content")?.as_array()?;
-    let result = parts
-        .iter()
-        .find(|part| part.get("type").and_then(Value::as_str) == Some("tool-result"))?;
+    // v4 lifted the result onto a tool-role message; before that it was a
+    // user-role message holding one `tool-result` wrapper block.
+    let result = if message.get("role").and_then(Value::as_str) == Some("tool") {
+        message
+    } else {
+        message
+            .get("content")?
+            .as_array()?
+            .iter()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("tool-result"))?
+    };
     let tool_use_id = result
         .get("toolCallId")
         .and_then(Value::as_str)
@@ -950,6 +1056,22 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         assert!(text.starts_with("{\"type\":\"session\""));
         assert!(text.contains("user/message"));
+    }
+
+    #[test]
+    fn only_canonical_log_names_carry_a_generation() {
+        assert_eq!(log_generation("session.jsonl"), Some(0));
+        assert_eq!(log_generation("session.jsonl.zstd"), Some(0));
+        assert_eq!(log_generation("session.v4.jsonl.zstd"), Some(4));
+        assert_eq!(log_generation("session.v12.jsonl"), Some(12));
+        // dsh publishes through a temporary sibling, then links it into place.
+        assert_eq!(
+            log_generation("session.v4.jsonl.zstd.af44d7226f77.tmp"),
+            None
+        );
+        assert_eq!(log_generation("session.lock"), None);
+        assert_eq!(log_generation("session.v.jsonl"), None);
+        assert_eq!(log_generation("._session.v4.jsonl.zstd"), None);
     }
 
     #[test]
