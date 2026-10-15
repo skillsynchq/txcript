@@ -176,6 +176,59 @@ fn grok_delete_refuses_a_symlink_into_the_sessions_root() {
 }
 
 #[test]
+fn dsh_delete_refuses_paths_outside_the_sessions_root() {
+    let sessions = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    // Give the victim a session's shape: the guard must hold even when the
+    // directory looks like a real session.
+    std::fs::write(victim.path().join("session.jsonl"), b"").unwrap();
+
+    let store = dsh::DshStore::new(sessions.path());
+    assert!(
+        store.delete(&victim.path().to_path_buf()).is_err(),
+        "a session-shaped directory outside the root must be refused"
+    );
+    assert!(victim.path().is_dir(), "the foreign directory must survive");
+
+    // A project directory holds sessions but isn't one itself.
+    let project = sessions.path().join("--proj--");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("session.jsonl"), b"").unwrap();
+    assert!(store.delete(&project).is_err());
+    assert!(project.is_dir());
+
+    // A directory with no session log isn't a session at all.
+    let bare = project.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    assert!(store.delete(&bare).is_err());
+    assert!(bare.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn dsh_delete_refuses_a_symlink_into_the_sessions_root() {
+    let sessions = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    std::fs::write(victim.path().join("session.jsonl.zstd"), b"").unwrap();
+
+    // Plant a link at the exact depth delete expects a session at.
+    let project = sessions.path().join("--proj--");
+    std::fs::create_dir_all(&project).unwrap();
+    let link = project.join("linked-session");
+    std::os::unix::fs::symlink(victim.path(), &link).unwrap();
+
+    let store = dsh::DshStore::new(sessions.path());
+    assert!(
+        store.delete(&link).is_err(),
+        "a symlink resolving outside the root must be refused"
+    );
+    assert!(
+        victim.path().join("session.jsonl.zstd").is_file(),
+        "the symlink target must survive"
+    );
+}
+
+#[test]
 fn antigravity_delete_refuses_paths_outside_the_conversations_root() {
     let root = tempfile::tempdir().unwrap();
     let victim = tempfile::tempdir().unwrap();

@@ -289,6 +289,33 @@ fn saving_under_a_new_cwd_leaves_no_duplicate_id_behind() {
 
 #[cfg(feature = "dsh_zstd")]
 #[test]
+fn a_failed_save_leaves_the_previous_copy_in_place() {
+    // Re-saving under a new cwd retires the copy under the old project
+    // directory — but only once the replacement is on disk. If writing the
+    // replacement fails, the old session must still be there.
+    let root = tempfile::tempdir().unwrap();
+    let store = dsh::DshStore::new(root.path());
+    let first = store.save(&saveable("session-abc", "/a")).unwrap();
+
+    // Learn where `/b` sessions go, then block that project directory with a
+    // plain file so the replacement cannot be created.
+    let scratch = tempfile::tempdir().unwrap();
+    let probe = dsh::DshStore::new(scratch.path())
+        .save(&saveable("probe", "/b"))
+        .unwrap();
+    let project = probe.reference.parent().unwrap().file_name().unwrap();
+    std::fs::write(root.path().join(project), b"").unwrap();
+
+    assert!(store.save(&saveable("session-abc", "/b")).is_err());
+    assert!(
+        first.reference.join("session.jsonl.zstd").is_file(),
+        "the previous copy must survive a failed save"
+    );
+    assert_eq!(store.discover().unwrap().len(), 1);
+}
+
+#[cfg(feature = "dsh_zstd")]
+#[test]
 fn save_refuses_an_id_that_would_escape_the_store() {
     let root = tempfile::tempdir().unwrap();
     let store = dsh::DshStore::new(root.path());

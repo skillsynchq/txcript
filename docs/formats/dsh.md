@@ -147,10 +147,14 @@ identity would otherwise keep pointing at the original's.
 The physical encoding follows whatever the root already uses; only an empty
 root falls back to dsh's own default of `zstd`. Re-saving a session whose cwd
 changed removes the copy under the old project directory, since leaving it
-would be the duplicate-id corruption above.
+would be the duplicate-id corruption above — but only after the replacement is
+on disk, so a failed save leaves the previous copy in place. The log itself is
+written to a temporary file and renamed into place.
 
 `delete` removes the session directory. dsh's persistence seam has no delete
 API, but it also keeps no index — an absent directory is simply not scanned.
+Before removing anything, `delete` requires a session log and refuses any path
+that doesn't resolve, symlinks included, to `<root>/<project>/<session>`.
 
 The native resume command documented for a TUI profile is
 `dsh --profile tui --resume <id>`.

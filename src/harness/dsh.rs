@@ -172,34 +172,62 @@ impl Store for DshStore {
         let mut body = transcript.body.clone();
         stamp_identity(&mut body.header, &id, cwd.as_deref());
 
-        self.retire_other_copies(&id, &dir);
-        fs::create_dir_all(&dir)?;
         let compressed = self.root_compresses();
-        let log = dir.join(if compressed {
-            "session.jsonl.zstd"
+        let (name, other) = if compressed {
+            ("session.jsonl.zstd", "session.jsonl")
         } else {
-            "session.jsonl"
-        });
+            ("session.jsonl", "session.jsonl.zstd")
+        };
         let bytes = if compressed {
             encode_log(&body)?
         } else {
             plain_log(&body)?.into_bytes()
         };
-        fs::write(&log, bytes)?;
+        fs::create_dir_all(&dir)?;
+        // Write beside the log and rename over it, so a failed write neither
+        // truncates a previous log at this path nor leaves a partial one. The
+        // temporary name carries no `.jsonl`, so dsh never mistakes it for a
+        // log of either encoding.
+        let tmp = dir.join(".txcript-save.tmp");
+        if let Err(error) = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, dir.join(name))) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
         // The opposite encoding in the same session directory is the same
         // poison as one elsewhere in the root, and a re-save that switched
         // encodings would leave it behind.
-        let _ = fs::remove_file(dir.join(if compressed {
-            "session.jsonl"
-        } else {
-            "session.jsonl.zstd"
-        }));
+        let _ = fs::remove_file(dir.join(other));
+        // Only now that the replacement is on disk: a copy under another
+        // project directory is the last one left if this save had failed.
+        self.retire_other_copies(&id, &dir);
         Ok(Saved { id, reference: dir })
     }
 
     fn delete(&self, reference: &PathBuf) -> Result<()> {
-        fs::remove_dir_all(reference)?;
-        Ok(())
+        if log_path(reference).is_none() {
+            return Err(Error::Malformed {
+                harness: Dsh::NAME,
+                detail: format!("not a dsh session directory: {}", reference.display()),
+            });
+        }
+        // Resolve symlinks before checking containment, and require the exact
+        // `<project>/<session>` depth so neither the root nor a project
+        // directory can be removed wholesale.
+        let canon = reference.canonicalize()?;
+        let root = self.sessions_dir.canonicalize()?;
+        let contained = canon
+            .strip_prefix(&root)
+            .is_ok_and(|rest| rest.components().count() == 2);
+        if !contained {
+            return Err(Error::Malformed {
+                harness: Dsh::NAME,
+                detail: format!(
+                    "refusing to delete outside the sessions root: {}",
+                    reference.display()
+                ),
+            });
+        }
+        Ok(fs::remove_dir_all(canon)?)
     }
 
     fn fingerprints(&self, refs: &[PathBuf]) -> Result<HashMap<String, String>> {
@@ -214,12 +242,6 @@ impl Store for DshStore {
 }
 
 impl DshStore {
-    /// Whether a new log should be Zstandard framed.
-    ///
-    /// dsh refuses to list *any* session in a root that holds both `.jsonl`
-    /// and `.jsonl.zstd` artifacts — under either configuration, not just the
-    /// mismatched one. So the root's existing artifacts decide, and only an
-    /// empty root falls back to dsh's own default of `zstd`.
     /// Remove copies of `id` filed under a different project directory.
     ///
     /// A session's project directory is keyed by its cwd, so a re-save after a
@@ -242,6 +264,12 @@ impl DshStore {
         }
     }
 
+    /// Whether a new log should be Zstandard framed.
+    ///
+    /// dsh refuses to list *any* session in a root that holds both `.jsonl`
+    /// and `.jsonl.zstd` artifacts — under either configuration, not just the
+    /// mismatched one. So the root's existing artifacts decide, and only an
+    /// empty root falls back to dsh's own default of `zstd`.
     fn root_compresses(&self) -> bool {
         let Ok(projects) = fs::read_dir(&self.sessions_dir) else {
             return true;
