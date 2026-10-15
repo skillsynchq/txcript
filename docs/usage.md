@@ -123,7 +123,7 @@ txcript = "0.14"
 # txcript = { version = "0.14", default-features = false }
 ```
 
-Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, `search`, and `codex_zstd` (the rollouts Codex compresses to `.jsonl.zst`).
+Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, `search`, `codex_zstd` (the rollouts Codex compresses to `.jsonl.zst`), and `dsh_zstd` (the session logs DeepSeek Harness compresses to `.jsonl.zstd`).
 
 Three layers, smallest to largest:
 

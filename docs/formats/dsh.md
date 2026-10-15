@@ -13,6 +13,10 @@ $DSH_HOME/sessions/          # default ~/.dsh/sessions
 Home resolution is configured path, then `$DSH_HOME`, then `~/.dsh`. An empty
 `$DSH_HOME` is treated as unset.
 
+Reading `session.jsonl.zstd` needs txcript's `dsh_zstd` feature, on by default.
+Without it (and in the wasm build), compressed sessions are left out of
+discovery and loading one fails; uncompressed `session.jsonl` logs still work.
+
 ## Native representation
 
 `txcript::harness::dsh::DshSession` retains the first JSONL line as `header`

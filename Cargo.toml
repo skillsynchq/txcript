@@ -60,14 +60,9 @@ wreq = { version = "6.0.0-rc.31", default-features = false, features = ["brotli"
 wreq-util = { version = "3.0.0-rc.14", features = ["emulation-compression"], optional = true }
 uuid = { version = "1.23.4", features = ["v4", "v5"] }
 wasm-bindgen = { version = "0.2.126", optional = true }
-# Decoding the rollouts Codex compresses; the library Codex writes them with.
+# Decoding the rollouts Codex compresses and the session logs DeepSeek Harness
+# compresses; the library both write them with.
 zstd = { version = "0.13.3", default-features = false, optional = true }
-
-# DeepSeek Harness stores session logs as concatenated Zstandard frames by
-# default. The codec's text form is uncompressed JSON; only the native store
-# decoder needs this, and wasm builds never open those files.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-zstd = "0.13.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aes = { version = "0.8.4", optional = true }
@@ -110,7 +105,7 @@ required-features = ["search"]
 [features]
 # Explicit cloud Cowork reads reuse the Claude Desktop transport.
 cowork_remote = ["claude_chat"]
-default = ["opencode", "hermes", "claude_chat", "cowork_remote", "chatgpt", "search", "codex_zstd"]
+default = ["opencode", "hermes", "claude_chat", "cowork_remote", "chatgpt", "search", "codex_zstd", "dsh_zstd"]
 # The OpenCode harness store reads OpenCode's SQLite database. The OpenCode
 # codec itself is always available; only the on-disk store needs rusqlite.
 opencode = ["dep:rusqlite"]
@@ -146,6 +141,10 @@ chatgpt = [
 # leaves the compressed ones out of discovery; with it, both list and load.
 # zstd is a C library, so the wasm build goes without.
 codex_zstd = ["dep:zstd"]
+# DeepSeek Harness compresses session logs to `session.jsonl.zstd` by default.
+# Without this feature the dsh store still reads `compression: 'none'` roots
+# (`session.jsonl`) and leaves compressed sessions out of discovery.
+dsh_zstd = ["dep:zstd"]
 # Fuzzy/substring search over transcripts (`txcript::search`). nucleo-matcher
 # is pure Rust (helix's matcher) and compiles to wasm32; combine with `wasm`
 # to expose the bindings.

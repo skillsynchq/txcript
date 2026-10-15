@@ -224,7 +224,7 @@ fn read_log_text(path: &Path) -> Result<String> {
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "dsh_zstd")]
 fn decode_zstd(bytes: &[u8]) -> Result<String> {
     use std::io::Read as _;
 
@@ -243,11 +243,11 @@ fn decode_zstd(bytes: &[u8]) -> Result<String> {
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(feature = "dsh_zstd"))]
 fn decode_zstd(_bytes: &[u8]) -> Result<String> {
     Err(Error::Malformed {
         harness: Dsh::NAME,
-        detail: "zstd session logs cannot be decoded in wasm".to_string(),
+        detail: "a compressed dsh session log needs txcript's `dsh_zstd` feature".to_string(),
     })
 }
 
@@ -936,7 +936,7 @@ mod tests {
         assert!(messages[0].usage.is_none());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "dsh_zstd")]
     #[test]
     fn decode_zstd_spans_concatenated_frames() {
         // The backend writes the header in its own frame, then one frame per
