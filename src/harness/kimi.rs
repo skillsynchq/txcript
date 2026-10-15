@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::common::{Block, Message, Meta, Role, StopReason, Tool, ToolOutput};
+use crate::common::{Block, Lineage, Message, Meta, Relation, Role, StopReason, Tool, ToolOutput};
 use crate::error::{Error, Result};
 use crate::harness::jsonl;
 use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
@@ -245,8 +245,13 @@ fn meta_from_body(body: &KimiSession) -> Meta {
         title,
         cli_version: string("cliVersion").or_else(|| string("cli_version")),
         model,
-        // Kimi's state.json and wire log carry no parent/fork/spawn signal.
-        lineage: None,
+        // `kimi fork` records the source session's id as `forkedFrom`.
+        // Subagents live inside the same session directory rather than as
+        // sessions of their own, so there is no spawn link to read.
+        lineage: string("forkedFrom").map(|parent| Lineage {
+            parent,
+            relation: Relation::Fork,
+        }),
     }
 }
 

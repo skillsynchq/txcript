@@ -198,6 +198,32 @@ fn discovery_does_not_depend_on_the_directory_name() {
     assert_eq!(found[0].meta.id, "conversation-7");
 }
 
+#[test]
+fn forked_from_becomes_fork_lineage() {
+    // `kimi fork` records the source session's id as `forkedFrom`.
+    let mut body = sample_body();
+    body.state["forkedFrom"] = json!("session_parent");
+    let root = tempfile::tempdir().unwrap();
+    write_session(&root.path().join("wd_x").join("session_child"), &body);
+
+    let found = kimi::KimiStore::new(root.path()).discover().unwrap();
+    let lineage = found[0].meta.lineage.as_ref().expect("fork lineage");
+    assert_eq!(lineage.parent, "session_parent");
+    assert_eq!(lineage.relation, common::Relation::Fork);
+
+    let text = serde_json::to_string(&body).unwrap();
+    let parsed = <kimi::Kimi as TextCodec>::from_text(&text).unwrap();
+    assert_eq!(parsed.meta.lineage, found[0].meta.lineage);
+}
+
+#[test]
+fn no_forked_from_means_no_lineage() {
+    let root = tempfile::tempdir().unwrap();
+    write_session(&root.path().join("wd_x").join("session_a"), &sample_body());
+    let found = kimi::KimiStore::new(root.path()).discover().unwrap();
+    assert!(found[0].meta.lineage.is_none());
+}
+
 fn write_session(dir: &std::path::Path, body: &kimi::KimiSession) {
     std::fs::create_dir_all(dir.join("agents/main")).unwrap();
     std::fs::write(

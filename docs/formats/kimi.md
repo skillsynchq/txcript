@@ -71,6 +71,15 @@ messages (a prompt plus injected reminders), and a single `count: 1` undo drops
 all of them. A wire log with no `turn.prompt` markers falls back to entry
 granularity.
 
+## Lineage
+
+`kimi fork` writes the source session's id to the forked session's
+`state.json` as top-level `forkedFrom` (documented in Kimi Code's
+`docs/en/configuration/data-locations.md`). txcript reads it into a Fork
+`Meta.lineage`, at discovery as well as on load. Subagents are not sessions of
+their own — they live under the same session's `agents/<name>/` — so there is
+no spawn link to read. Writing `forkedFrom` back out is not implemented.
+
 ## Store capabilities
 
 Kimi Code has no documented session import or deletion command. The txcript
