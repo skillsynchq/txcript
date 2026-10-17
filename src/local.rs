@@ -68,7 +68,8 @@ enum Locator {
 }
 
 /// Every local session, newest first. Unreadable stores and sessions are
-/// skipped.
+/// skipped. Sessions that started at the same instant (such as copies of one
+/// id) are ordered by [`Session::updated_at`], newest first.
 #[must_use]
 pub fn discover() -> Vec<Session> {
     discover_with(|_, _| {})
@@ -192,8 +193,22 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
         }
     }
 
-    out.sort_by_key(|s| std::cmp::Reverse(s.meta.timestamp));
+    sort_newest_first(&mut out);
     out
+}
+
+/// Newest start time first. Copies of one session (Claude Code writes a
+/// second store when a session is resumed from another cwd) share a start
+/// time, so ties go to the most recently modified file: the first copy of an
+/// id is the newest. A missing `updated_at` sorts after a known one; remaining
+/// ties keep discovery order (the sort is stable).
+fn sort_newest_first(sessions: &mut [Session]) {
+    sessions.sort_by_key(|s| {
+        (
+            std::cmp::Reverse(s.meta.timestamp),
+            std::cmp::Reverse(s.updated_at),
+        )
+    });
 }
 
 /// Discover one harness, surfacing remote errors when a live source is
@@ -1254,5 +1269,83 @@ mod resume_template_tests {
             locator: super::Locator::Id("sess-1".to_string()),
         };
         assert_eq!(session.location(), "hermes db session sess-1");
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::{HarnessId, Locator, Meta, PathBuf, Session, sort_newest_first};
+    use chrono::{DateTime, Utc};
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// A file-backed session; `tag` marks the copy in its path.
+    fn session(id: &str, started: &str, updated: Option<&str>, tag: &str) -> Session {
+        Session {
+            harness: HarnessId::ClaudeCode,
+            meta: Meta {
+                id: id.to_string(),
+                timestamp: at(started),
+                cwd: None,
+                git_branch: None,
+                title: None,
+                cli_version: None,
+                model: None,
+                lineage: None,
+            },
+            updated_at: updated.map(at),
+            locator: Locator::Path(PathBuf::from(tag)),
+        }
+    }
+
+    fn order(sessions: &[Session]) -> Vec<String> {
+        sessions.iter().map(Session::location).collect()
+    }
+
+    const START: &str = "2026-01-02T03:04:05Z";
+
+    #[test]
+    fn copies_of_one_id_sort_by_newest_file_first_whatever_the_walk_order() {
+        let mut sessions = vec![
+            session("s", START, Some("2026-01-01T00:00:00Z"), "oldest"),
+            session("s", START, Some("2026-01-04T00:00:00Z"), "newest"),
+            session("s", START, Some("2026-01-03T00:00:00Z"), "middle"),
+        ];
+        sort_newest_first(&mut sessions);
+        assert_eq!(order(&sessions), ["newest", "middle", "oldest"]);
+    }
+
+    #[test]
+    fn start_time_still_outranks_file_mtime() {
+        let mut sessions = vec![
+            session(
+                "old",
+                "2026-01-01T00:00:00Z",
+                Some("2026-02-01T00:00:00Z"),
+                "old",
+            ),
+            session(
+                "new",
+                "2026-01-02T00:00:00Z",
+                Some("2026-01-02T00:00:00Z"),
+                "new",
+            ),
+        ];
+        sort_newest_first(&mut sessions);
+        assert_eq!(order(&sessions), ["new", "old"]);
+    }
+
+    #[test]
+    fn a_known_mtime_beats_a_missing_one_and_ties_keep_discovery_order() {
+        let mut sessions = vec![
+            session("s", START, None, "none-1"),
+            session("s", START, Some("2026-01-01T00:00:00Z"), "tie-1"),
+            session("s", START, None, "none-2"),
+            session("s", START, Some("2026-01-01T00:00:00Z"), "tie-2"),
+        ];
+        sort_newest_first(&mut sessions);
+        assert_eq!(order(&sessions), ["tie-1", "tie-2", "none-1", "none-2"]);
     }
 }

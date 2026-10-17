@@ -30,7 +30,7 @@ txcript export <id>[#range]              # write a session as a Simple document
     [--out <file>]                        #   write to <file> instead of stdout
 ```
 
-A session id is any unambiguous prefix of the full id, or the session's exact title. `txcript resume` is an alias for `continue`. `--since` and `--until` take RFC 3339 timestamps or bare `YYYY-MM-DD` dates.
+A session id is any unambiguous prefix of the full id, or the session's exact title. When several copies share one id (Claude Code writes a second copy when a session is resumed from another directory), the most recently modified copy is used. `txcript resume` is an alias for `continue`. `--since` and `--until` take RFC 3339 timestamps or bare `YYYY-MM-DD` dates.
 
 `continue` writes the session where the target harness keeps its sessions, then launches that harness on it, handing over the terminal:
 
