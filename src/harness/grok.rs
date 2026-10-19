@@ -898,8 +898,8 @@ fn push_assistant(
                 }));
                 pending_calls.push((id.clone(), name, input));
             }
-            // User-side blocks have no slot in an assistant record.
-            Block::Image { .. } | Block::ToolResult { .. } => {}
+            Block::Image { source } => texts.push(format!("[image: {}]", source.media_type)),
+            Block::ToolResult { .. } => {}
         }
     }
     if texts.is_empty() && tool_calls.is_empty() {
