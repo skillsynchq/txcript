@@ -884,10 +884,7 @@ fn local_command_record<'a>(
         ] if command_ids.contains(tool_use_id.as_str())
             || !called.contains(tool_use_id.as_str()) =>
         {
-            let text = match content {
-                ToolOutput::Text(text) => text.clone(),
-                ToolOutput::Json(value) => value.to_string(),
-            };
+            let text = content.as_text().into_owned();
             let mut line = Map::new();
             let mut put = |key: &str, value: Value| {
                 line.insert(key.to_string(), value);

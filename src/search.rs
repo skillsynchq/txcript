@@ -28,7 +28,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str, Utf32String};
 use serde::{Deserialize, Serialize};
 
-use crate::common::{Block, Message, Meta, Role, Tool, ToolOutput};
+use crate::common::{Block, Message, Meta, Role, Tool};
 use crate::{Common, HarnessId, Span, Transcript};
 
 // ── query ──────────────────────────────────────────────────────────────
@@ -1053,12 +1053,9 @@ fn extract(meta: &Meta, messages: &[Message]) -> Vec<Line> {
                 Block::ToolUse { tool, .. } => {
                     extract_tool(tool, |text| push(m, b, Origin::ToolUse, text));
                 }
-                Block::ToolResult { content, .. } => match content {
-                    ToolOutput::Text(text) => push(m, b, Origin::ToolResult, text),
-                    ToolOutput::Json(value) => {
-                        push(m, b, Origin::ToolResult, &value.to_string());
-                    }
-                },
+                Block::ToolResult { content, .. } => {
+                    push(m, b, Origin::ToolResult, &content.as_text());
+                }
                 // Images carry no searchable text.
                 Block::Image { .. } => {}
                 Block::Artifact { artifact } => {

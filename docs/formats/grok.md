@@ -92,7 +92,8 @@ A synthetic `chat_history.jsonl` assistant line, shaped like the real thing:
 - Token usage is never extracted (the display log's `_meta.totalTokens` is
   ignored), so `usage` is always absent.
 - Regenerating from Common is lossy: per-turn usage, non-turn stop reasons,
-  reasoning record ids, structured tool-result JSON (flattened to strings),
+  reasoning record ids, structured tool-result JSON (flattened to strings: block arrays
+  read as their text and `[image: <media type>]` placeholders, other JSON as compact text),
   and the system prompt record are not reproduced; sidecars are left empty
   for Grok to regenerate. Native load → save round-trips everything except
   `terminal/` output scratch and `*.lock` files, which are deliberately

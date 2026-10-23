@@ -116,10 +116,18 @@ that relation here. `from_common` never writes `teamName`/`agentName` back.
   types are gone after a cross-model trip (same-harness native trips keep everything).
   Rewritten `tool_result.content` must be a string or block array — anything else
   fails a `claude --resume` load — so bare JSON is flattened to its compact text.
+  Block arrays are written back unchanged.
   Common → Claude Code removes Claude.ai's `uuid` metadata from tool-result
   content blocks, including nested search-result and document content. The
   Messages API rejects those extra fields. Text, supported block fields, and
   UUIDs inside ordinary tool data are preserved; native load/save is unchanged.
+- **Block-array tool results read as text.** MCP and image tool results arrive as a block
+  array (`text`, `image`, ...). `view`, the MCP `read_session`, search, and every export to
+  a harness that stores results as plain strings (Codex, pi, Campfire, Cursor, OpenCode,
+  Grok, fx) render it with `ToolOutput::as_text`: text blocks as their text, joined by a
+  blank line; image blocks as `[image: <media type>]` (never the base64); other blocks as
+  compact JSON. Any other structured result stays compact JSON. Antigravity and Cursor
+  desktop keep compact JSON text, because they parse it back into structured output.
 - **Tool inputs.** The Messages API requires `tool_use.input` to be an object,
   including calls already in the conversation history. Common → Claude Code
   wraps non-object inputs, such as Codex freeform tool text, as

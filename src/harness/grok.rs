@@ -798,7 +798,7 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> GrokSession {
                                 tool_call_id: tool_use_id.clone(),
                                 // Grok's tool_result content is a plain
                                 // string; structured outputs are flattened.
-                                content: Value::String(tool_output_string(content)),
+                                content: Value::String(content.as_text().into_owned()),
                                 extra: Map::new(),
                             }));
                             updates.tool_result(msg.timestamp, tool_use_id, content, *is_error);
@@ -1036,7 +1036,7 @@ impl UpdateLog {
     }
 
     fn tool_result(&mut self, ts: DateTime<Utc>, id: &str, content: &ToolOutput, is_error: bool) {
-        let text = tool_output_string(content);
+        let text = content.as_text();
         self.push(
             ts,
             "session/update",
@@ -1066,30 +1066,6 @@ impl UpdateLog {
 
     fn finish(self) -> Vec<Value> {
         self.lines
-    }
-}
-
-/// Grok stores tool results as plain strings. Anthropic-style block arrays
-/// flatten to their text; anything else structured becomes compact JSON.
-fn tool_output_string(content: &ToolOutput) -> String {
-    match content {
-        ToolOutput::Text(s) => s.clone(),
-        ToolOutput::Json(v) => {
-            let block_texts: Option<Vec<&str>> = v.as_array().and_then(|arr| {
-                arr.iter()
-                    .map(|b| {
-                        (b.get("type").and_then(Value::as_str) == Some("text"))
-                            .then(|| b.get("text").and_then(Value::as_str))
-                            .flatten()
-                    })
-                    .collect()
-            });
-            match block_texts {
-                Some(texts) if !texts.is_empty() => texts.join("\n\n"),
-                // Not a text-block array (or an empty one): compact JSON.
-                Some(_) | None => v.to_string(),
-            }
-        }
     }
 }
 

@@ -657,7 +657,7 @@ fn push_message_lines<'a>(
                         custom_tool_output(content, *is_error),
                     )
                 } else {
-                    ("function_call_output", tool_output_text(content))
+                    ("function_call_output", content.as_text().into_owned())
                 };
                 lines.push(meta_line_str(
                     ts,
@@ -1674,13 +1674,6 @@ fn parse_json_string_or_raw(raw: &str) -> Value {
 
 fn parse_optional_json_string(raw: Option<&str>) -> Value {
     raw.map_or(Value::Object(Map::new()), parse_json_string_or_raw)
-}
-
-fn tool_output_text(out: &ToolOutput) -> String {
-    match out {
-        ToolOutput::Text(s) => s.clone(),
-        ToolOutput::Json(v) => v.to_string(),
-    }
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {

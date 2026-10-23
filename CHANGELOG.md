@@ -23,6 +23,13 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
   teammates' `teamName`/`agentName`. Filled at discovery time, not only on load. Writing
   lineage into native formats is not implemented yet.
 
+### Fixed
+
+- Show tool results that are content-block arrays (every MCP result, screenshots) as their text, not
+  escaped JSON, in `view`, MCP `read_session`, search, and exports to Codex, pi, Campfire, Cursor,
+  OpenCode, Grok, and fx. Images in a tool result render as `[image: <media type>]` instead of their
+  whole base64 payload, which could push a session past the MCP read budget.
+
 ## [0.14.4](https://github.com/skillsynchq/txcript/compare/v0.14.3...v0.14.4) - 2026-09-13
 
 ### Fixed

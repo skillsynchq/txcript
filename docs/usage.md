@@ -206,7 +206,7 @@ An empty pattern returns documents newest-first. Tool outputs are excluded by de
 
 ### Text projection
 
-`txcript::text::to_text(&common)` is the projection behind [`txcript view`](#cli): a one-way, token-conscious rendering of `Transcript<Common>` for use as LLM context. It keeps messages, reasoning text, and compact tool calls/results; replay-only payloads (encrypted reasoning, usage accounting, inline image bytes) are omitted. `to_text_fragment(&common, &span)` renders a `Span` of the body, keeping each message's ordinal in the full session.
+`txcript::text::to_text(&common)` is the projection behind [`txcript view`](#cli): a one-way, token-conscious rendering of `Transcript<Common>` for use as LLM context. It keeps messages, reasoning text, and compact tool calls/results; replay-only payloads (encrypted reasoning, usage accounting, inline image bytes) are omitted. A tool result that is a content-block array (every MCP result) reads as its text, blocks separated by a blank line, with an image shown as `[image: <media type>]`; other structured results stay compact JSON. `to_text_fragment(&common, &span)` renders a `Span` of the body, keeping each message's ordinal in the full session.
 
 ## npm package
 

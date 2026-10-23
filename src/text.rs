@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::common::{Block, Message, Meta, Role, ToolOutput};
+use crate::common::{Block, Message, Meta, Role};
 use crate::{Common, Span, Transcript};
 
 /// Render a canonical transcript as compact, LLM-oriented text.
@@ -118,10 +118,7 @@ fn blocks<'a>(
                 let short_id = short_tool_id(tool_ids, next_tool_id, tool_use_id);
                 let error = if *is_error { " error" } else { "" };
                 let label = format!("result {short_id}{error}");
-                match content {
-                    ToolOutput::Text(text) => section(out, &label, text),
-                    ToolOutput::Json(value) => section(out, &label, &value.to_string()),
-                }
+                section(out, &label, &content.as_text());
             }
             Block::Image { source } => section(
                 out,
@@ -187,7 +184,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::common::{ImageSource, Message, Meta, StopReason, Tool, Usage};
+    use crate::common::{ImageSource, Message, Meta, StopReason, Tool, ToolOutput, Usage};
 
     fn transcript(body: Vec<Message>) -> Transcript<Common> {
         Transcript::new(

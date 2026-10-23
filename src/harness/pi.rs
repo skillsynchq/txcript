@@ -348,7 +348,7 @@ fn pi_payloads_for(
                             "role": "toolResult",
                             "toolCallId": tool_use_id,
                             "toolName": tool_name,
-                            "content": [{"type": "text", "text": tool_output_text(result)}],
+                            "content": [{"type": "text", "text": result.as_text()}],
                             "isError": is_error,
                             "timestamp": ts_ms,
                         }));
@@ -1093,13 +1093,6 @@ fn provider_api(model: &str) -> (&'static str, &'static str) {
         ("google", "google-generative-ai")
     } else {
         ("anthropic", "anthropic-messages")
-    }
-}
-
-fn tool_output_text(out: &ToolOutput) -> String {
-    match out {
-        ToolOutput::Text(s) => s.clone(),
-        ToolOutput::Json(v) => v.to_string(),
     }
 }
 

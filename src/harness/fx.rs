@@ -878,7 +878,7 @@ impl TurnBuilder {
                     content,
                     is_error,
                 } => {
-                    let output = tool_output_string(content);
+                    let output = content.as_text();
                     let bytes = output.len();
                     let tool_name = self
                         .tool_names
@@ -906,29 +906,6 @@ impl TurnBuilder {
                 _ => None,
             })
             .collect()
-    }
-}
-
-/// fx stores tool output as a plain string. Anthropic-style block arrays
-/// flatten to their text; anything else structured becomes compact JSON.
-fn tool_output_string(content: &ToolOutput) -> String {
-    match content {
-        ToolOutput::Text(s) => s.clone(),
-        ToolOutput::Json(v) => {
-            let block_texts: Option<Vec<&str>> = v.as_array().and_then(|arr| {
-                arr.iter()
-                    .map(|b| {
-                        (b.get("type").and_then(Value::as_str) == Some("text"))
-                            .then(|| b.get("text").and_then(Value::as_str))
-                            .flatten()
-                    })
-                    .collect()
-            });
-            match block_texts {
-                Some(texts) if !texts.is_empty() => texts.join("\n\n"),
-                Some(_) | None => v.to_string(),
-            }
-        }
     }
 }
 
