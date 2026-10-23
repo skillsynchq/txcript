@@ -313,6 +313,7 @@ fn result_to_output(result: &Value, is_error: bool) -> ToolOutput {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn messages_to_records(_meta: &Meta, messages: &[Message]) -> Vec<Value> {
     let mut records = Vec::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
@@ -344,17 +345,21 @@ fn messages_to_records(_meta: &Meta, messages: &[Message]) -> Vec<Value> {
                         }
                         Block::Image { .. } | Block::Artifact { .. } | Block::Thinking { .. } => {}
                         Block::ToolUse { id, tool } => {
-                            // Rare on user turns (e.g. slash commands); emit as assistant-shaped.
-                            let (native_name, input) = denormalize_tool_use(id, tool);
-                            tool_names.insert(id.clone(), native_name.clone());
-                            records.push(json!({
-                                "role": "assistant",
-                                "message": {"content": [{
-                                    "type": "tool_use",
-                                    "name": native_name,
-                                    "input": input,
-                                }]},
-                            }));
+                            if let Some(text) = tool.command_display() {
+                                text_blocks.push(json!({"type": "text", "text": text}));
+                            } else {
+                                // Rare on user turns (e.g. non-command tool calls); emit as assistant-shaped.
+                                let (native_name, input) = denormalize_tool_use(id, tool);
+                                tool_names.insert(id.clone(), native_name.clone());
+                                records.push(json!({
+                                    "role": "assistant",
+                                    "message": {"content": [{
+                                        "type": "tool_use",
+                                        "name": native_name,
+                                        "input": input,
+                                    }]},
+                                }));
+                            }
                         }
                     }
                 }

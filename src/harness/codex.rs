@@ -583,7 +583,7 @@ fn messages_to_lines(meta: &Meta, messages: &[Message]) -> Vec<Line> {
     lines
 }
 
-/// Emit the `response_item` (and paired display `event_msg`) lines for one message.
+#[allow(clippy::too_many_lines)]
 fn push_message_lines<'a>(
     lines: &mut Vec<Line>,
     msg: &'a Message,
@@ -639,12 +639,19 @@ fn push_message_lines<'a>(
                 ));
             }
             Block::ToolUse { id, tool } => {
-                if is_patch_tool(tool) {
-                    pending_patch_ids.insert(id.as_str());
+                if msg.role == Role::User
+                    && let Some(cmd) = tool.command_display()
+                {
+                    message_content.push(json!({ "type": "input_text", "text": cmd }));
+                    text_chunks.push(cmd);
                 } else {
-                    pending_patch_ids.remove(id.as_str());
+                    if is_patch_tool(tool) {
+                        pending_patch_ids.insert(id.as_str());
+                    } else {
+                        pending_patch_ids.remove(id.as_str());
+                    }
+                    push_tool_use_lines(lines, ts, id, tool);
                 }
-                push_tool_use_lines(lines, ts, id, tool);
             }
             Block::ToolResult {
                 tool_use_id,
