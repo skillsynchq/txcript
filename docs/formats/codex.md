@@ -113,8 +113,14 @@ applies, at discovery time as well as on load — reading the header line is all
 paired with `thread_source: "guardian_review"`) and any other subagent shape. No `source.subagent`
 but a top-level `parent_thread_id` is also a spawn. Otherwise, `forked_from_id` is a fork. A
 subagent thread forked from its parent's history at spawn time carries both fields; spawn wins.
-Writing lineage back into a rollout is not implemented yet — `from_common` never emits
-`source`/`parent_thread_id`/`forked_from_id`.
+`from_common` writes a Fork lineage back as `forked_from_id`, so a fork survives a round trip
+through Common. It writes nothing for a spawn, since `source.subagent` would turn the copy into
+a subagent thread, and nothing for a continue, which Codex has no field for. It also skips a
+parent that isn't a UUID, because Codex rejects a `session_meta` whose `forked_from_id` isn't
+one. `source` is always `"cli"` and `parent_thread_id` is never written. When `continue` or
+`crop` writes a copy into Codex from a Codex session, the copy is a fork of that session and
+names it in `forked_from_id`. A copy from another harness gets no lineage, because its source
+id doesn't name a Codex thread.
 
 ## Caveats
 
