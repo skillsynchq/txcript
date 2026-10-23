@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 
 use crate::common::{ArtifactSource, Block, Meta};
 use crate::harness::{
-    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, pi,
+    amp, antigravity, campfire, claude_code, codex, cowork, cursor, dsh, fx, grok, grok_bot, pi,
 };
 
 #[cfg(feature = "chatgpt")]
@@ -132,6 +132,8 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
         grok_bot::GrokBotStore::default_root(),
         &mut out,
     );
+    on_store(HarnessId::Dsh, out.len());
+    scan(HarnessId::Dsh, dsh::DshStore::default_root(), &mut out);
     on_store(HarnessId::Fx, out.len());
     scan(HarnessId::Fx, fx::FxStore::default_root(), &mut out);
     on_store(HarnessId::Amp, out.len());
@@ -394,6 +396,7 @@ impl Session {
             (HarnessId::Cursor, Locator::Path(p)) => go(cursor::CursorStore::default_root(), p),
             (HarnessId::Grok, Locator::Path(p)) => go(grok::GrokStore::default_root(), p),
             (HarnessId::GrokBot, Locator::Path(p)) => go(grok_bot::GrokBotStore::default_root(), p),
+            (HarnessId::Dsh, Locator::Path(p)) => go(dsh::DshStore::default_root(), p),
             (HarnessId::Fx, Locator::Path(p)) => go(fx::FxStore::default_root(), p),
             (HarnessId::Amp, Locator::Path(p)) => go(amp::AmpStore::default_root(), p),
             (HarnessId::Antigravity, Locator::Path(p)) => {
@@ -453,6 +456,7 @@ impl Session {
             (HarnessId::Cursor, Locator::Path(p)) => go(cursor::CursorStore::default_root(), p),
             (HarnessId::Grok, Locator::Path(p)) => go(grok::GrokStore::default_root(), p),
             (HarnessId::GrokBot, Locator::Path(p)) => go(grok_bot::GrokBotStore::default_root(), p),
+            (HarnessId::Dsh, Locator::Path(p)) => go(dsh::DshStore::default_root(), p),
             (HarnessId::Fx, Locator::Path(p)) => go(fx::FxStore::default_root(), p),
             (HarnessId::Amp, Locator::Path(p)) => go(amp::AmpStore::default_root(), p),
             (HarnessId::Antigravity, Locator::Path(p)) => {
@@ -522,6 +526,7 @@ pub fn fingerprints(sessions: &[Session]) -> Vec<String> {
             HarnessId::Cursor => group.files(cursor::CursorStore::default_root()),
             HarnessId::Grok => group.files(grok::GrokStore::default_root()),
             HarnessId::GrokBot => group.files(grok_bot::GrokBotStore::default_root()),
+            HarnessId::Dsh => group.files(dsh::DshStore::default_root()),
             HarnessId::Fx => group.files(fx::FxStore::default_root()),
             HarnessId::Amp => group.files(amp::AmpStore::default_root()),
             HarnessId::Antigravity => group.files(antigravity::AntigravityStore::default_root()),
@@ -851,6 +856,10 @@ pub fn write_with(
                 })
             }
         }
+        HarnessId::Dsh => Err(Error::Unconvertible {
+            harness: "dsh",
+            detail: "DeepSeek Harness session storage is read-only and dsh has no documented session import command; sessions can be converted from dsh, but not continued into it".to_string(),
+        }),
         HarnessId::Fx => go(
             fx::FxStore::default_root(),
             fx::FxStore::new,
@@ -1134,6 +1143,10 @@ pub fn resume_command(harness: HarnessId, id: &str) -> (String, Vec<String>) {
             // the session is in the Agents sidebar.
             HarnessId::CursorDesktop => ("cursor".into(), Vec::new()),
             HarnessId::Grok => ("grok".into(), vec!["--resume".into(), id]),
+            HarnessId::Dsh => (
+                "dsh".into(),
+                vec!["--profile".into(), "tui".into(), "--resume".into(), id],
+            ),
             HarnessId::Fx => ("fx".into(), vec!["--resume".into(), id]),
             HarnessId::Hermes => ("hermes".into(), vec!["--resume".into(), id]),
             HarnessId::Amp => ("amp".into(), vec!["threads".into(), "continue".into(), id]),
