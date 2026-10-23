@@ -125,6 +125,7 @@ writeFileSync("rollout.jsonl", output);
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | 지원 | 로컬 게이트웨이 사용 |
 | [fx](../formats/fx.md) | `fx` | 지원 | 지원 |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | 지원 | 지원 |
+| [uji](../formats/uji.md) | `uji` | 지원 | 지원 |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | 지원 | 미지원 |
 | [Amp](../formats/amp.md) | `amp` | 지원 | 미지원 |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | 온라인 계정 | 미지원 |
