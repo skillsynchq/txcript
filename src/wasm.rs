@@ -15,13 +15,13 @@ use wasm_bindgen::prelude::*;
 use crate::common;
 use crate::harness::{
     amp, antigravity, campfire, chatgpt, claude_chat, claude_code, codex, cowork, cowork_remote,
-    cursor, cursor_desktop, fx, grok, grok_bot, hermes, opencode, pi, simple,
+    cursor, cursor_desktop, fx, grok, grok_bot, hermes, opencode, pi, qoder, simple,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
 /// Continue/convert a session from one harness's native text into another's.
 ///
-/// `input` is the source session text (JSONL for `claude_code`/codex/pi/campfire,
+/// `input` is the source session text (JSONL for `claude_code`/codex/pi/campfire/qoder,
 /// one live conversation detail object for `claude_chat` or `chatgpt`,
 /// a session-and-events document for `cowork_remote`,
 /// the Cursor JSON DB export for cursor, the JSON dump of the session's
@@ -35,7 +35,7 @@ use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 /// record, transcript and audit log for cowork); `from`/`to` are harness
 /// names (`"claude_code"`, `"claude_chat"`, `"cowork_remote"`, `"chatgpt"`, `"codex"`, `"opencode"`, `"pi"`, `"campfire"`,
 /// `"cursor"`, `"cursor_desktop"`, `"grok"`, `"grok_bot"`, `"fx"`, `"hermes"`, `"amp"`,
-/// `"antigravity"`, `"simple"`, `"cowork"`). Returns the target harness's
+/// `"antigravity"`, `"qoder"`, `"simple"`, `"cowork"`). Returns the target harness's
 /// native text.
 #[wasm_bindgen]
 pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
@@ -215,6 +215,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::Hermes => go::<hermes::Hermes>(text),
         HarnessId::Amp => go::<amp::Amp>(text),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(text),
+        HarnessId::Qoder => go::<qoder::Qoder>(text),
         HarnessId::Simple => go::<simple::Simple>(text),
         HarnessId::Cowork => go::<cowork::Cowork>(text),
     }
@@ -241,6 +242,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::Hermes => go::<hermes::Hermes>(common),
         HarnessId::Amp => go::<amp::Amp>(common),
         HarnessId::Antigravity => go::<antigravity::Antigravity>(common),
+        HarnessId::Qoder => go::<qoder::Qoder>(common),
         HarnessId::Simple => go::<simple::Simple>(common),
         HarnessId::Cowork => go::<cowork::Cowork>(common),
     }

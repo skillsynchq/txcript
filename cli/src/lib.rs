@@ -69,7 +69,7 @@ mod pager;
 mod view;
 
 pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
-     amp, antigravity, simple, cowork, cowork_remote";
+     amp, antigravity, qoder, simple, cowork, cowork_remote";
 
 /// The `txcript` binary's command line.
 #[derive(Parser)]
@@ -1322,6 +1322,7 @@ mod style {
             HarnessId::Hermes => "\x1b[93m",     // bright yellow
             HarnessId::Amp => "\x1b[95m",        // bright magenta
             HarnessId::Antigravity => "\x1b[94m", // bright blue
+            HarnessId::Qoder => "\x1b[38;5;99m", // violet
             HarnessId::Simple => "\x1b[92m",     // bright green
             HarnessId::Cowork => "\x1b[38;5;208m", // orange
         }

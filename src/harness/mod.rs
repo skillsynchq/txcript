@@ -23,6 +23,7 @@ pub mod grok_bot;
 pub mod hermes;
 pub mod opencode;
 pub mod pi;
+pub mod qoder;
 pub mod simple;
 
 pub(crate) mod jsonl;

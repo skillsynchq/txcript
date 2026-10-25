@@ -460,12 +460,13 @@ pub enum HarnessId {
     Hermes,
     Amp,
     Antigravity,
+    Qoder,
     Simple,
     Cowork,
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 18] = [
+    pub const ALL: [HarnessId; 19] = [
         HarnessId::ClaudeCode,
         HarnessId::ClaudeChat,
         HarnessId::CoworkRemote,
@@ -482,6 +483,7 @@ impl HarnessId {
         HarnessId::Hermes,
         HarnessId::Amp,
         HarnessId::Antigravity,
+        HarnessId::Qoder,
         HarnessId::Simple,
         HarnessId::Cowork,
     ];
@@ -506,6 +508,7 @@ impl HarnessId {
             HarnessId::Hermes => "hermes",
             HarnessId::Amp => "amp",
             HarnessId::Antigravity => "antigravity",
+            HarnessId::Qoder => "qoder",
             HarnessId::Simple => "simple",
             HarnessId::Cowork => "cowork",
         }
@@ -554,6 +557,7 @@ impl FromStr for HarnessId {
             "antigravity" | "agy" | "antigravity_cli" | "antigravity-cli" | "anti-gravity" => {
                 Ok(HarnessId::Antigravity)
             }
+            "qoder" | "qodercli" | "qoder_cli" | "qoder-cli" => Ok(HarnessId::Qoder),
             "simple" | "simple_json" | "simple-json" => Ok(HarnessId::Simple),
             "cowork" | "claude_cowork" | "claude-cowork" | "claude_desktop" | "claude-desktop" => {
                 Ok(HarnessId::Cowork)
