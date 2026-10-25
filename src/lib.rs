@@ -17,8 +17,11 @@
 //! - [`Transcript`], [`Harness`], [`Codec`], [`Store`] — the generic type and
 //!   the traits over it.
 //! - [`harness`] — one module per implemented harness.
+//! - [`dispatch`] — parse or render a harness's native text, chosen by
+//!   [`HarnessId`] at run time.
 
 pub mod common;
+pub mod dispatch;
 pub mod error;
 pub mod harness;
 #[cfg(not(target_arch = "wasm32"))]
