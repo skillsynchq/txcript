@@ -15,13 +15,23 @@
 //!     [--metadata <spec>]                   #   harness mint options (repeatable;
 //!                                           #   key=value or JSON object; grok_bot
 //!                                           #   uses name/description)
+//!     [--quiet]                             #   no stderr note about a lossy conversion
+//!     [--strict]                            #   refuse to convert when content would be lost
+//!     [--dry-run]                           #   like `check`: report, write nothing
 //! txcript continue <file|->[#range]     # continue a Simple document (file, or stdin
 //!     --with <harness> [...]                #   for `-`) into <harness>; see
 //!                                           #   docs/formats/simple.md
 //!                                           #   --with grok_bot never launches a CLI
+//! txcript check <id|file|->[#range]     # what converting would lose; writes nothing
+//!     [--with <harness>]...                 #   one detailed report per harness (default:
+//!                                           #   a matrix of every writable harness)
+//!     [--from <harness>]                    #   scope the id lookup to one harness
+//!     [--json] [--detail]                   #   machine-readable; longer examples
+//!     [--fail-on <none|content|accounting|metadata>]  # exit 1 at or above this severity
 //! txcript crop <id>[#range]             # interactively cut messages and save a copy
 //!     [--with <harness>]                    #   optionally convert the cropped copy
 //!     [--from <harness>]                    #   scope the source lookup
+//!     [--quiet] [--strict]                  #   as for `continue`
 //! txcript view <id>[#range]             # view a session; compact text when piped
 //!     [--from <harness>]                    #   scope the id lookup to one harness
 //!     [--no-pager]                          #   print the terminal view directly
@@ -58,6 +68,7 @@ use txcript::harness::{amp, chatgpt, claude_chat, cowork_remote, simple};
 use txcript::{Codec, Common, HarnessId, Store, TextCodec, Transcript, local};
 
 pub mod cache;
+mod check;
 mod draft;
 mod editpane;
 mod export;
@@ -67,6 +78,8 @@ mod graphics;
 pub mod mcp;
 mod pager;
 mod view;
+
+pub use check::FailOn;
 
 pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
      amp, antigravity, simple, cowork, cowork_remote";
@@ -184,6 +197,65 @@ pub enum SessionCommand {
         /// recognizes `name` and `description` for the minted agent profile.
         #[arg(long, value_name = "SPEC")]
         metadata: Vec<String>,
+        /// Don't print the note about what a lossy conversion drops
+        #[arg(long)]
+        quiet: bool,
+        /// Refuse to convert when content (text, thinking, tool calls,
+        /// results, images) would be lost or changed: error out before
+        /// writing or launching anything. Same as `check --fail-on content`
+        #[arg(long)]
+        strict: bool,
+        /// Report what would be written and what it would lose, as
+        /// `check` does, then stop without writing or launching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Report what converting a session into a harness would lose
+    ///
+    /// Without --with, compares every harness `continue --with` can write, one
+    /// row each. With --with (repeatable), prints a full report per harness.
+    /// Nothing is written and no agent is launched. The source is resolved as
+    /// `continue` does: a session id or title, a Simple document file, or `-`
+    /// for stdin, with an optional `#range` so the report covers exactly what
+    /// would be written.
+    ///
+    /// The report is codec-level: it converts the session to the target's
+    /// native format and reads it back, so it shows what the format stores,
+    /// not what a store adds around it (a fresh id and timestamp, artifact
+    /// files, a re-homed working directory). Content is text, thinking, tool
+    /// calls, results, images. Accounting is usage, stop reasons, per-message
+    /// models, thinking signatures. Metadata is title, model, branch, working
+    /// directory, timestamps.
+    ///
+    /// By default the report shows counts and short examples only (80
+    /// characters, never a tool result or image). --detail adds longer
+    /// examples, a preview of changed tool results, and message numbers.
+    /// Exit status is 0, or 1 when a target cannot be assessed or --fail-on's
+    /// severity is reached.
+    Check {
+        /// Session id (any unambiguous prefix) or its exact title; or a Simple
+        /// document (a file path, `-` for stdin). Takes an optional `#range`
+        /// of 1-based inclusive message numbers (`abc#5-12`, `#7`, `#5-`)
+        // Other: without a hint, generated completions fall back to filenames.
+        #[arg(value_hint = clap::ValueHint::Other)]
+        id: String,
+        /// Report on this harness (repeatable); without it, a table of every
+        /// writable harness
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        with: Vec<HarnessId>,
+        /// Only look for the session in this harness
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        from: Option<HarnessId>,
+        /// Print a versioned JSON document (`schema: 1`) instead of text
+        #[arg(long)]
+        json: bool,
+        /// Longer examples, a preview of changed tool results, and the first
+        /// message each difference appears in
+        #[arg(long)]
+        detail: bool,
+        /// Exit 1 when a target's severity reaches this level
+        #[arg(long, value_enum, value_name = "SEVERITY", default_value = "none")]
+        fail_on: FailOn,
     },
     /// Interactively crop a session into a new, resumable session
     ///
@@ -204,6 +276,13 @@ pub enum SessionCommand {
         /// Only look for the source session in this harness
         #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
         from: Option<HarnessId>,
+        /// Don't print the note about what a lossy conversion drops
+        #[arg(long)]
+        quiet: bool,
+        /// Refuse to save when content would be lost or changed in the
+        /// target harness; checked when you save, before anything is written
+        #[arg(long)]
+        strict: bool,
     },
     /// View a session in the terminal or print compact text to a pipe
     ///
@@ -401,8 +480,53 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             out,
             no_resume,
             metadata,
-        } => cmd_continue(&id, with, from, out.as_ref(), no_resume, &metadata),
-        SessionCommand::Crop { source, with, from } => cmd_crop(&source, with, from),
+            quiet,
+            strict,
+            dry_run,
+        } => {
+            if dry_run {
+                return check::cmd_dry_run(&id, with, from, strict);
+            }
+            let gate = check::Gate {
+                quiet,
+                strict,
+                reference: &id,
+                from,
+            };
+            cmd_continue(&id, with, from, out.as_ref(), no_resume, &metadata, gate)
+        }
+        SessionCommand::Check {
+            id,
+            with,
+            from,
+            json,
+            detail,
+            fail_on,
+        } => check::cmd_check(
+            &id,
+            &with,
+            from,
+            check::Present {
+                json,
+                detail,
+                fail_on: fail_on.threshold(),
+            },
+        ),
+        SessionCommand::Crop {
+            source,
+            with,
+            from,
+            quiet,
+            strict,
+        } => {
+            let gate = check::Gate {
+                quiet,
+                strict,
+                reference: &source,
+                from,
+            };
+            cmd_crop(&source, with, from, gate)
+        }
         SessionCommand::View {
             source,
             from,
@@ -1056,12 +1180,20 @@ mod crop_command_tests {
         ])
         .unwrap();
 
-        let Command::Session(SessionCommand::Crop { source, from, with }) = cli.command else {
+        let Command::Session(SessionCommand::Crop {
+            source,
+            from,
+            with,
+            quiet,
+            strict,
+        }) = cli.command
+        else {
             panic!("expected crop command");
         };
         assert_eq!(source, "session-123#2-4");
         assert_eq!(from, Some(HarnessId::ClaudeCode));
         assert_eq!(with, Some(HarnessId::Codex));
+        assert!(!quiet && !strict);
     }
 
     #[test]
@@ -1336,6 +1468,7 @@ fn cmd_crop(
     source: &str,
     with: Option<HarnessId>,
     from: Option<HarnessId>,
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("crop is interactive and requires a terminal".to_string());
@@ -1353,7 +1486,7 @@ fn cmd_crop(
         let target = with.unwrap_or(source_harness);
         ensure_crop_target(target)?;
         let (common, request) = loaded?;
-        return crop_loaded(&common, source_harness, target, request.as_ref());
+        return crop_loaded(&common, source_harness, target, request.as_ref(), gate);
     }
     let sessions = discover_with_spinner(from)?;
     let (id, request) = match crop_ref(source) {
@@ -1365,13 +1498,13 @@ fn cmd_crop(
             let target = with.unwrap_or(found.harness);
             ensure_crop_target(target)?;
             let common = found.read().map_err(|error| error.to_string())?;
-            crop_loaded(&common, found.harness, target, request.as_ref())
+            crop_loaded(&common, found.harness, target, request.as_ref(), gate)
         }
         None if matches!(from, None | Some(HarnessId::Amp)) && is_amp_thread_id(id) => {
             let target = with.unwrap_or(HarnessId::Amp);
             ensure_crop_target(target)?;
             let common = load_amp_server_thread(id)?;
-            crop_loaded(&common, HarnessId::Amp, target, request.as_ref())
+            crop_loaded(&common, HarnessId::Amp, target, request.as_ref(), gate)
         }
         None => Err(match from {
             Some(harness) => format!(
@@ -1388,6 +1521,7 @@ fn crop_loaded(
     source: HarnessId,
     target: HarnessId,
     request: Option<&fragment::SpanReq>,
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
     ensure_crop_target(target)?;
     let total = common.body.len();
@@ -1410,7 +1544,7 @@ fn crop_loaded(
         .map_err(|error| error.to_string())?;
     fresh_identity(&mut cropped, target, None);
     stamp_live_cwd(&mut cropped, None);
-    let cropped_id = write_and_report(source, target, &cropped, None, None)?;
+    let cropped_id = write_and_report(source, target, &cropped, None, None, gate)?;
     let edited = match outcome.edited {
         0 => String::new(),
         1 => " (1 message edited)".to_string(),
@@ -1431,6 +1565,7 @@ fn cmd_continue(
     out: Option<&PathBuf>,
     no_resume: bool,
     metadata_specs: &[String],
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
     let metadata = parse_metadata_specs(metadata_specs)?;
     let metadata =
@@ -1442,17 +1577,9 @@ fn cmd_continue(
     // input directly, so no session can shadow it.
     if let Some((input, request)) = document_source(id) {
         if from.is_some() {
-            return Err(
-                "--from scopes the search for a local session; a Simple document \
-                 is its own input and takes --with only"
-                    .to_string(),
-            );
+            return Err(FROM_WITH_DOCUMENT.to_string());
         }
-        let target = with.ok_or_else(|| {
-            "a Simple document has no harness of its own to resume; \
-             pass --with <harness> (e.g. --with claude_code)"
-                .to_string()
-        })?;
+        let target = with.ok_or_else(|| DOCUMENT_NEEDS_WITH.to_string())?;
         let resume = wants_resume(target, out.is_some(), no_resume);
         return continue_document(
             &input,
@@ -1461,6 +1588,7 @@ fn cmd_continue(
             out.map(PathBuf::as_path),
             resume,
             metadata,
+            gate,
         );
     }
 
@@ -1479,6 +1607,7 @@ fn cmd_continue(
             out.map(PathBuf::as_path),
             wants_resume(target, out.is_some(), no_resume),
             metadata,
+            gate,
         );
     }
     let sessions = discover_with_spinner(from)?;
@@ -1503,6 +1632,7 @@ fn cmd_continue(
                 out.map(PathBuf::as_path),
                 wants_resume(target, out.is_some(), no_resume),
                 metadata,
+                gate,
             )
         }
         // Modern Amp CLIs are server-authoritative and write no local thread
@@ -1517,21 +1647,35 @@ fn cmd_continue(
                 out.map(PathBuf::as_path),
                 wants_resume(target, out.is_some(), no_resume),
                 metadata,
+                gate,
             )
         }
-        None => Err(match from {
-            Some(h) => format!("no {h} session matches `{src}` (try `{} list`)", program()),
-            // A path-looking argument that named no file falls through to the
-            // session lookup; say so, or the "no session" alone misleads.
-            None if src.contains(['/', '\\']) => format!(
-                "no local session matches `{src}`, and no such file exists \
-                 (a Simple document must be an existing file, or `-` for stdin)"
-            ),
-            None => format!(
-                "no local session matches `{src}` (try `{} list`)",
-                program()
-            ),
-        }),
+        None => Err(no_session_error(from, src)),
+    }
+}
+
+/// `--from` scopes the lookup of a local session, which a document is not.
+const FROM_WITH_DOCUMENT: &str = "--from scopes the search for a local session; a Simple document \
+     is its own input and takes --with only";
+
+/// A document has no harness to resume in.
+const DOCUMENT_NEEDS_WITH: &str = "a Simple document has no harness of its own to resume; \
+     pass --with <harness> (e.g. --with claude_code)";
+
+/// The error for a session reference that matched nothing.
+fn no_session_error(from: Option<HarnessId>, src: &str) -> String {
+    match from {
+        Some(h) => format!("no {h} session matches `{src}` (try `{} list`)", program()),
+        // A path-looking argument that named no file falls through to the
+        // session lookup; say so, or the "no session" alone misleads.
+        None if src.contains(['/', '\\']) => format!(
+            "no local session matches `{src}`, and no such file exists \
+             (a Simple document must be an existing file, or `-` for stdin)"
+        ),
+        None => format!(
+            "no local session matches `{src}` (try `{} list`)",
+            program()
+        ),
     }
 }
 
@@ -1628,12 +1772,40 @@ fn continue_document(
     out: Option<&std::path::Path>,
     resume: bool,
     metadata: Option<&serde_json::Value>,
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
-    let target = with.ok_or_else(|| {
-        "a Simple document has no harness of its own to resume; \
-         pass --with <harness> (e.g. --with claude_code)"
-            .to_string()
-    })?;
+    let target = with.ok_or_else(|| DOCUMENT_NEEDS_WITH.to_string())?;
+    let common = load_document(input)?;
+
+    let mut copy = match span_req {
+        Some(req) => fragment::sliced(&common, req)?,
+        None => common,
+    };
+    fresh_identity(&mut copy, target, out);
+    if copy.meta.id.is_empty() {
+        // An `--out` export keeps the source identity — which stdin may not
+        // carry at all. The target store still needs a file name.
+        copy.meta.id = uuid::Uuid::new_v4().to_string();
+    }
+    // A document without a usable recorded cwd continues *here*: the target
+    // stores shard by cwd, and "the directory the user ran txcript in" is the
+    // only sensible home for a transcript that never had one.
+    stamp_live_cwd(&mut copy, out);
+    let resume_id = write_and_report(HarnessId::Simple, target, &copy, out, metadata, gate)?;
+    // Stdin was consumed by the document; hand the launched harness the
+    // terminal instead, or an interactive resume would read EOF.
+    let stdin_tty = matches!(input, DocInput::Stdin);
+    launch_via(
+        target,
+        &resume_id,
+        copy.meta.cwd.as_deref(),
+        resume,
+        stdin_tty,
+    )
+}
+
+/// Read a Simple document from stdin or a file into the canonical model.
+fn load_document(input: &DocInput) -> Result<Transcript<Common>, String> {
     let text = match input {
         DocInput::Stdin => {
             let mut buffer = String::new();
@@ -1651,33 +1823,7 @@ fn continue_document(
         DocInput::Stdin => None,
         DocInput::File(path) => Some(path.as_path()).filter(|p| p.is_file()),
     };
-    let common = document_to_common(&text, origin)?;
-
-    let mut copy = match span_req {
-        Some(req) => fragment::sliced(&common, req)?,
-        None => common,
-    };
-    fresh_identity(&mut copy, target, out);
-    if copy.meta.id.is_empty() {
-        // An `--out` export keeps the source identity — which stdin may not
-        // carry at all. The target store still needs a file name.
-        copy.meta.id = uuid::Uuid::new_v4().to_string();
-    }
-    // A document without a usable recorded cwd continues *here*: the target
-    // stores shard by cwd, and "the directory the user ran txcript in" is the
-    // only sensible home for a transcript that never had one.
-    stamp_live_cwd(&mut copy, out);
-    let resume_id = write_and_report(HarnessId::Simple, target, &copy, out, metadata)?;
-    // Stdin was consumed by the document; hand the launched harness the
-    // terminal instead, or an interactive resume would read EOF.
-    let stdin_tty = matches!(input, DocInput::Stdin);
-    launch_via(
-        target,
-        &resume_id,
-        copy.meta.cwd.as_deref(),
-        resume,
-        stdin_tty,
-    )
+    document_to_common(&text, origin)
 }
 
 /// Parse a Simple document into the canonical model, backfilling an empty id
@@ -1806,6 +1952,7 @@ fn continue_amp_server_thread(
     out: Option<&std::path::Path>,
     resume: bool,
     metadata: Option<&serde_json::Value>,
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
     let common = load_amp_server_thread(id)?;
 
@@ -1817,7 +1964,7 @@ fn continue_amp_server_thread(
             let mut copy = common.clone();
             fresh_identity(&mut copy, target, out);
             stamp_live_cwd(&mut copy, out);
-            write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
+            write_and_report(HarnessId::Amp, target, &copy, out, metadata, gate)?
         }
         // A sliced continue always rewrites — the server thread can't resume
         // a subset of itself in place.
@@ -1825,7 +1972,7 @@ fn continue_amp_server_thread(
             let mut copy = fragment::sliced(&common, req)?;
             fresh_identity(&mut copy, target, out);
             stamp_live_cwd(&mut copy, out);
-            write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
+            write_and_report(HarnessId::Amp, target, &copy, out, metadata, gate)?
         }
     };
     launch(target, &resume_id, common.meta.cwd.as_deref(), resume)
@@ -1842,6 +1989,7 @@ fn continue_session(
     out: Option<&std::path::Path>,
     resume: bool,
     metadata: Option<&serde_json::Value>,
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
     let target = with.unwrap_or(found.harness);
     ensure_resumable_source(found.harness, target)?;
@@ -1854,20 +2002,21 @@ fn continue_session(
             let mut common = found.read().map_err(|e| e.to_string())?;
             fresh_identity(&mut common, target, out);
             stamp_live_cwd(&mut common, out);
-            write_and_report(found.harness, target, &common, out, metadata)?
+            write_and_report(found.harness, target, &common, out, metadata, gate)?
         }
         (Some(req), _) => {
             let common = found.read().map_err(|e| e.to_string())?;
             let mut copy = fragment::sliced(&common, req)?;
             fresh_identity(&mut copy, target, out);
             stamp_live_cwd(&mut copy, out);
-            write_and_report(found.harness, target, &copy, out, metadata)?
+            write_and_report(found.harness, target, &copy, out, metadata, gate)?
         }
     };
 
     launch(target, &resume_id, found.meta.cwd.as_deref(), resume)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn continue_loaded_remote(
     common: Transcript<Common>,
     source: HarnessId,
@@ -1876,6 +2025,7 @@ fn continue_loaded_remote(
     out: Option<&std::path::Path>,
     resume: bool,
     metadata: Option<&serde_json::Value>,
+    gate: check::Gate<'_>,
 ) -> Result<ExitCode, String> {
     let cwd = common.meta.cwd.clone();
     let mut copy = match span_req {
@@ -1884,7 +2034,7 @@ fn continue_loaded_remote(
     };
     fresh_identity(&mut copy, target, out);
     stamp_live_cwd(&mut copy, out);
-    let resume_id = write_and_report(source, target, &copy, out, metadata)?;
+    let resume_id = write_and_report(source, target, &copy, out, metadata, gate)?;
     launch(target, &resume_id, cwd.as_deref(), resume)
 }
 
@@ -1981,7 +2131,10 @@ fn write_and_report(
     common: &Transcript<Common>,
     out: Option<&std::path::Path>,
     metadata: Option<&serde_json::Value>,
+    gate: check::Gate<'_>,
 ) -> Result<String, String> {
+    // Measured on exactly what is about to be written, before anything is.
+    let note = gate.before_write(target, common)?;
     let written = local::write_with(
         target,
         common,
@@ -2000,6 +2153,9 @@ fn write_and_report(
         // shed the quotes it puts around paths.
         style::dim(written.location.trim_matches('"'), on)
     );
+    if let Some(note) = note {
+        eprintln!("{}", style::scrub(&note));
+    }
     Ok(written.id)
 }
 
@@ -2509,6 +2665,7 @@ mod query {
                     None,
                     with != Some(HarnessId::GrokBot),
                     None,
+                    super::check::Gate::note_only(&session.meta.id),
                 )
             }
         }

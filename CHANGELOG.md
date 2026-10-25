@@ -17,6 +17,7 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 
 ### Added
 
+- Add `txcript check <id|file|->[#range] [--with <harness>]...`, a conversion fidelity report: what converting a session into each harness would lose, change, or make up, before any copy is written. A table of every writable harness by default, a full report per `--with`, `--json` (schema 1), `--detail`, and `--fail-on <none|content|accounting|metadata>` for CI. `continue` and `crop` print a one-line note on stderr when the chosen target loses something (`--quiet` silences it), `continue --strict` refuses to convert when content would be lost, and `continue --dry-run` is `check` for the same arguments. The library gains `txcript::fidelity` (`assess`, `check_all`) and `txcript::dispatch` (the text codec for a `HarnessId`, shared with the WASM bindings). The measurement is codec-level; see the [fidelity docs](docs/usage.md#fidelity) and the [per-harness table](docs/formats/README.md#conversion-fidelity).
 - Add read-side session lineage (`Meta::lineage`): fork/continue/spawn relationships read from
   Codex's `session_meta` (subagent spawns, guardian review, `/fork`), pi/Campfire's
   `parentSession` (`/fork`, `/clone`), OpenCode's `session.parent_id`, and Claude Code

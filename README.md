@@ -152,6 +152,8 @@ The common model represents messages, reasoning, tool calls and results, images,
 
 Conversion carries conversation history. The destination supplies its own system instructions and tools, and project files must be available separately. Native load/save and conversion have different preservation guarantees; see each [format's caveats](docs/formats/README.md).
 
+To see what a conversion would lose before you do it, run `txcript check <session> --with <harness>`; `continue` also prints a one-line note when the target drops something ([fidelity](docs/usage.md#fidelity)).
+
 ## Documentation
 
 - [CLI reference](docs/usage.md#cli): commands, search, cropping, MCP, and shell integration.

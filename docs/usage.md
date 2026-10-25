@@ -17,11 +17,21 @@ txcript continue <id>[#range]            # continue <id>, then launch its harnes
     [--from <harness>]                    #   scope the id lookup to one harness
     [--out <dir>]                         #   write under <dir>; implies --no-resume
     [--no-resume]                         #   write the session but don't launch
+    [--quiet]                             #   no stderr note about what a conversion loses
+    [--strict]                            #   refuse to convert if content would be lost
+    [--dry-run]                           #   report what it would cost; write nothing
 txcript continue <file|->[#range]        # continue a Simple document instead:
     --with <harness> [...]                #   a file, or stdin (`-`), from any agent
+txcript check <id|file|->[#range]        # what would converting lose? writes nothing
+    [--with <harness>]...                 #   a full report per harness (default: a table
+                                          #   of every harness `continue` can write)
+    [--from <harness>]                    #   scope the id lookup to one harness
+    [--json] [--detail]                   #   machine-readable; longer examples
+    [--fail-on <none|content|accounting|metadata>]   # exit 1 at or above this severity
 txcript crop <id>[#range]                # interactively cut messages and save a copy
     [--with <harness>]                    #   optionally convert the cropped copy
     [--from <harness>]                    #   scope the source lookup
+    [--quiet] [--strict]                  #   as for `continue`
 txcript view <id>[#range]                # view a session; compact text when piped
     [--from <harness>]                    #   scope the id lookup to one harness
     [--no-pager]                          #   print the terminal view directly
@@ -56,6 +66,109 @@ txcript continue ./session.json --with claude_code   # on the other one
 ```
 
 The recorded working directory is kept when it exists on the importing machine and otherwise replaced by the directory `continue` runs in. `export` accepts the same `#range` suffix and `--from` scope as `view`.
+
+### Fidelity
+
+Converting a session between harnesses can lose things: a target may have no place for the title, token usage, or a tool call's description, or may write a slash command under another name. `txcript check` shows what a conversion would cost, before you do it:
+
+```text
+$ txcript check session.json --with codex
+check 8d116ece (simple, 23 messages) -> codex
+  content    ADDED    1 text block  [artifact: report.md] /txcript-artifacts/18-2/report.md
+             CHANGED  1 tool name renamed  /release -> _release
+             LOST     1 tool argument (Bash.description)  Run tests
+             LOST     1 tool argument (Bash.timeout_ms)  60000
+             LOST     1 tool argument (Edit.replace_all)  true
+             CHANGED  1 tool argument (Write.content)  # notes\n -> # notes
+             LOST     1 artifact  report.md
+             LOST     1 error flag
+  accounting LOST     1 thinking signature
+             LOST     4 usage records
+             LOST     1 usage field (cache_creation_input_tokens)
+             LOST     8 stop reasons  tool_use
+             ADDED    8 per-message models  claude-opus-5
+  metadata   LOST     title  Session everything
+             LOST     model  claude-opus-5
+  structure  23 messages become 30 (the target splits turns)
+  codec-level: measured on the target's session text; a store's own additions are not counted
+```
+
+Without `--with`, one row per target `continue` can write:
+
+```text
+$ txcript check session.json
+check 8d116ece (simple, 23 messages), codec-level, 11 targets
+target          content  accounting  metadata  notes
+claude_code     ok       changed     ok        messages 23->24, 1 added
+codex           lost     lost        lost      messages 23->30, 9 added
+opencode        lost     lost        lost      messages 23->26, 10 added
+pi              lost     lost        lost      messages 23->22, 1 added
+campfire        lost     lost        lost      messages 23->22, 1 added
+cursor          lost     lost        lost      2 added
+cursor_desktop  lost     lost        lost      messages 23->25, 8 added
+grok            lost     lost        lost      messages 23->24
+fx              lost     lost        lost      messages 23->17, 2 added
+antigravity     lost     lost        lost      messages 23->21
+cowork          ok       changed     ok        messages 23->24, 1 added
+run 'txcript check session.json --with <harness>' for details
+```
+
+`check` takes the same sources as `continue`: a session id or title, a Simple document file, or `-` for stdin, with an optional `#range`, so the report covers exactly the messages that would be written. It never writes anything and never launches an agent.
+
+**What it measures.** The session is converted to the target's native session text and read back, and the two are compared. The comparison matches content, not messages, because targets split and merge turns: a session that becomes more messages in Codex is not a loss. Text is trimmed, JSON compares by value, so key order and spacing never count, and regenerated ids are ignored. Each difference is one of:
+
+- `LOST`: in the source, absent from the result.
+- `CHANGED`: in both, but different: a renamed tool or tool argument, a rewritten argument, an edited text, a stop reason written another way, blocks in another order.
+- `ADDED`: absent from the source, present in the result: a stop reason or model the target made up. Listed, but never counted toward severity.
+
+Severity is the worst class of loss or change in the report:
+
+| Severity | Covers |
+| --- | --- |
+| `content` | text, thinking, tool calls and arguments, results, images, artifacts, error flags, block order |
+| `accounting` | usage, stop reasons, per-message models, thinking signatures |
+| `metadata` | title, model, git branch, working directory, message timestamps, lineage |
+
+The measurement is **codec-level**: it covers what the target's format stores, not what a store adds around it. A real `continue` also gives the copy a fresh id and timestamp, re-homes a working directory that no longer exists, writes artifact files (compared here by name only), imports through the `opencode` binary, and writes Cursor's database; none of that is counted. Message timestamps are compared by the second. A copy made by a lossy conversion no longer has what was lost, so run `check` on the original with the final target rather than on each copy: a chain of conversions loses at least what its worst hop does.
+
+By default a report shows counts and short examples only: at most 80 characters, control characters replaced, and never the body of a tool result or the data of an image. `--detail` adds longer examples, a preview of changed tool results, and the first message each difference appears in.
+
+`continue --with <harness>` and `crop --with <harness>` print one line to stderr when the chosen target loses or changes anything, and nothing else changes: standard output is what it always was.
+
+```text
+note: lossy conversion: 1 text block, 1 tool call, 3 tool arguments, 1 artifact, 8 usage records, 7 stop reasons, and 2 more; run 'txcript check session.json --with fx' for details
+```
+
+The note is printed whether or not stderr is a terminal. That matches the other status lines `continue` prints there (`resuming: …`), keeps the loss visible in CI logs, and costs a script nothing, since stdout is untouched. `--quiet` removes it. `--strict` is for scripts that must not lose content: it refuses before writing or launching anything, with a message and exit status 1, when text, thinking, tool calls or arguments, results, images, or artifacts would be lost or changed (`crop` checks when you save). Losing only accounting or metadata still prints the note; a conversion that only rewrites something, such as a stop reason written another way, says `conversion changes` instead of `lossy conversion`. Resuming a session in its own harness without a `#range` converts nothing, so none of this applies there. `continue --dry-run` runs `check` for the same arguments, with `--strict` meaning `--fail-on content`, and prints that it would resume in place when no conversion is involved.
+
+`check` exits 0, or 1 when `--fail-on` is set and any target's severity is at or above it, or when a target cannot be assessed (a harness `continue` cannot write, such as Hermes, Amp, or a live source, reports that under its own name without stopping the others). `--fail-on content` is the usual CI gate.
+
+With `--json`, `check` prints one document. Version 1 of the schema:
+
+```json
+{
+  "schema": 1,
+  "source": { "harness": "claude_code", "id": "0dc114bf-…", "messages": 81 },
+  "targets": [
+    {
+      "harness": "codex",
+      "error": null,
+      "messages_after": 125,
+      "severity": "content",
+      "items": [
+        { "kind": "changed", "category": "tool_name", "path": "/release -> _release",
+          "count": 2, "first_message": 14, "example": null }
+      ],
+      "warnings": [],
+      "counts": { "lost": 87, "changed": 2, "synthesized": 44 }
+    }
+  ]
+}
+```
+
+`kind` is `lost`, `changed`, or `synthesized`. `category` is one of `text`, `thinking`, `tool_call`, `tool_name`, `tool_args`, `tool_result`, `image`, `artifact`, `is_error`, `order`, `thinking_signature`, `usage`, `stop_reason`, `message_model`, `title`, `model`, `git_branch`, `cwd`, `timestamp`, `lineage`. `path` refines a category (`Bash.description`, `/release -> _release`, a usage field) and `first_message` is 1-based like `#range`; either, and `example`, can be `null`. A target that could not be assessed has `error` set and `null` for `messages_after`, `severity`, and `counts`. New fields may be added within a schema version; `schema` changes only when a field's meaning does.
+
+[Per-harness results](formats/README.md#conversion-fidelity) on a reference session are listed with the formats. Not covered yet, and tracked as follow-ups: counting malformed lines in a source, redacting secrets before a conversion, verifying a real write by reloading it, and estimating token cost.
 
 ### Search
 
@@ -155,6 +268,8 @@ let claude = store.load(&found[0].reference)?;       // Transcript<ClaudeCode>
 let codex = convert::<_, codex::Codex>(&claude)?;
 codex::CodexStore::default_root().expect("home dir").save(&codex)?;  // resumable on disk
 ```
+
+`dispatch::{parse_to_common, render_from_common}` pick the text codec by `HarnessId`. On top of them, `fidelity::assess(target, &common)` renders a transcript as a harness's text, reads it back, and reports what was lost, changed, or made up; no I/O, so it runs in WASM builds too (see [Fidelity](#fidelity)).
 
 The canonical model is `Transcript<Common>`: `Meta` + `Vec<Message>`, where a `Message` holds typed `Block`s (`Text`, `Thinking`, `ToolUse`, `ToolResult`, `Image`) and a typed `Tool` enum.
 
