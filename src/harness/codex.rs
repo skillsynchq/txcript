@@ -609,7 +609,6 @@ fn flush_message_content(
         }
     }
 }
-
 #[allow(clippy::too_many_lines)]
 fn push_message_lines<'a>(
     lines: &mut Vec<Line>,
@@ -674,20 +673,27 @@ fn push_message_lines<'a>(
                 ));
             }
             Block::ToolUse { id, tool } => {
-                flush_message_content(
-                    lines,
-                    &mut message_content,
-                    &mut text_chunks,
-                    msg.role,
-                    role_str,
-                    ts,
-                );
-                if is_patch_tool(tool) {
-                    pending_patch_ids.insert(id.as_str());
+                if msg.role == Role::User
+                    && let Some(cmd) = tool.command_display()
+                {
+                    message_content.push(json!({ "type": "input_text", "text": cmd }));
+                    text_chunks.push(cmd);
                 } else {
-                    pending_patch_ids.remove(id.as_str());
+                    flush_message_content(
+                        lines,
+                        &mut message_content,
+                        &mut text_chunks,
+                        msg.role,
+                        role_str,
+                        ts,
+                    );
+                    if is_patch_tool(tool) {
+                        pending_patch_ids.insert(id.as_str());
+                    } else {
+                        pending_patch_ids.remove(id.as_str());
+                    }
+                    push_tool_use_lines(lines, ts, id, tool);
                 }
-                push_tool_use_lines(lines, ts, id, tool);
             }
             Block::ToolResult {
                 tool_use_id,

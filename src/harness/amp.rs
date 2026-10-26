@@ -470,9 +470,11 @@ fn user_value(msg: &Message, index: usize) -> Value {
                 "toolUseID": tool_use_id,
                 "run": run_value(content, *is_error),
             })),
-            // Thinking and ToolUse never occur on user turns in the canonical
-            // model; there is nothing of them to render.
-            Block::Thinking { .. } | Block::ToolUse { .. } => None,
+            Block::ToolUse { tool, .. } => tool
+                .command_display()
+                .map(|text| json!({ "type": "text", "text": text })),
+            // Thinking never occurs on user turns in the canonical model.
+            Block::Thinking { .. } => None,
         })
         .collect();
     let mut m = Map::new();
