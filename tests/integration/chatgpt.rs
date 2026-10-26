@@ -86,3 +86,27 @@ fn friendly_aliases_resolve_to_chatgpt() {
         assert_eq!(alias.parse::<HarnessId>().unwrap(), HarnessId::ChatGpt);
     }
 }
+
+#[test]
+fn chatgpt_finish_details_mapped_to_stop_reason() {
+    let mut fix = fixture();
+    fix["current_node"] = json!("interrupted_assistant");
+    fix["mapping"]["interrupted_assistant"] = json!({
+        "id": "interrupted_assistant",
+        "parent": "user",
+        "children": [],
+        "message": {
+            "id": "m-int",
+            "author": { "role": "assistant" },
+            "create_time": 1_770_000_004,
+            "content": { "content_type": "text", "parts": ["partial text..."] },
+            "metadata": {
+                "finish_details": { "type": "interrupted" }
+            }
+        }
+    });
+    let transcript = chatgpt::ChatGpt::from_text(&fix.to_string()).unwrap();
+    let common = chatgpt::ChatGpt::to_common(&transcript).unwrap();
+    let last = common.body.last().unwrap();
+    assert_eq!(last.stop_reason, Some(txcript::common::StopReason::Aborted));
+}
