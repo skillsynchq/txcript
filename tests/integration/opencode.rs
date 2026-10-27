@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use txcript::common;
 use txcript::harness::opencode;
-use txcript::{Codec, Common, Transcript};
+use txcript::{Codec, Common, TextCodec, Transcript};
 
 fn ts(s: &str) -> DateTime<Utc> {
     s.parse().unwrap()
@@ -445,4 +445,69 @@ fn custom_and_mcp_tool_names_preserve_exact_casing() {
             other => panic!("expected Tool::Raw, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn to_text_writes_the_2_1_document_and_reads_it_back() {
+    let common = sample_common();
+    let native = opencode::OpenCode::from_common(&common).unwrap();
+    let text = opencode::OpenCode::to_text(&native).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+    // The header carries what 2.1's importer validates.
+    let info = &doc["info"];
+    assert_eq!(info["id"], "ses_1");
+    assert_eq!(info["projectID"], "global");
+    assert_eq!(info["cost"], 0.0);
+    assert_eq!(info["tokens"]["cache"]["read"], 0);
+    assert_eq!(info["location"]["directory"], "/repo");
+    assert_eq!(info["title"], "Demo");
+    assert_eq!(info["model"]["id"], "claude-opus-4-7");
+    assert!(
+        info.get("directory").is_none(),
+        "the 2.0 spelling stays out of the 2.1 header"
+    );
+
+    // Messages are flat records, not `{info, parts}` pairs.
+    let messages = doc["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["type"], "user");
+    assert_eq!(messages[0]["text"], "edit it");
+    assert!(messages[0].get("parts").is_none());
+    assert!(
+        messages
+            .iter()
+            .all(|m| m["id"].as_str().unwrap().starts_with("msg_"))
+    );
+    let tool_turn = messages
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|item| item["type"] == "tool"))
+        })
+        .unwrap();
+    assert_eq!(tool_turn["finish"], "tool-calls");
+    let tool = tool_turn["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "tool")
+        .unwrap();
+    assert_eq!(tool["name"], "edit");
+    assert_eq!(tool["id"], "call-1");
+    assert_eq!(tool["state"]["status"], "completed");
+    assert_eq!(tool["state"]["input"]["path"], "/repo/a.rs");
+    assert_eq!(tool["state"]["content"][0]["text"], "done");
+
+    // And the document reads back to the same conversation. The 2.1 header
+    // has no slot for the CLI version (the importer stamps its own), so that
+    // is the one `Meta` field a text round-trip cannot keep.
+    let back =
+        opencode::OpenCode::to_common(&opencode::OpenCode::from_text(&text).unwrap()).unwrap();
+    assert_eq!(common.body, back.body);
+    assert_eq!(back.meta.id, common.meta.id);
+    assert_eq!(back.meta.cwd, common.meta.cwd);
+    assert_eq!(back.meta.title, common.meta.title);
+    assert_eq!(back.meta.model, common.meta.model);
+    assert_eq!(back.meta.cli_version, None);
 }

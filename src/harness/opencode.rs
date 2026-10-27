@@ -1,12 +1,17 @@
-//! `OpenCode`: a single `SQLite` database (`~/.local/share/opencode/opencode.db`)
-//! holding `session`, `message`, and `part` rows.
+//! `OpenCode`: a single `SQLite` database (`~/.local/share/opencode/opencode.db`).
+//! Up to 2.0 it held `session`, `message`, and `part` rows; since 2.1 it keeps
+//! `session_v2` rows and one flat `session_message` record per message.
 //!
-//! The native [`Body`](OpenCode) is `OpenCode`'s own export shape —
-//! `{info, messages: [{info, parts}]}` — the format `opencode export` emits and
-//! `opencode import` consumes. [`OpenCodeStore`] reads the DB read-only and
-//! assembles that shape; `save` hands it to `opencode import`. The codec and
-//! native types are pure JSON and compile without the `opencode` feature;
-//! only the store pulls in `rusqlite`.
+//! The native [`Body`](OpenCode) is the 2.0 export shape —
+//! `{info, messages: [{info, parts}]}` — which the codec understands; the `v2`
+//! module projects it to and from 2.1's `{info, messages: [record]}` document,
+//! the form `opencode session export` emits and `opencode session import`
+//! consumes. [`OpenCodeStore`] reads either database layout read-only and
+//! assembles the native shape; `save` hands the document the installed CLI
+//! understands to `opencode session import` (2.1) or `opencode import`
+//! (earlier). The text form is the 2.1 document; `from_text` reads both. The
+//! codec and native types are pure JSON and compile without the `opencode`
+//! feature; only the store pulls in `rusqlite`.
 //!
 //! A `part` of type `tool` splits into a [`Block::ToolUse`] on an assistant
 //! message and a [`Block::ToolResult`] on the following user message, matching
@@ -22,6 +27,8 @@ use uuid::Uuid;
 use crate::common::{Block, ImageSource, Message, Meta, Role, StopReason, Tool, ToolOutput, Usage};
 use crate::error::Result;
 use crate::transcript::{Codec, Common, Harness, TextCodec, Transcript};
+
+mod v2;
 
 /// The `OpenCode` harness marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,15 +83,21 @@ impl Codec for OpenCode {
 }
 
 impl TextCodec for OpenCode {
-    /// The text form is the `opencode export` JSON document.
+    /// The text form is the `opencode session export` JSON document (2.1);
+    /// the 2.0 `opencode export` shape is read as well.
     fn from_text(text: &str) -> Result<Transcript<Self>> {
-        let export: Export = serde_json::from_str(text)?;
+        let doc: Value = serde_json::from_str(text)?;
+        let export = if v2::is_document(&doc) {
+            v2::to_legacy(&doc)?
+        } else {
+            serde_json::from_value(doc)?
+        };
         let meta = meta_from_info(&export.info);
         Ok(Transcript::new(meta, export))
     }
 
     fn to_text(transcript: &Transcript<Self>) -> Result<String> {
-        Ok(serde_json::to_string(&transcript.body)?)
+        Ok(serde_json::to_string(&v2::from_legacy(&transcript.body))?)
     }
 }
 
@@ -113,7 +126,15 @@ fn meta_from_info(info: &Value) -> Meta {
     Meta {
         id: string("id").unwrap_or_default(),
         timestamp,
-        cwd: string("directory"),
+        // 2.0 spelled the working directory `directory`; 2.1 nests it in
+        // `location`.
+        cwd: string("directory").or_else(|| {
+            info.get("location")
+                .and_then(|location| location.get("directory"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        }),
         git_branch: None,
         title,
         cli_version: string("version"),
@@ -575,17 +596,8 @@ fn assistant_part(
                 "metadata": {},
                 "time": time,
             });
-            // Fold matching ToolResult from the following user turn into state.output.
-            if let Some(next) = messages.get(*idx + 1)
-                && matches!(next.role, Role::User)
-                && let Some(result) = next.content.iter().find_map(|b| match b {
-                    Block::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } if tool_use_id == id => Some((content, *is_error)),
-                    _ => None,
-                })
+            // Fold the matching ToolResult into state.output.
+            if let Some(result) = following_result(messages, *idx, id)
                 && let Value::Object(obj) = &mut state
             {
                 if result.1 {
@@ -611,6 +623,39 @@ fn assistant_part(
         obj.insert("messageID".into(), json!(msg_id));
     }
     p
+}
+
+/// The result of call `id` made in `messages[idx]`: the first matching
+/// `ToolResult` in the messages after it, up to the next user message that is
+/// more than tool results (the next prompt). Parallel calls can be recorded one
+/// per assistant message, with each result in its own later user message, so
+/// the result is not always in the very next message.
+fn following_result<'m>(
+    messages: &'m [Message],
+    idx: usize,
+    id: &str,
+) -> Option<(&'m ToolOutput, bool)> {
+    for message in messages.iter().skip(idx + 1) {
+        if message.role != Role::User {
+            continue;
+        }
+        let mut prompt = false;
+        for block in &message.content {
+            match block {
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => return Some((content, *is_error)),
+                Block::ToolResult { .. } => {}
+                _ => prompt = true,
+            }
+        }
+        if prompt {
+            return None;
+        }
+    }
+    None
 }
 
 // ── tool normalization ─────────────────────────────────────────────────
@@ -834,12 +879,12 @@ pub use store::OpenCodeStore;
 #[cfg(feature = "opencode")]
 mod store {
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use rusqlite::{Connection, OpenFlags};
     use serde_json::Value;
 
-    use super::{Export, MessageRecord, OpenCode};
+    use super::{Export, MessageRecord, OpenCode, v2};
     use crate::common::{Lineage, Meta, Relation};
     use crate::error::{Error, Result};
     use crate::transcript::{Discovered, Saved, Store, Transcript};
@@ -889,6 +934,89 @@ mod store {
         }
     }
 
+    /// Which tables a database keeps its sessions in: 2.1 moved them to
+    /// `session_v2` and `session_message`; earlier releases used `session`,
+    /// `message` and `part`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Layout {
+        Legacy,
+        V2,
+    }
+
+    impl Layout {
+        fn detect(conn: &Connection) -> Result<Self> {
+            let v2: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'session_v2')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_err)?;
+            Ok(if v2 { Self::V2 } else { Self::Legacy })
+        }
+
+        fn session_table(self) -> &'static str {
+            match self {
+                Self::Legacy => "session",
+                Self::V2 => "session_v2",
+            }
+        }
+
+        fn message_table(self) -> &'static str {
+            match self {
+                Self::Legacy => "message",
+                Self::V2 => "session_message",
+            }
+        }
+    }
+
+    /// Which generation the `opencode` on `PATH` is: 2.1 imports with
+    /// `opencode session import` and the flat document; earlier releases
+    /// with `opencode import` and the `{info, parts}` export.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Generation {
+        Legacy,
+        Current,
+    }
+
+    impl Generation {
+        fn of_cli() -> Result<Self> {
+            use std::process::{Command, Stdio};
+
+            let output = Command::new("opencode")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| Error::Unconvertible {
+                    harness: "opencode",
+                    detail: format!("running `opencode --version`: {e} (is OpenCode on PATH?)"),
+                })?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(Self::parse(&text))
+        }
+
+        /// `opencode v2.1.4`, `2.0.3`, `v1.17.20`: anything before 2.1 is the
+        /// legacy generation; a version that cannot be read is taken as
+        /// current.
+        fn parse(text: &str) -> Self {
+            let version = text.split_whitespace().find_map(|word| {
+                let mut numbers = word.trim_start_matches('v').split('.');
+                let major: u32 = numbers.next()?.parse().ok()?;
+                let minor: u32 = numbers.next()?.parse().ok()?;
+                Some((major, minor))
+            });
+            match version {
+                Some(version) if version < (2, 1) => Self::Legacy,
+                _ => Self::Current,
+            }
+        }
+    }
+
     impl Store for OpenCodeStore {
         type H = OpenCode;
         type Ref = String;
@@ -896,11 +1024,13 @@ mod store {
         fn discover(&self) -> Result<Vec<Discovered<String>>> {
             if self.db_path.is_file() {
                 let conn = self.open()?;
+                let layout = Layout::detect(&conn)?;
                 let mut stmt = conn
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT id, directory, title, version, time_created, model, parent_id \
-                         FROM session WHERE time_archived IS NULL ORDER BY time_created DESC",
-                    )
+                         FROM {} WHERE time_archived IS NULL ORDER BY time_created DESC",
+                        layout.session_table()
+                    ))
                     .map_err(sqlite_err)?;
                 let rows = stmt
                     .query_map([], |row| {
@@ -946,71 +1076,30 @@ mod store {
 
         fn load(&self, reference: &String) -> Result<Transcript<OpenCode>> {
             let conn = self.open()?;
-
-            let (meta, info) = session_row(&conn, reference)?;
-
-            let mut msg_stmt = conn
-                .prepare(
-                    "SELECT id, data, time_created FROM message \
-                     WHERE session_id = ?1 ORDER BY time_created, id",
-                )
-                .map_err(sqlite_err)?;
-            let message_rows: Vec<(String, String, i64)> = msg_stmt
-                .query_map([reference], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .map_err(sqlite_err)?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(sqlite_err)?;
-            drop(msg_stmt);
-
-            let mut part_stmt = conn
-                .prepare(
-                    "SELECT message_id, data FROM part \
-                     WHERE session_id = ?1 ORDER BY message_id, id",
-                )
-                .map_err(sqlite_err)?;
-            let part_rows = part_stmt
-                .query_map([reference], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(sqlite_err)?;
-            let mut parts_by_message: HashMap<String, Vec<Value>> = HashMap::new();
-            for row in part_rows {
-                let (message_id, data) = row.map_err(sqlite_err)?;
-                // A part row whose JSON doesn't parse is dropped; the message
-                // survives without it.
-                if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                    parts_by_message.entry(message_id).or_default().push(value);
-                }
-            }
-            drop(part_stmt);
-
-            let mut messages = Vec::with_capacity(message_rows.len());
-            for (message_id, data, time_created) in message_rows {
-                let mut msg_info: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
-                // The export shape carries time on the message; the DB keeps it
-                // in a column. Inject it so the codec reads a uniform shape.
-                if let Value::Object(obj) = &mut msg_info {
-                    obj.entry("time")
-                        .or_insert_with(|| serde_json::json!({ "created": time_created, "completed": time_created }));
-                }
-                messages.push(MessageRecord {
-                    info: msg_info,
-                    parts: parts_by_message.remove(&message_id).unwrap_or_default(),
-                });
-            }
-
+            let layout = Layout::detect(&conn)?;
+            let (meta, info) = session_row(&conn, layout, reference)?;
+            let messages = match layout {
+                Layout::Legacy => legacy_messages(&conn, reference)?,
+                Layout::V2 => v2_messages(&conn, reference)?,
+            };
             Ok(Transcript::new(meta, Export { info, messages }))
         }
 
         fn save(&self, transcript: &Transcript<OpenCode>) -> Result<Saved<String>> {
-            // OpenCode owns its schema; hand it the export and let `opencode
-            // import` normalize and persist. Requires the `opencode` binary.
+            // OpenCode owns its schema; hand it the export and let its import
+            // command normalize and persist. Requires the `opencode` binary,
+            // whose generation picks the command and the document layout.
             use std::io::Write;
             use std::process::{Command, Stdio};
 
-            let export = serde_json::to_string(&transcript.body)?;
+            let generation = Generation::of_cli()?;
+            let (command, export) = match generation {
+                Generation::Current => (
+                    "opencode session import",
+                    serde_json::to_string(&v2::from_legacy(&transcript.body))?,
+                ),
+                Generation::Legacy => ("opencode import", serde_json::to_string(&transcript.body)?),
+            };
             // A randomized name plus `create_new` keeps the staging file off
             // any predictable, pre-plantable path (and never follows a
             // symlink); 0600 keeps the exported transcript private in a
@@ -1028,16 +1117,33 @@ mod store {
             file.write_all(export.as_bytes())?;
             drop(file);
 
-            let output = Command::new("opencode")
-                .arg("import")
-                .arg(&tmp)
+            let mut import = Command::new("opencode");
+            match generation {
+                Generation::Current => {
+                    import.arg("session").arg("import").arg(&tmp);
+                    // 2.1 files the session under the directory it is imported
+                    // from; name the transcript's own when it exists here.
+                    if let Some(cwd) = transcript
+                        .meta
+                        .cwd
+                        .as_deref()
+                        .filter(|dir| Path::new(dir).is_dir())
+                    {
+                        import.arg("--directory").arg(cwd);
+                    }
+                }
+                Generation::Legacy => {
+                    import.arg("import").arg(&tmp);
+                }
+            }
+            let output = import
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
                 .map_err(|e| Error::Unconvertible {
                     harness: "opencode",
-                    detail: format!("running `opencode import`: {e} (is OpenCode on PATH?)"),
+                    detail: format!("running `{command}`: {e} (is OpenCode on PATH?)"),
                 })?;
             if output.status.success() {
                 let _ = std::fs::remove_file(&tmp);
@@ -1055,7 +1161,7 @@ mod store {
                 Err(Error::Unconvertible {
                     harness: "opencode",
                     detail: format!(
-                        "`opencode import` failed: {}",
+                        "`{command}` failed: {}",
                         String::from_utf8_lossy(&output.stderr)
                     ),
                 })
@@ -1067,11 +1173,15 @@ mod store {
         /// archived sessions out; the rows stay, reversible from `OpenCode`.
         fn delete(&self, reference: &String) -> Result<()> {
             let conn = Connection::open(&self.db_path).map_err(sqlite_err)?;
+            let layout = Layout::detect(&conn)?;
             let now = chrono::Utc::now().timestamp_millis();
             let updated = conn
                 .execute(
-                    "UPDATE session SET time_archived = ?1 \
-                     WHERE id = ?2 AND time_archived IS NULL",
+                    &format!(
+                        "UPDATE {} SET time_archived = ?1 \
+                         WHERE id = ?2 AND time_archived IS NULL",
+                        layout.session_table()
+                    ),
                     rusqlite::params![now, reference],
                 )
                 .map_err(sqlite_err)?;
@@ -1088,10 +1198,12 @@ mod store {
         fn fingerprints(&self, refs: &[String]) -> Result<HashMap<String, String>> {
             if self.db_path.is_file() {
                 let conn = self.open()?;
+                let layout = Layout::detect(&conn)?;
                 let mut stmt = conn
-                    .prepare(
-                        "SELECT session_id, MAX(time_created) FROM message GROUP BY session_id",
-                    )
+                    .prepare(&format!(
+                        "SELECT session_id, MAX(time_created) FROM {} GROUP BY session_id",
+                        layout.message_table()
+                    ))
                     .map_err(sqlite_err)?;
                 let rows = stmt
                     .query_map([], |r| {
@@ -1115,13 +1227,113 @@ mod store {
         }
     }
 
-    fn session_row(conn: &Connection, id: &str) -> Result<(Meta, Value)> {
+    /// The 2.0 layout: `message` rows carry the message `info`, `part` rows
+    /// its parts.
+    fn legacy_messages(conn: &Connection, reference: &str) -> Result<Vec<MessageRecord>> {
+        let mut msg_stmt = conn
+            .prepare(
+                "SELECT id, data, time_created FROM message \
+                 WHERE session_id = ?1 ORDER BY time_created, id",
+            )
+            .map_err(sqlite_err)?;
+        let message_rows: Vec<(String, String, i64)> = msg_stmt
+            .query_map([reference], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sqlite_err)?;
+        drop(msg_stmt);
+
+        let mut part_stmt = conn
+            .prepare(
+                "SELECT message_id, data FROM part \
+                 WHERE session_id = ?1 ORDER BY message_id, id",
+            )
+            .map_err(sqlite_err)?;
+        let part_rows = part_stmt
+            .query_map([reference], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_err)?;
+        let mut parts_by_message: HashMap<String, Vec<Value>> = HashMap::new();
+        for row in part_rows {
+            let (message_id, data) = row.map_err(sqlite_err)?;
+            // A part row whose JSON doesn't parse is dropped; the message
+            // survives without it.
+            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                parts_by_message.entry(message_id).or_default().push(value);
+            }
+        }
+        drop(part_stmt);
+
+        let mut messages = Vec::with_capacity(message_rows.len());
+        for (message_id, data, time_created) in message_rows {
+            let mut msg_info: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            // The export shape carries time on the message; the DB keeps it
+            // in a column. Inject it so the codec reads a uniform shape.
+            if let Value::Object(obj) = &mut msg_info {
+                obj.entry("time").or_insert_with(
+                    || serde_json::json!({ "created": time_created, "completed": time_created }),
+                );
+            }
+            messages.push(MessageRecord {
+                info: msg_info,
+                parts: parts_by_message.remove(&message_id).unwrap_or_default(),
+            });
+        }
+        Ok(messages)
+    }
+
+    /// The 2.1 layout: one `session_message` row per message, its `data`
+    /// column the record minus `id` and `type`, in `seq` order.
+    fn v2_messages(conn: &Connection, reference: &str) -> Result<Vec<MessageRecord>> {
         let mut stmt = conn
             .prepare(
+                "SELECT id, type, data, time_created FROM session_message \
+                 WHERE session_id = ?1 ORDER BY seq, time_created, id",
+            )
+            .map_err(sqlite_err)?;
+        let rows: Vec<(String, String, String, i64)> = stmt
+            .query_map([reference], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sqlite_err)?;
+        drop(stmt);
+
+        let mut last_user_id = None;
+        let mut messages = Vec::with_capacity(rows.len());
+        for (i, (id, kind, data, time_created)) in rows.into_iter().enumerate() {
+            // A row whose JSON doesn't parse is dropped; the session survives
+            // without it.
+            let Ok(Value::Object(mut record)) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            record.insert("id".into(), Value::String(id));
+            record.insert("type".into(), Value::String(kind));
+            record
+                .entry("time")
+                .or_insert_with(|| serde_json::json!({ "created": time_created }));
+            messages.push(v2::record_to_legacy(
+                &Value::Object(record),
+                reference,
+                i,
+                &mut last_user_id,
+            ));
+        }
+        Ok(messages)
+    }
+
+    fn session_row(conn: &Connection, layout: Layout, id: &str) -> Result<(Meta, Value)> {
+        let mut stmt = conn
+            .prepare(&format!(
                 "SELECT directory, title, version, time_created, model, slug, time_updated, \
                         parent_id \
-                 FROM session WHERE id = ?1",
-            )
+                 FROM {} WHERE id = ?1",
+                layout.session_table()
+            ))
             .map_err(sqlite_err)?;
         let row = stmt
             .query_row([id], |row| {
@@ -1201,8 +1413,8 @@ mod store {
     #[cfg(test)]
     mod tests {
         use super::super::OpenCode;
-        use super::OpenCodeStore;
-        use crate::common::{Block, Relation, Role, Tool};
+        use super::{Generation, OpenCodeStore};
+        use crate::common::{Block, Relation, Role, Tool, ToolOutput};
         use crate::transcript::{Codec, Store};
         use rusqlite::{Connection, params};
 
@@ -1338,6 +1550,119 @@ mod store {
             let lineage = loaded.meta.lineage.as_ref().expect("spawn lineage on load");
             assert_eq!(lineage.parent, "ses_1");
             assert_eq!(lineage.relation, Relation::Spawn);
+        }
+
+        /// A 2.1 database: `session_v2` plus flat `session_message` records —
+        /// the conversation of `make_db` plus the `idle` marker 2.1 writes
+        /// when a turn ends.
+        fn make_db_v2() -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "transcript-oc-v2-test-{n}-{:?}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("opencode.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, \
+                   slug TEXT, directory TEXT, title TEXT, version TEXT, model TEXT, \
+                   time_created INTEGER, time_updated INTEGER, time_archived INTEGER);\
+                 CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, \
+                   seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_v2 VALUES ('ses_1','global',NULL,'clever-engine','/repo','Demo','2.1.4',\
+                 '{\"id\":\"claude-opus-4-7\",\"providerID\":\"anthropic\"}',1778834704515,1778834704516,NULL)",
+                [],
+            )
+            .unwrap();
+            for (id, kind, seq, created, data) in [
+                (
+                    "msg_u",
+                    "user",
+                    1,
+                    1_778_834_704_520_i64,
+                    r#"{"text":"edit it","time":{"created":1778834704520}}"#,
+                ),
+                (
+                    "msg_a",
+                    "assistant",
+                    2,
+                    1_778_834_704_540,
+                    r#"{"agent":"build","model":{"id":"claude-opus-4-7","providerID":"anthropic"},"finish":"stop","cost":0,"tokens":{"input":6,"output":88,"reasoning":0,"cache":{"read":10,"write":21428}},"time":{"created":1778834704540,"completed":1778834704560},"content":[{"type":"reasoning","text":"thinking"},{"type":"text","text":"On it."},{"type":"tool","id":"c1","name":"edit","time":{"created":1778834704545,"completed":1778834704550},"state":{"status":"completed","input":{"path":"/repo/a.rs","oldString":"old","newString":"new"},"content":[{"type":"text","text":"done"}]}},{"type":"text","text":"Finished."}]}"#,
+                ),
+                (
+                    "msg_i",
+                    "idle",
+                    3,
+                    1_778_834_704_570,
+                    r#"{"outcome":"succeeded","time":{"created":1778834704570}}"#,
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_message VALUES (?1,'ses_1',?2,?3,?4,?4,?5)",
+                    params![id, kind, seq, created, data],
+                )
+                .unwrap();
+            }
+            path
+        }
+
+        #[test]
+        fn discover_and_load_from_a_2_1_database() {
+            let path = make_db_v2();
+            let store = OpenCodeStore::new(&path);
+
+            let found = store.discover().unwrap();
+            assert_eq!(found.len(), 1);
+            let d = &found[0];
+            assert_eq!(d.reference, "ses_1");
+            assert_eq!(d.meta.title.as_deref(), Some("Demo"));
+            assert_eq!(d.meta.model.as_deref(), Some("claude-opus-4-7"));
+            assert_eq!(d.meta.cwd.as_deref(), Some("/repo"));
+            assert_eq!(d.meta.cli_version.as_deref(), Some("2.1.4"));
+
+            let native = store.load(&d.reference).unwrap();
+            // The idle marker rides along verbatim; the codec skips it.
+            assert_eq!(native.body.messages.len(), 3);
+            assert_eq!(native.body.messages[2].info["type"], "idle");
+            let msgs = OpenCode::to_common(&native).unwrap().body;
+            // user | assistant(reasoning+text) | assistant(tool) | user(result) | assistant(text)
+            assert_eq!(msgs.len(), 5);
+            assert_eq!(msgs[0].role, Role::User);
+            assert!(matches!(
+                &msgs[2].content[0],
+                Block::ToolUse { id, tool: Tool::Edit { file_path, .. } }
+                    if id == "c1" && file_path == "/repo/a.rs"
+            ));
+            assert!(matches!(
+                &msgs[3].content[0],
+                Block::ToolResult { tool_use_id, content: ToolOutput::Text(text), is_error: false }
+                    if tool_use_id == "c1" && text == "done"
+            ));
+            let usage = msgs[4].usage.unwrap();
+            assert_eq!(usage.input_tokens, 6);
+            assert_eq!(usage.cache_creation_input_tokens, Some(21428));
+
+            let prints = store.fingerprints(&["ses_1".to_string()]).unwrap();
+            assert_eq!(prints["ses_1"], "1778834704570");
+        }
+
+        #[test]
+        fn cli_generation_is_read_from_the_version_line() {
+            assert_eq!(Generation::parse("opencode v2.1.4\n"), Generation::Current);
+            assert_eq!(Generation::parse("2.0.3"), Generation::Legacy);
+            assert_eq!(Generation::parse("v1.17.20"), Generation::Legacy);
+            assert_eq!(
+                Generation::parse("opencode 2.1.0-beta.1"),
+                Generation::Current
+            );
+            assert_eq!(Generation::parse("3.0.0"), Generation::Current);
+            assert_eq!(Generation::parse(""), Generation::Current);
         }
     }
 }

@@ -181,6 +181,9 @@ pub(crate) fn records_to_messages(records: &[Record], fallback_ts: DateTime<Utc>
 
     for record in records {
         let (role, entry) = match record {
+            // The file still holds the history a compaction summary condenses
+            // (#100).
+            Record::User(e) if is_compact_summary(e) => continue,
             Record::User(e) => (Role::User, e),
             Record::Assistant(e) => (Role::Assistant, e),
             // Newer CLI versions write the same command envelopes on
@@ -222,6 +225,14 @@ pub(crate) fn records_to_messages(records: &[Record], fallback_ts: DateTime<Utc>
     }
 
     messages
+}
+
+/// Whether a `user` line is the summary a compaction writes after its
+/// `compact_boundary`. Reading in file order already carries the history it
+/// condenses, which the file keeps before the boundary, so the summary would
+/// repeat it as a user turn.
+fn is_compact_summary(entry: &EntryLine) -> bool {
+    entry.extra.get("isCompactSummary") == Some(&Value::Bool(true))
 }
 
 /// The native records for a canonical conversation: one entry line per

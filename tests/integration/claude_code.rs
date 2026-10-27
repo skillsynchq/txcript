@@ -702,3 +702,26 @@ fn discover_leaves_lineage_none_when_the_lead_prefix_is_ambiguous() {
     let teammate = found.iter().find(|d| d.meta.id == "teammate").unwrap();
     assert!(teammate.meta.lineage.is_none());
 }
+
+/// The compaction summary repeats history the file still holds before its
+/// `compact_boundary`: it is not a user turn (#100).
+#[test]
+fn the_compaction_summary_is_not_a_user_turn() {
+    let jsonl = r#"{"type":"user","uuid":"u1","sessionId":"s","timestamp":"2026-01-02T03:04:05.000Z","message":{"role":"user","content":"first prompt"}}
+{"type":"system","subtype":"compact_boundary","uuid":"b1","parentUuid":null,"logicalParentUuid":"u1","sessionId":"s","timestamp":"2026-01-02T03:04:06.000Z","content":"Conversation compacted"}
+{"type":"user","uuid":"c1","parentUuid":"b1","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"sessionId":"s","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"user","content":"summary"}}
+{"type":"user","uuid":"u2","parentUuid":"c1","sessionId":"s","timestamp":"2026-01-02T03:04:08.000Z","message":{"role":"user","content":"second prompt"}}
+"#;
+    let native = claude_code::ClaudeCode::from_text(jsonl).unwrap();
+    let conversation = claude_code::ClaudeCode::to_common(&native).unwrap();
+    let texts: Vec<&str> = conversation
+        .body
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            common::Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["first prompt", "second prompt"]);
+}

@@ -13,7 +13,7 @@ mod codex_pairing;
 
 use chrono::{DateTime, Utc};
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
-use txcript::harness::{claude_code, codex, grok};
+use txcript::harness::{claude_code, codex, grok, opencode};
 use txcript::{Codec, HarnessId, Store, TextCodec, Transcript};
 
 #[cfg(feature = "search")]
@@ -348,4 +348,87 @@ fn search_substring_matches_flag_shaped_needles() {
         assert_eq!(hits.len(), 1, "pattern `{pattern}` must match");
         assert_eq!(hits[0].origin, Origin::ToolUse);
     }
+}
+
+/// Fixed for issue #98. A source can record parallel tool calls one call
+/// per assistant message, each result in its own later user message
+/// (call A, call B, result A, result B). The `OpenCode` writer looked for a
+/// result only in the message right after its call, so both calls were
+/// written with an empty output and their results were lost.
+#[test]
+fn opencode_keeps_the_results_of_parallel_calls_written_one_per_message() {
+    let call = |id: &str, path: &str| Block::ToolUse {
+        id: id.to_string(),
+        tool: Tool::Read {
+            file_path: path.to_string(),
+            offset: None,
+            limit: None,
+        },
+    };
+    let result = |id: &str, text: &str| Block::ToolResult {
+        tool_use_id: id.to_string(),
+        content: ToolOutput::Text(text.to_string()),
+        is_error: false,
+    };
+    let common = Transcript::new(
+        meta("ses_parallel"),
+        vec![
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "read both".to_string(),
+                }],
+                0,
+            ),
+            msg(Role::Assistant, vec![call("call_a", "/a")], 1),
+            msg(Role::Assistant, vec![call("call_b", "/b")], 1),
+            msg(Role::User, vec![result("call_a", "content a")], 2),
+            msg(Role::User, vec![result("call_b", "content b")], 2),
+            msg(
+                Role::Assistant,
+                vec![Block::Text {
+                    text: "done".to_string(),
+                }],
+                3,
+            ),
+        ],
+    );
+
+    let native = opencode::OpenCode::from_common(&common).unwrap();
+    let outputs: Vec<(String, String)> = native
+        .body
+        .messages
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .filter(|part| part["type"] == "tool")
+        .map(|part| {
+            (
+                part["callID"].as_str().unwrap_or_default().to_string(),
+                part["state"]["output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let expected = vec![
+        ("call_a".to_string(), "content a".to_string()),
+        ("call_b".to_string(), "content b".to_string()),
+    ];
+    assert_eq!(outputs, expected);
+
+    let back = opencode::OpenCode::to_common(&native).unwrap().body;
+    let results: Vec<(String, String)> = back
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|block| match block {
+            Block::ToolResult {
+                tool_use_id,
+                content: ToolOutput::Text(text),
+                ..
+            } => Some((tool_use_id.clone(), text.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, expected);
 }

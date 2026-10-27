@@ -13,6 +13,9 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 
 ### Fixed
 
+- Support OpenCode 2.1 ([#96](https://github.com/skillsynchq/txcript/issues/96)): discover and load sessions from its `session_v2`/`session_message` tables, write its flat transcript with the 2.1 tool names and input keys (`shell`, `subagent`, `path`, …), and import it with `opencode session import --directory <cwd>`. A 2.0 database still reads, and a 2.0 CLI (found through `opencode --version`) still gets the `{info, parts}` export through `opencode import`. The `opencode` text form — the WASM `convert`/`fromCommon` output — is now the 2.1 document; `from_text` reads both layouts.
+- Keep the results of parallel tool calls when converting to OpenCode ([#98](https://github.com/skillsynchq/txcript/issues/98)). A source that records each call in its own assistant message, with each result in its own later user message, used to be written with every call's output empty, because the writer only looked for a result in the very next message; it now looks through the following user messages of the turn.
+- Drop the compaction summary from `claude_code` conversions ([#100](https://github.com/skillsynchq/txcript/issues/100)). The `user` line flagged `isCompactSummary` used to become a user prompt that repeated, condensed, the earlier history the file still holds before the `compact_boundary`. It now stays in the native body only.
 - Resolve a session id that exists in several stores to the most recently modified copy. `view`, `export`, `continue` and `crop` used to load whichever copy the file system listed first; discovery now breaks start-time ties by file mtime.
 
 ### Added
