@@ -17,6 +17,7 @@ mod cowork_files;
 pub mod cowork_remote;
 pub mod cursor;
 pub mod cursor_desktop;
+pub mod dsh;
 pub mod fx;
 pub mod grok;
 pub mod grok_bot;

@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use txcript::common;
 use txcript::harness::{
-    amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, fx, grok,
+    amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, dsh, fx, grok,
     grok_bot, hermes, opencode, pi, simple,
 };
 use txcript::{Codec, Common, Transcript, convert};
@@ -194,6 +194,7 @@ fn sample_with_raw_tool(tool_name: &str) -> Transcript<Common> {
     Transcript::new(meta, body)
 }
 
+#[allow(clippy::too_many_lines)]
 fn assert_cycle(common: &Transcript<Common>, context: &str) {
     let expected = signature(common);
 
@@ -261,7 +262,14 @@ fn assert_cycle(common: &Transcript<Common>, context: &str) {
         "{context}: grok_bot"
     );
 
-    let fx = convert::<grok_bot::GrokBot, fx::Fx>(&grok_bot).unwrap();
+    let dsh = convert::<grok_bot::GrokBot, dsh::Dsh>(&grok_bot).unwrap();
+    assert_eq!(
+        signature(&dsh::Dsh::to_common(&dsh).unwrap()),
+        expected,
+        "{context}: dsh"
+    );
+
+    let fx = convert::<dsh::Dsh, fx::Fx>(&dsh).unwrap();
     assert_eq!(
         signature(&fx::Fx::to_common(&fx).unwrap()),
         expected,

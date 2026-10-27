@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use crate::common;
 use crate::harness::{
     amp, antigravity, campfire, chatgpt, claude_chat, claude_code, codex, cowork, cowork_remote,
-    cursor, cursor_desktop, fx, grok, grok_bot, hermes, opencode, pi, simple,
+    cursor, cursor_desktop, dsh, fx, grok, grok_bot, hermes, opencode, pi, simple,
 };
 use crate::transcript::{Codec, Common, HarnessId, TextCodec, Transcript};
 
@@ -211,6 +211,7 @@ fn parse_to_common(harness: HarnessId, text: &str) -> crate::Result<Transcript<C
         HarnessId::CursorDesktop => go::<cursor_desktop::CursorDesktop>(text),
         HarnessId::Grok => go::<grok::Grok>(text),
         HarnessId::GrokBot => go::<grok_bot::GrokBot>(text),
+        HarnessId::Dsh => go::<dsh::Dsh>(text),
         HarnessId::Fx => go::<fx::Fx>(text),
         HarnessId::Hermes => go::<hermes::Hermes>(text),
         HarnessId::Amp => go::<amp::Amp>(text),
@@ -237,6 +238,7 @@ fn render_from_common(harness: HarnessId, common: &Transcript<Common>) -> crate:
         HarnessId::CursorDesktop => go::<cursor_desktop::CursorDesktop>(common),
         HarnessId::Grok => go::<grok::Grok>(common),
         HarnessId::GrokBot => go::<grok_bot::GrokBot>(common),
+        HarnessId::Dsh => go::<dsh::Dsh>(common),
         HarnessId::Fx => go::<fx::Fx>(common),
         HarnessId::Hermes => go::<hermes::Hermes>(common),
         HarnessId::Amp => go::<amp::Amp>(common),

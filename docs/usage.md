@@ -123,7 +123,7 @@ txcript = "0.14"
 # txcript = { version = "0.14", default-features = false }
 ```
 
-Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, `search`, and `codex_zstd` (the rollouts Codex compresses to `.jsonl.zst`).
+Default features: `opencode` (the SQLite stores: OpenCode, both Cursors, Antigravity), `hermes`, `claude_chat`, `cowork_remote`, `chatgpt`, `search`, `codex_zstd` (the rollouts Codex compresses to `.jsonl.zst`), and `dsh_zstd` (the session logs DeepSeek Harness compresses to `.jsonl.zstd`).
 
 Three layers, smallest to largest:
 
@@ -225,7 +225,7 @@ writeFileSync("session.jsonl", convert(input, "codex", "claude_code"));
 const common = JSON.parse(toCommon(input, "codex"));   // { meta, messages }
 const pi = fromCommon(JSON.stringify(common), "pi");
 
-harnesses(); // ["claude_code","claude_chat","cowork_remote","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","fx","hermes","amp","antigravity","simple","cowork"]
+harnesses(); // ["claude_code","claude_chat","cowork_remote","chatgpt","codex","opencode","pi","campfire","cursor","cursor_desktop","grok","grok_bot","dsh","fx","hermes","amp","antigravity","simple","cowork"]
 ```
 
 Text-in / text-out: `input` is the source harness's native session text and the result is the target's. Invalid harness names or unparseable input throw a JS `Error`.
@@ -255,6 +255,7 @@ const matches = JSON.parse(index.query(JSON.stringify({ pattern: "relay bug" }))
 | `cursor_desktop` | JSON dump of the session's `state.vscdb` rows |
 | `grok` | JSON bundle of the session directory's files |
 | `grok_bot` | agent-transcript JSONL (`role`/`message` envelopes) |
+| `dsh` | JSON object of the session header and its decompressed JSONL events |
 | `fx` | JSON bundle of the session directory's files |
 | `hermes` | `hermes sessions export` JSON object |
 | `amp` | `amp threads export` JSON |
