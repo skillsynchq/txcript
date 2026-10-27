@@ -68,7 +68,7 @@ pub mod mcp;
 mod pager;
 mod view;
 
-pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
+pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, kimi, fx, hermes, \
      amp, antigravity, simple, cowork, cowork_remote";
 
 /// The `txcript` binary's command line.
@@ -1318,6 +1318,7 @@ mod style {
             HarnessId::CursorDesktop => "\x1b[96m", // bright cyan
             HarnessId::Grok => "\x1b[37m",       // white
             HarnessId::GrokBot => "\x1b[97m",    // bright white
+            HarnessId::Kimi => "\x1b[38;5;141m", // violet
             HarnessId::Fx => "\x1b[38;5;39m",    // azure
             HarnessId::Hermes => "\x1b[93m",     // bright yellow
             HarnessId::Amp => "\x1b[95m",        // bright magenta
@@ -1917,6 +1918,11 @@ fn ensure_resumable_source(source: HarnessId, target: HarnessId) -> Result<(), S
     } else if source == HarnessId::ChatGpt && target == HarnessId::ChatGpt {
         Err(
             "ChatGPT is pull-only: choose another --with harness; txcript never continues conversations in ChatGPT"
+                .to_string(),
+        )
+    } else if source == HarnessId::Kimi && target == HarnessId::Kimi {
+        Err(
+            "Kimi Code is read-only: choose another --with harness; txcript never writes undocumented Kimi session files"
                 .to_string(),
         )
     } else {

@@ -21,6 +21,7 @@ pub mod fx;
 pub mod grok;
 pub mod grok_bot;
 pub mod hermes;
+pub mod kimi;
 pub mod opencode;
 pub mod pi;
 pub mod simple;
