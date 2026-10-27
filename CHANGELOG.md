@@ -13,6 +13,7 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 
 ### Fixed
 
+- Keep the results of parallel tool calls when converting to OpenCode ([#98](https://github.com/skillsynchq/txcript/issues/98)). A source that records each call in its own assistant message, with each result in its own later user message, used to be written with every call's output empty, because the writer only looked for a result in the very next message; it now looks through the following user messages of the turn.
 - Resolve a session id that exists in several stores to the most recently modified copy. `view`, `export`, `continue` and `crop` used to load whichever copy the file system listed first; discovery now breaks start-time ties by file mtime.
 
 ### Added

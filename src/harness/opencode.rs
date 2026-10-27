@@ -575,17 +575,8 @@ fn assistant_part(
                 "metadata": {},
                 "time": time,
             });
-            // Fold matching ToolResult from the following user turn into state.output.
-            if let Some(next) = messages.get(*idx + 1)
-                && matches!(next.role, Role::User)
-                && let Some(result) = next.content.iter().find_map(|b| match b {
-                    Block::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } if tool_use_id == id => Some((content, *is_error)),
-                    _ => None,
-                })
+            // Fold the matching ToolResult into state.output.
+            if let Some(result) = following_result(messages, *idx, id)
                 && let Value::Object(obj) = &mut state
             {
                 if result.1 {
@@ -611,6 +602,39 @@ fn assistant_part(
         obj.insert("messageID".into(), json!(msg_id));
     }
     p
+}
+
+/// The result of call `id` made in `messages[idx]`: the first matching
+/// `ToolResult` in the messages after it, up to the next user message that is
+/// more than tool results (the next prompt). Parallel calls can be recorded one
+/// per assistant message, with each result in its own later user message, so
+/// the result is not always in the very next message.
+fn following_result<'m>(
+    messages: &'m [Message],
+    idx: usize,
+    id: &str,
+) -> Option<(&'m ToolOutput, bool)> {
+    for message in messages.iter().skip(idx + 1) {
+        if message.role != Role::User {
+            continue;
+        }
+        let mut prompt = false;
+        for block in &message.content {
+            match block {
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => return Some((content, *is_error)),
+                Block::ToolResult { .. } => {}
+                _ => prompt = true,
+            }
+        }
+        if prompt {
+            return None;
+        }
+    }
+    None
 }
 
 // ── tool normalization ─────────────────────────────────────────────────
