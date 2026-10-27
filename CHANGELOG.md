@@ -13,6 +13,7 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 
 ### Fixed
 
+- Drop the compaction summary from `claude_code` conversions ([#100](https://github.com/skillsynchq/txcript/issues/100)). The `user` line flagged `isCompactSummary` used to become a user prompt that repeated, condensed, the earlier history the file still holds before the `compact_boundary`. It now stays in the native body only.
 - Resolve a session id that exists in several stores to the most recently modified copy. `view`, `export`, `continue` and `crop` used to load whichever copy the file system listed first; discovery now breaks start-time ties by file mtime.
 
 ### Added
