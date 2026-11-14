@@ -539,7 +539,10 @@ fn body_from_messages(meta: &Meta, messages: &[Message]) -> FxSession {
         while i < messages.len() && !is_prompt(&messages[i]) {
             i += 1;
         }
-        let body = &messages[body_start..i];
+        // A prompt carrying tool results also closes this turn; `i` stays on
+        // it so its text still opens the next.
+        let body_end = i + usize::from(messages.get(i).is_some_and(has_tool_result));
+        let body = &messages[body_start..body_end];
         let ts = prompt
             .or_else(|| body.first())
             .map_or(meta.timestamp, |m| m.timestamp);
