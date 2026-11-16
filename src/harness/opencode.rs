@@ -1,12 +1,12 @@
-//! `OpenCode`: a single `SQLite` database (`~/.local/share/opencode/opencode.db`)
-//! holding `session`, `message`, and `part` rows.
+//! `OpenCode`: a single `SQLite` database (`~/.local/share/opencode/opencode.db`) holding either
+//! `session` / `message` / `part` rows (1.x) or `session_v2` / `session_message` rows (2.x).
 //!
-//! The native [`Body`](OpenCode) is `OpenCode`'s own export shape —
-//! `{info, messages: [{info, parts}]}` — the format `opencode export` emits and
-//! `opencode import` consumes. [`OpenCodeStore`] reads the DB read-only and
-//! assembles that shape; `save` hands it to `opencode import`. The codec and
-//! native types are pure JSON and compile without the `opencode` feature;
-//! only the store pulls in `rusqlite`.
+//! The native [`Body`](OpenCode) is `OpenCode`'s 1.x export shape —
+//! `{info, messages: [{info, parts}]}` — which doubles as the interchange form between the codec
+//! and the store. [`OpenCodeStore`] reads the DB read-only and assembles that shape; `save` hands
+//! it to `OpenCode`'s own import command, translating to the flat document 2.x requires. The codec
+//! and native types are pure JSON and compile without the `opencode` feature; only the store pulls
+//! in `rusqlite`.
 //!
 //! A `part` of type `tool` splits into a [`Block::ToolUse`] on an assistant
 //! message and a [`Block::ToolResult`] on the following user message, matching
@@ -14,6 +14,7 @@
 //! (step-start/finish, snapshot, patch, …) are dropped from the conversation
 //! but preserved in the native body.
 
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -475,7 +476,7 @@ fn build_export(meta: &Meta, messages: &[Message]) -> Export {
     Export {
         info: json!({
             "id": session_id,
-            // `opencode import` requires a slug; derive it from the session
+            // OpenCode's 1.x import requires a slug; derive it from the session
             // id so re-imports stay stable.
             "slug": format!("txcript-{}", &det_hex(&session_id, 0, 0)[..8]),
             "directory": meta.cwd.clone().unwrap_or_default(),
@@ -486,6 +487,310 @@ fn build_export(meta: &Meta, messages: &[Message]) -> Export {
         }),
         messages: out,
     }
+}
+
+// ── codec: from_common for OpenCode 2.x ─────────────────────────────────
+
+/// `OpenCode` 2.x's import document.
+///
+/// 2.x replaced `{info, messages: [{info, parts}]}` with one flat object per message
+/// (`{type: "user", text, files}` / `{type: "assistant", content}`), moved `opencode import` to
+/// `opencode session import`, and made `info.projectID` + `info.location` mandatory. A legacy
+/// export is flattened here at the store boundary so the native body — and everything that reads
+/// it, including the codec — stays on the shape `to_common` already understands.
+fn build_v2_document(export: &Export, project_id: &str) -> Value {
+    let info = &export.info;
+    let read = |key: &str| {
+        info.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let created = info
+        .pointer("/time/created")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let updated = info
+        .pointer("/time/updated")
+        .and_then(Value::as_i64)
+        .unwrap_or(created);
+
+    let mut messages = Vec::with_capacity(export.messages.len());
+    for record in &export.messages {
+        let ts = record
+            .info
+            .pointer("/time/created")
+            .and_then(Value::as_i64)
+            .unwrap_or(created);
+        match record.info.get("role").and_then(Value::as_str) {
+            Some("user") => messages.push(v2_user_message(record, ts)),
+            Some("assistant") => messages.push(v2_assistant_message(record, ts)),
+            _ => {}
+        }
+    }
+
+    let tokens = aggregate_tokens(&messages);
+    json!({
+        "info": {
+            "id": read("id"),
+            "projectID": project_id,
+            "agent": "build",
+            "model": info.get("model").cloned().filter(Value::is_object)
+                .unwrap_or_else(|| json!({ "providerID": "anthropic" })),
+            "cost": 0.0,
+            "tokens": tokens,
+            "outcome": "succeeded",
+            "time": { "created": created, "updated": updated },
+            "title": read("title"),
+            "location": { "directory": read("directory") },
+        },
+        "messages": messages,
+    })
+}
+
+fn v2_user_message(record: &MessageRecord, ts: i64) -> Value {
+    let mut text = String::new();
+    let mut files = Vec::new();
+    for part in &record.parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let chunk = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                if chunk.trim().is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(chunk);
+            }
+            Some("file") => {
+                // 2.x carries attachments beside the text as `files[]` entries with an
+                // inline `[Image N]` mention marker; the legacy `file` part holds a data
+                // URL. The TUI never appends a marker the message already carries
+                // (promptAttachmentLabel reuses marker text), so when rebuilding a
+                // document — a txcript round-trip, or a session OpenCode itself wrote —
+                // point the mention at the existing occurrence instead of growing a
+                // duplicate.
+                let mime = part
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                let Some((header, payload)) = part
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(|url| url.split_once(','))
+                    .filter(|(header, _)| header.starts_with("data:"))
+                else {
+                    continue;
+                };
+                // The import schema only accepts canonical base64; normalize the
+                // forms OpenCode itself tolerates and re-encodes.
+                let payload =
+                    canonical_base64(header, payload).unwrap_or_else(|| payload.to_string());
+                let marker = format!("[Image {}]", files.len() + 1);
+                // Mention offsets are JS string indices (UTF-16 code units): the
+                // composer places extmarks with `String.length`, not Rust byte
+                // offsets, so they diverge as soon as non-ASCII precedes the marker.
+                let start = if let Some(at) = text.find(&marker) {
+                    text[..at].encode_utf16().count()
+                } else {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    let start = text.encode_utf16().count();
+                    text.push_str(&marker);
+                    start
+                };
+                let end = start + marker.encode_utf16().count();
+                files.push(json!({
+                    "data": payload,
+                    "mime": mime,
+                    "source": { "type": "inline" },
+                    "name": "txcript",
+                    "mention": { "text": marker, "start": start, "end": end },
+                }));
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "id": record.info.get("id").cloned().unwrap_or(Value::Null),
+        "time": { "created": ts },
+        "text": text,
+        "files": files,
+        "agents": [],
+        "type": "user",
+    })
+}
+
+fn v2_assistant_message(record: &MessageRecord, ts: i64) -> Value {
+    let mut content = Vec::new();
+    for part in &record.parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    content.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    content.push(json!({ "type": "reasoning", "text": text }));
+                }
+            }
+            // 2.x assistant content is text/reasoning/tool only; an image keeps its place as a
+            // marker rather than silently vanishing from the transcript.
+            Some("file") => {
+                let mime = part.get("mime").and_then(Value::as_str).unwrap_or("image");
+                content.push(json!({ "type": "text", "text": format!("[Image omitted: {mime}]") }));
+            }
+            Some("tool") => content.push(v2_tool_part(part)),
+            _ => {}
+        }
+    }
+
+    let model_id = record
+        .info
+        .get("modelID")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let provider = record
+        .info
+        .get("providerID")
+        .and_then(Value::as_str)
+        .unwrap_or("anthropic");
+    let (finish, raw_finish) = v2_finish(
+        record
+            .info
+            .get("finish")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let completed = record
+        .info
+        .pointer("/time/completed")
+        .and_then(Value::as_i64)
+        .unwrap_or(ts);
+    json!({
+        "id": record.info.get("id").cloned().unwrap_or(Value::Null),
+        "time": { "created": ts, "completed": completed },
+        "type": "assistant",
+        "agent": "build",
+        "model": { "id": model_id, "providerID": provider },
+        "content": content,
+        "finish": finish,
+        "rawFinish": raw_finish,
+        "cost": 0.0,
+        "tokens": record.info.get("tokens").cloned()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({ "input": 0, "output": 0, "reasoning": 0,
+                                       "cache": { "read": 0, "write": 0 } })),
+    })
+}
+
+/// A legacy `tool` part (call and result folded into `state.output`/`state.error`) rewritten as
+/// the 2.x part, which keeps the result in `state.content`.
+fn v2_tool_part(part: &Value) -> Value {
+    let name = part
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let call_id = part
+        .get("callID")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let state = part.get("state");
+    let input = state
+        .and_then(|s| s.get("input"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let status = state
+        .and_then(|s| s.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+
+    let state_json = if status == "error" {
+        let message = state
+            .and_then(|s| s.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("Tool call failed")
+            .to_string();
+        json!({
+            "status": "error",
+            "input": input,
+            "error": { "type": "tool.execution", "message": message },
+            "metadata": { "truncated": false },
+        })
+    } else {
+        let output = state
+            .and_then(|s| s.get("output"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        json!({
+            "status": "completed",
+            "input": input,
+            "content": [{ "type": "text", "text": output }],
+            "metadata": { "truncated": false },
+        })
+    };
+
+    json!({
+        "type": "tool",
+        "id": call_id,
+        "name": name,
+        "executed": true,
+        "state": state_json,
+        "time": { "created": 0, "completed": 0 },
+    })
+}
+
+/// 2.x finish vocabulary differs from the 1.x one it replaced: `tool_use` became `tool-calls`,
+/// and the set of things 1.x spelled as `stop` has no 2.x equivalent other than `unknown`.
+fn v2_finish(finish: &str) -> (String, String) {
+    match finish {
+        "tool_use" | "tool-calls" | "tool_calls" => ("tool-calls".into(), "tool_calls".into()),
+        "length" => ("length".into(), "length".into()),
+        "error" => ("error".into(), "error".into()),
+        "" | "stop" => ("stop".into(), "stop".into()),
+        other => ("unknown".into(), other.to_string()),
+    }
+}
+
+fn aggregate_tokens(messages: &[Value]) -> Value {
+    let mut input = 0i64;
+    let mut output = 0i64;
+    let mut reasoning = 0i64;
+    let mut read = 0i64;
+    let mut write = 0i64;
+    for message in messages {
+        if message.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let tokens = &message["tokens"];
+        input += tokens.get("input").and_then(Value::as_i64).unwrap_or(0);
+        output += tokens.get("output").and_then(Value::as_i64).unwrap_or(0);
+        reasoning += tokens.get("reasoning").and_then(Value::as_i64).unwrap_or(0);
+        read += tokens
+            .pointer("/cache/read")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        write += tokens
+            .pointer("/cache/write")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+    }
+    json!({
+        "input": input,
+        "output": output,
+        "reasoning": reasoning,
+        "cache": { "read": read, "write": write },
+    })
 }
 
 fn user_part(
@@ -698,16 +1003,97 @@ fn parse_file_image(part: &Value) -> Option<ImageSource> {
         .get("mime")
         .and_then(Value::as_str)
         .filter(|mime| mime.starts_with("image/"))?;
-    let (_, data) = part
+    let (header, data) = part
         .get("url")
         .and_then(Value::as_str)?
         .split_once(',')
         .filter(|(header, _)| header.starts_with("data:"))?;
+    // 1.x stored payloads the import schema would reject wholesale —
+    // percent-encoded data URLs and base64 with wrapped lines. OpenCode's own
+    // migration re-encodes both, so mirror it; a payload that survives neither
+    // path is left as-is and fails wherever the consuming harness fails.
+    let data = canonical_base64(header, data).unwrap_or_else(|| data.to_string());
     Some(ImageSource {
         source_type: "base64".to_string(),
         media_type: mime.to_string(),
-        data: data.to_string(),
+        data,
     })
+}
+
+/// Normalizes a data-URL payload into the canonical base64 `OpenCode`'s import
+/// schema demands (`length % 4 == 0 && /^[A-Za-z0-9+/]*={0,2}$/`), the way
+/// `OpenCode`'s own 1.x→2.x migration does (`migrateFile`).
+fn canonical_base64(header: &str, payload: &str) -> Option<String> {
+    if header.ends_with(";base64") {
+        if !non_canonical_base64(payload) {
+            return Some(payload.to_string());
+        }
+        // Re-encode from the bytes: `Buffer.from(payload, "base64")` accepts
+        // whitespace and missing padding, so OpenCode tolerates those on the
+        // way in and emits canonical base64 on the way out.
+        let cleaned: String = payload
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let engine = base64::engine::GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            base64::engine::GeneralPurposeConfig::new()
+                .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+        );
+        engine
+            .decode(cleaned.as_bytes())
+            .ok()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        percent_decode(payload).map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+}
+
+/// True when a base64 payload isn't in the canonical form the import schema's
+/// linear check requires — `length % 4 == 0` with the standard alphabet and at
+/// most two trailing `=` — written as a scan so multi-megabyte payloads don't
+/// hit the schema's backtracking pattern.
+fn non_canonical_base64(payload: &str) -> bool {
+    let bytes = payload.as_bytes();
+    let mut padding = 0;
+    let mut seen_padding = false;
+    for &byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !seen_padding => {}
+            b'=' => {
+                seen_padding = true;
+                padding += 1;
+            }
+            _ => return true,
+        }
+    }
+    !bytes.len().is_multiple_of(4) || padding > 2
+}
+
+/// Percent-decoding, for the 1.x file parts that stored a data URL without a
+/// `;base64` header (`decodeURIComponent` in `OpenCode`'s migration).
+fn percent_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                // The two bytes after a `%` in a well-formed URL are ASCII hex
+                // digits; anything else (including a stray multi-byte char) is
+                // a malformed encoding.
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'%' => return None,
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 fn parse_tokens(tokens: Option<&Value>) -> Option<Usage> {
@@ -736,7 +1122,7 @@ fn parse_tokens(tokens: Option<&Value>) -> Option<Usage> {
 }
 
 fn tokens_value(usage: Option<&Usage>) -> Value {
-    // `opencode import` requires the full tokens object, cache included;
+    // Both import generations require the full tokens object, cache included;
     // absent counts are written as 0 (and read back as `Some(0)`).
     json!({
         "input": usage.map_or(0, |u| u.input_tokens),
@@ -834,12 +1220,12 @@ pub use store::OpenCodeStore;
 #[cfg(feature = "opencode")]
 mod store {
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use rusqlite::{Connection, OpenFlags};
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
-    use super::{Export, MessageRecord, OpenCode};
+    use super::{Export, MessageRecord, OpenCode, build_v2_document};
     use crate::common::{Lineage, Meta, Relation};
     use crate::error::{Error, Result};
     use crate::transcript::{Discovered, Saved, Store, Transcript};
@@ -887,6 +1273,499 @@ mod store {
             Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(sqlite_err)
         }
+
+        /// The schema of the live database. A database that does not exist yet is initialized
+        /// (and the directory registered as a project) by running `OpenCode` itself.
+        fn live_schema(&self, directory: Option<&Path>) -> Result<Schema> {
+            if self.db_path.is_file() {
+                let conn = self.open()?;
+                return schema_of(&conn);
+            }
+            if let Some(dir) = directory.filter(|dir| dir.is_dir()) {
+                let _ = run_opencode(&["session", "list"], dir);
+            }
+            if self.db_path.is_file() {
+                let conn = self.open()?;
+                return schema_of(&conn);
+            }
+            // Still nothing: an OpenCode that has never run here is the 1.x-era one.
+            Ok(Schema::Legacy)
+        }
+
+        /// `session import` in 2.x requires `info.projectID`, but the server
+        /// ignores it — it resolves the project from the `--directory` and
+        /// rewrites the stored row id (`transfer.ts`), so the field only has to
+        /// satisfy the schema. txcript still emits the real row id when the
+        /// read-only `project` table matches, so the document looks like one
+        /// `OpenCode` itself would have written, and falls back to the schema's
+        /// own `"global"` static otherwise.
+        fn project_id(&self, directory: Option<&Path>) -> String {
+            let dir = directory
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            self.find_project(&dir)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "global".to_string())
+        }
+
+        fn find_project(&self, dir: &Path) -> Result<Option<String>> {
+            if !self.db_path.is_file() {
+                return Ok(None);
+            }
+            let conn = self.open()?;
+            if schema_of(&conn)? != Schema::V2 {
+                return Ok(None);
+            }
+            // `project.worktree` stores the canonical git/hg root: OpenCode
+            // resolves a project by walking up from the launch directory to the
+            // nearest marker (`Project.root`), so a directory inside the
+            // repository — txcript run from a subdirectory, or pointed there —
+            // belongs to the same project. Match ancestors too and take the
+            // nearest (deepest) worktree, mirroring that walk.
+            let mut stmt = conn
+                .prepare("SELECT id, worktree FROM project")
+                .map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(sqlite_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sqlite_err)?;
+            let Some(wanted) = dir.canonicalize().ok() else {
+                return Ok(None);
+            };
+            let mut best: Option<(String, usize)> = None;
+            for (id, worktree) in rows {
+                let Some(candidate) = Path::new(&worktree).canonicalize().ok() else {
+                    continue;
+                };
+                if wanted != candidate && !wanted.starts_with(&candidate) {
+                    continue;
+                }
+                let depth = candidate.components().count();
+                if best.as_ref().is_none_or(|(_, d)| depth > *d) {
+                    best = Some((id, depth));
+                }
+            }
+            Ok(best.map(|(id, _)| id))
+        }
+    }
+
+    /// Which generation of `OpenCode`'s storage the database speaks. 2.x keeps the legacy
+    /// `session`/`message`/`part` tables for rows it migrated but writes every new session to
+    /// `session_v2` + `session_message`, and its import command and document shape differ.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Schema {
+        Legacy,
+        V2,
+    }
+
+    fn schema_of(conn: &Connection) -> Result<Schema> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('session_v2', 'session_message')",
+            )
+            .map_err(sqlite_err)?;
+        let found = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+        Ok(if found.len() == 2 {
+            Schema::V2
+        } else {
+            Schema::Legacy
+        })
+    }
+
+    fn discover_v2(conn: &Connection) -> Result<Vec<Discovered<String>>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, directory, title, version, time_created, model, parent_id \
+                 FROM session_v2 WHERE time_archived IS NULL ORDER BY time_created DESC",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let raw: Vec<_> = rows.collect::<rusqlite::Result<_>>().map_err(sqlite_err)?;
+        Ok(raw
+            .into_iter()
+            .map(
+                |(id, directory, title, version, time_created, model_json, parent_id)| Discovered {
+                    meta: Meta {
+                        id: id.clone(),
+                        timestamp: time_created
+                            .and_then(DateTime::from_timestamp_millis)
+                            .unwrap_or_else(Utc::now),
+                        cwd: directory,
+                        git_branch: None,
+                        title: title.filter(|t| !is_placeholder_title(t)),
+                        cli_version: version,
+                        model: model_json.as_deref().and_then(model_id),
+                        lineage: lineage_from_parent_id(parent_id),
+                    },
+                    reference: id,
+                },
+            )
+            .collect())
+    }
+
+    fn load_v2(conn: &Connection, reference: &str) -> Result<Transcript<OpenCode>> {
+        let (meta, info) = session_row_v2(conn, reference)?;
+        let messages = v2_records(conn, reference)?;
+        Ok(Transcript::new(meta, Export { info, messages }))
+    }
+
+    /// 2.x messages are one flat JSON object each; they are expanded back into the legacy
+    /// `{info, parts}` record so `to_common` stays the single code path for both generations.
+    fn v2_records(conn: &Connection, session: &str) -> Result<Vec<MessageRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, type, data, time_created FROM session_message \
+                 WHERE session_id = ?1 ORDER BY seq",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([session], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, data, ts) = row.map_err(sqlite_err)?;
+            // A row whose JSON doesn't parse is dropped; the rest of the session survives.
+            let Ok(data) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            match kind.as_str() {
+                "user" => out.push(v2_user_record(&id, &data, ts)),
+                "assistant" => out.push(v2_assistant_record(&id, &data, ts)),
+                // idle markers, compaction checkpoints and other bookkeeping are not conversation.
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn v2_user_record(id: &str, data: &Value, ts: i64) -> MessageRecord {
+        let mut parts = Vec::new();
+        if let Some(text) = data
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            parts.push(json!({ "type": "text", "text": text }));
+        }
+        for file in data
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let mime = file
+                .get("mime")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let payload = file.get("data").and_then(Value::as_str).unwrap_or_default();
+            parts.push(json!({
+                "type": "file",
+                "mime": mime,
+                "url": format!("data:{mime};base64,{payload}"),
+            }));
+        }
+        MessageRecord {
+            info: json!({ "id": id, "role": "user", "time": { "created": ts } }),
+            parts,
+        }
+    }
+
+    fn v2_assistant_record(id: &str, data: &Value, ts: i64) -> MessageRecord {
+        let mut parts = Vec::new();
+        for item in data
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match item.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        parts.push(json!({ "type": "text", "text": text }));
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        parts.push(json!({ "type": "reasoning", "text": text }));
+                    }
+                }
+                Some("file") => {
+                    let mime = item
+                        .get("mime")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream");
+                    if let Some(url) = item.get("url").and_then(Value::as_str) {
+                        parts.push(json!({ "type": "file", "mime": mime, "url": url }));
+                    }
+                }
+                Some("tool") => parts.push(v2_tool_record_part(item)),
+                _ => {}
+            }
+        }
+        let completed = data
+            .pointer("/time/completed")
+            .and_then(Value::as_i64)
+            .unwrap_or(ts);
+        MessageRecord {
+            info: json!({
+                "id": id,
+                "role": "assistant",
+                "modelID": data.pointer("/model/id").and_then(Value::as_str).unwrap_or_default(),
+                "providerID": data.pointer("/model/providerID").and_then(Value::as_str)
+                    .unwrap_or("anthropic"),
+                "finish": data.get("finish").and_then(Value::as_str).unwrap_or("stop"),
+                "tokens": data.get("tokens").cloned().unwrap_or_else(|| json!({})),
+                "time": { "created": ts, "completed": completed },
+            }),
+            parts,
+        }
+    }
+
+    /// The 2.x tool part keeps the result in `state.content` (or `state.error`); the legacy part
+    /// carries it as `state.output` before `parse_tool` splits off the result block.
+    fn v2_tool_record_part(item: &Value) -> Value {
+        let state = item.get("state");
+        let status = state
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        let input = state
+            .and_then(|s| s.get("input"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let mut legacy_state = json!({ "status": status, "input": input });
+        if status == "error" {
+            let message = state
+                .and_then(|s| s.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Tool call failed");
+            legacy_state["error"] = json!(message);
+        } else {
+            let output = state
+                .and_then(|s| s.get("content"))
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            legacy_state["output"] = json!(output);
+        }
+        json!({
+            "type": "tool",
+            "tool": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+            "callID": item.get("id").and_then(Value::as_str).unwrap_or_default(),
+            "state": legacy_state,
+        })
+    }
+
+    fn session_row_v2(conn: &Connection, id: &str) -> Result<(Meta, Value)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT directory, title, version, time_created, model, time_updated, parent_id \
+                 FROM session_v2 WHERE id = ?1",
+            )
+            .map_err(sqlite_err)?;
+        let row = stmt
+            .query_row([id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let (directory, title, version, time_created, model_json, time_updated, parent_id) = row;
+        let timestamp = time_created
+            .and_then(DateTime::from_timestamp_millis)
+            .unwrap_or_else(Utc::now);
+        let meta = Meta {
+            id: id.to_string(),
+            timestamp,
+            cwd: directory.clone(),
+            git_branch: None,
+            title: title.clone().filter(|t| !is_placeholder_title(t)),
+            cli_version: version.clone(),
+            model: model_json.as_deref().and_then(model_id),
+            lineage: lineage_from_parent_id(parent_id),
+        };
+        let info = json!({
+            "id": id,
+            "directory": directory.unwrap_or_default(),
+            "title": title.unwrap_or_default(),
+            "version": version.unwrap_or_default(),
+            "model": model_json.as_deref().map_or(Value::Null, |m| {
+                serde_json::from_str::<Value>(m).unwrap_or(Value::Null)
+            }),
+            "time": {
+                "created": time_created.unwrap_or(0),
+                "updated": time_updated.or(time_created).unwrap_or(0),
+            },
+        });
+        Ok((meta, info))
+    }
+
+    /// Hands the document to `OpenCode`'s own importer — the schema stays `OpenCode`'s problem.
+    /// 2.x moved the command under `session`, hence the subcommand flip.
+    fn import_document(payload: &str, v2: bool, directory: Option<&Path>) -> Result<String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // A randomized name plus `create_new` keeps the staging file off any predictable,
+        // pre-plantable path (and never follows a symlink); 0600 keeps the transcript private in
+        // a world-shared temp dir.
+        let tmp =
+            std::env::temp_dir().join(format!("opencode-import-{}.json", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(payload.as_bytes())?;
+        drop(file);
+
+        let mut command = Command::new("opencode");
+        if v2 {
+            command.arg("session");
+        }
+        command.arg("import").arg(&tmp);
+        if v2 && let Some(dir) = directory {
+            command.arg("--directory").arg(dir);
+        }
+        let output = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| Error::Unconvertible {
+                harness: "opencode",
+                detail: format!("running `opencode import`: {e} (is OpenCode on PATH?)"),
+            })?;
+        if output.status.success() {
+            let _ = std::fs::remove_file(&tmp);
+            parse_import_output(
+                payload,
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                v2,
+            )
+        } else {
+            // The staged document is left behind on purpose, for debugging.
+            Err(Error::Unconvertible {
+                harness: "opencode",
+                detail: format!(
+                    "`opencode import` failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            })
+        }
+    }
+
+    /// Interprets `opencode import` output. 2.x rejects a duplicate id with a
+    /// 409, and its CLI reports that by printing `Session already exists` to
+    /// stderr while still exiting 0 with empty stdout — treating it as success
+    /// would leave the stored session silently stale, so surface the conflict.
+    fn parse_import_output(payload: &str, stdout: &str, stderr: &str, v2: bool) -> Result<String> {
+        if v2 && stderr.contains("Session already exists") {
+            let id = serde_json::from_str::<Value>(payload)
+                .ok()
+                .and_then(|doc| {
+                    doc.pointer("/info/id")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_default();
+            return Err(Error::Unconvertible {
+                harness: "opencode",
+                detail: if id.is_empty() {
+                    "`opencode session import` rejected the document: a session with this \
+                     id already exists (2.x refuses duplicates instead of updating them)."
+                        .to_string()
+                } else {
+                    format!(
+                        "`opencode session import` rejected the document: session `{id}` \
+                         already exists (2.x refuses a duplicate id instead of updating \
+                         the stored session)."
+                    )
+                },
+            });
+        }
+        Ok(stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Imported session: ").map(str::trim))
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Runs one `OpenCode` CLI command in a directory — used to bootstrap a
+    /// database when `OpenCode` has never run there.
+    fn run_opencode(args: &[&str], cwd: &Path) -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let output = Command::new("opencode")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| Error::Unconvertible {
+                harness: "opencode",
+                detail: format!("running `opencode {}`: {e} (is OpenCode on PATH?)", args[0]),
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::Unconvertible {
+                harness: "opencode",
+                detail: format!(
+                    "`opencode {}` failed: {}",
+                    args[0],
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            })
+        }
     }
 
     impl Store for OpenCodeStore {
@@ -896,6 +1775,9 @@ mod store {
         fn discover(&self) -> Result<Vec<Discovered<String>>> {
             if self.db_path.is_file() {
                 let conn = self.open()?;
+                if schema_of(&conn)? == Schema::V2 {
+                    return discover_v2(&conn);
+                }
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, directory, title, version, time_created, model, parent_id \
@@ -946,6 +1828,9 @@ mod store {
 
         fn load(&self, reference: &String) -> Result<Transcript<OpenCode>> {
             let conn = self.open()?;
+            if schema_of(&conn)? == Schema::V2 {
+                return load_v2(&conn, reference);
+            }
 
             let (meta, info) = session_row(&conn, reference)?;
 
@@ -1005,61 +1890,54 @@ mod store {
         }
 
         fn save(&self, transcript: &Transcript<OpenCode>) -> Result<Saved<String>> {
-            // OpenCode owns its schema; hand it the export and let `opencode
-            // import` normalize and persist. Requires the `opencode` binary.
-            use std::io::Write;
-            use std::process::{Command, Stdio};
+            // OpenCode owns its schema; hand it the document and let its own importer normalize
+            // and persist. Which document (and which command) depends on the generation of the
+            // database in front of us. Requires the `opencode` binary.
+            let export = &transcript.body;
+            // The recorded cwd may have been a temp checkout that no longer exists; imports land
+            // in a live project, so fall back to the process directory in that case.
+            let recorded = export
+                .info
+                .get("directory")
+                .and_then(Value::as_str)
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from);
+            let directory = recorded
+                .filter(|dir| dir.is_dir())
+                .or_else(|| std::env::current_dir().ok());
 
-            let export = serde_json::to_string(&transcript.body)?;
-            // A randomized name plus `create_new` keeps the staging file off
-            // any predictable, pre-plantable path (and never follows a
-            // symlink); 0600 keeps the exported transcript private in a
-            // world-shared temp dir.
-            let tmp =
-                std::env::temp_dir().join(format!("opencode-import-{}.json", uuid::Uuid::new_v4()));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&tmp)?;
-            file.write_all(export.as_bytes())?;
-            drop(file);
-
-            let output = Command::new("opencode")
-                .arg("import")
-                .arg(&tmp)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|e| Error::Unconvertible {
-                    harness: "opencode",
-                    detail: format!("running `opencode import`: {e} (is OpenCode on PATH?)"),
-                })?;
-            if output.status.success() {
-                let _ = std::fs::remove_file(&tmp);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let id = stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Imported session: ").map(str::trim))
-                    .map_or_else(|| transcript.meta.id.clone(), String::from);
-                Ok(Saved {
-                    reference: id.clone(),
-                    id,
-                })
+            let imported = match self.live_schema(directory.as_deref())? {
+                Schema::Legacy => import_document(&serde_json::to_string(export)?, false, None)?,
+                Schema::V2 => {
+                    let project_id = self.project_id(directory.as_deref());
+                    let mut document = build_v2_document(export, &project_id);
+                    // Keep the document's location in step with the directory actually imported.
+                    if let Some(dir) = &directory {
+                        document["info"]["location"]["directory"] =
+                            json!(dir.display().to_string());
+                    }
+                    import_document(
+                        &serde_json::to_string(&document)?,
+                        true,
+                        directory.as_deref(),
+                    )?
+                }
+            };
+            // Fall back to the id txcript minted when the CLI printed none.
+            let id = if imported.is_empty() {
+                export
+                    .info
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
             } else {
-                // The export file is left behind on purpose, for debugging.
-                Err(Error::Unconvertible {
-                    harness: "opencode",
-                    detail: format!(
-                        "`opencode import` failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ),
-                })
-            }
+                imported
+            };
+            Ok(Saved {
+                reference: id.clone(),
+                id,
+            })
         }
 
         /// Archives the session in place — `OpenCode`'s own notion of
@@ -1067,11 +1945,18 @@ mod store {
         /// archived sessions out; the rows stay, reversible from `OpenCode`.
         fn delete(&self, reference: &String) -> Result<()> {
             let conn = Connection::open(&self.db_path).map_err(sqlite_err)?;
+            let table = if schema_of(&conn)? == Schema::V2 {
+                "session_v2"
+            } else {
+                "session"
+            };
             let now = chrono::Utc::now().timestamp_millis();
             let updated = conn
                 .execute(
-                    "UPDATE session SET time_archived = ?1 \
-                     WHERE id = ?2 AND time_archived IS NULL",
+                    &format!(
+                        "UPDATE {table} SET time_archived = ?1 \
+                         WHERE id = ?2 AND time_archived IS NULL"
+                    ),
                     rusqlite::params![now, reference],
                 )
                 .map_err(sqlite_err)?;
@@ -1088,10 +1973,15 @@ mod store {
         fn fingerprints(&self, refs: &[String]) -> Result<HashMap<String, String>> {
             if self.db_path.is_file() {
                 let conn = self.open()?;
+                let table = if schema_of(&conn)? == Schema::V2 {
+                    "session_message"
+                } else {
+                    "message"
+                };
                 let mut stmt = conn
-                    .prepare(
-                        "SELECT session_id, MAX(time_created) FROM message GROUP BY session_id",
-                    )
+                    .prepare(&format!(
+                        "SELECT session_id, MAX(time_created) FROM {table} GROUP BY session_id"
+                    ))
                     .map_err(sqlite_err)?;
                 let rows = stmt
                     .query_map([], |r| {
@@ -1242,7 +2132,7 @@ mod store {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO message VALUES ('m_a','ses_1',1778834704540,?1)",
+                "INSERT INTO message VALUES ('m_a','ses_1',1_778_834_704_540,?1)",
                 params![r#"{"role":"assistant","modelID":"claude-opus-4-7","finish":"stop","tokens":{"input":6,"output":88,"cache":{"write":21428,"read":10}}}"#],
             )
             .unwrap();
@@ -1310,6 +2200,128 @@ mod store {
             assert!(found.iter().all(|d| d.reference != "ses_2"));
         }
 
+        /// `OpenCode` 2.x's tables: `session_v2` plus one flat
+        /// `session_message` per turn.
+        fn make_v2_db() -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("transcript-oc2-test-{n}-{:?}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("opencode.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);\
+                 CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, \
+                   slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT, version TEXT NOT NULL, \
+                   model TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, \
+                   time_archived INTEGER, parent_id TEXT);\
+                 CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+                   type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, \
+                   time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO project VALUES ('prj_1','/repo')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO session_v2 VALUES ('ses_v2','prj_1','demo','/repo','Demo','2.3.0',\
+                   '{\"id\":\"claude-opus-4-7\",\"providerID\":\"anthropic\"}',1778834704515,1778834704516,NULL,NULL)",
+                [],
+            )
+            .unwrap();
+            for (id, kind, seq, ts, data) in [
+                (
+                    "msg_u",
+                    "user",
+                    1,
+                    1_778_834_704_520_i64,
+                    r#"{"text":"edit it","files":[],"agents":[]}"#,
+                ),
+                (
+                    "msg_a1",
+                    "assistant",
+                    2,
+                    1_778_834_704_540,
+                    r#"{"time":{"created":1778834704540,"completed":1778834704550},"agent":"build","model":{"id":"claude-opus-4-7","providerID":"anthropic"},"content":[{"type":"reasoning","text":"thinking"},{"type":"text","text":"On it."},{"type":"tool","id":"c1","name":"edit","state":{"status":"completed","input":{"filePath":"/repo/a.rs","oldString":"old","newString":"new"},"content":[{"type":"text","text":"done"}],"metadata":{}}},{"type":"text","text":"Finished."}],"finish":"tool-calls","cost":0,"tokens":{"input":6,"output":88,"reasoning":0,"cache":{"read":10,"write":21428}}}"#,
+                ),
+                (
+                    "msg_idle",
+                    "idle",
+                    3,
+                    1_778_834_704_560,
+                    r#"{"outcome":"succeeded"}"#,
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_message VALUES (?1,'ses_v2',?2,?3,?4,?4,?5)",
+                    params![id, kind, seq, ts, data],
+                )
+                .unwrap();
+            }
+            path
+        }
+
+        #[test]
+        fn discover_and_load_from_v2_tables() {
+            let path = make_v2_db();
+            let store = OpenCodeStore::new(&path);
+
+            let found = store.discover().unwrap();
+            assert_eq!(found.len(), 1, "the idle marker is not a session");
+            let d = &found[0];
+            assert_eq!(d.reference, "ses_v2");
+            assert_eq!(d.meta.title.as_deref(), Some("Demo"));
+            assert_eq!(d.meta.model.as_deref(), Some("claude-opus-4-7"));
+            assert_eq!(d.meta.cwd.as_deref(), Some("/repo"));
+
+            let native = store.load(&d.reference).unwrap();
+            let msgs = OpenCode::to_common(&native).unwrap().body;
+            // user | assistant(reasoning+text) | assistant(tool) | user(result) | assistant(text)
+            assert_eq!(msgs.len(), 5);
+            assert_eq!(msgs[0].role, Role::User);
+            assert!(matches!(
+                &msgs[2].content[0],
+                Block::ToolUse { id, tool: Tool::Edit { file_path, .. } }
+                    if id == "c1" && file_path == "/repo/a.rs"
+            ));
+            assert!(
+                matches!(&msgs[3].content[0], Block::ToolResult { tool_use_id, .. } if tool_use_id == "c1")
+            );
+            let usage = msgs[4].usage.unwrap();
+            assert_eq!(usage.input_tokens, 6);
+            assert_eq!(usage.cache_creation_input_tokens, Some(21428));
+        }
+
+        #[test]
+        fn v2_delete_archives_the_row() {
+            let path = make_v2_db();
+            let store = OpenCodeStore::new(&path);
+            store.delete(&"ses_v2".to_string()).unwrap();
+            assert!(store.discover().unwrap().is_empty());
+            // Archived, not removed: 2.x keeps the row for its own UI.
+            let conn = Connection::open(&path).unwrap();
+            let archived: i64 = conn
+                .query_row(
+                    "SELECT time_archived FROM session_v2 WHERE id = 'ses_v2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(archived > 0);
+        }
+
+        #[test]
+        fn v2_fingerprints_track_session_message_times() {
+            let path = make_v2_db();
+            let store = OpenCodeStore::new(&path);
+            let prints = store.fingerprints(&["ses_v2".to_string()]).unwrap();
+            assert_eq!(
+                prints.get("ses_v2"),
+                Some(&1_778_834_704_560_i64.to_string())
+            );
+        }
+
         /// `session.parent_id` names a spawning session; the signal is a
         /// bare column read, so both `discover` and `load` surface it
         /// without any extra query.
@@ -1338,6 +2350,280 @@ mod store {
             let lineage = loaded.meta.lineage.as_ref().expect("spawn lineage on load");
             assert_eq!(lineage.parent, "ses_1");
             assert_eq!(lineage.relation, Relation::Spawn);
+        }
+
+        #[test]
+        fn project_lookup_matches_subdirectories_of_the_worktree() {
+            // `project.worktree` holds the canonical repo root: OpenCode
+            // resolves a project by walking up to the nearest marker, so
+            // txcript run from (or pointed at) a subdirectory belongs to the
+            // same project.
+            let path = make_v2_db();
+            let root = path.parent().unwrap().join("repo");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE project SET worktree = ?1",
+                params![root.display().to_string()],
+            )
+            .unwrap();
+            drop(conn);
+
+            let store = OpenCodeStore::new(&path);
+            assert_eq!(store.project_id(Some(root.as_path())), "prj_1");
+            assert_eq!(store.project_id(Some(root.join("src").as_path())), "prj_1");
+
+            // A directory no project row encloses falls back to the schema's
+            // own static instead of failing the save.
+            let elsewhere = path.parent().unwrap().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            assert_eq!(store.project_id(Some(elsewhere.as_path())), "global");
+        }
+
+        #[test]
+        fn duplicate_import_is_an_error_not_a_silent_success() {
+            // 2.x reports a conflicting id on stderr while exiting 0; treating
+            // that as success would leave the stored session silently stale.
+            let err = super::parse_import_output(
+                r#"{"info":{"id":"ses_1"}}"#,
+                "",
+                "Session already exists\n",
+                true,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("ses_1"));
+
+            // The happy path still parses the printed id, and the conflict
+            // marker is only treated as one in the 2.x shape.
+            let id = super::parse_import_output(
+                r#"{"info":{"id":"ses_1"}}"#,
+                "Imported session: ses_9\n",
+                "",
+                false,
+            )
+            .unwrap();
+            assert_eq!(id, "ses_9");
+        }
+    }
+}
+
+#[cfg(test)]
+mod v2_document_tests {
+    use base64::Engine as _;
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
+
+    use super::{OpenCode, build_v2_document, parse_file_image};
+    use crate::common::{Block, ImageSource, Message, Meta, Role, Tool, ToolOutput};
+    use crate::transcript::{Codec, Common, Transcript};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn sample() -> Transcript<Common> {
+        let meta = Meta {
+            id: "ses_1".into(),
+            timestamp: ts("2026-01-02T03:04:05.000Z"),
+            cwd: Some("/repo".into()),
+            git_branch: None,
+            title: Some("Demo".into()),
+            cli_version: Some("2.3.0".into()),
+            model: Some("claude-opus-4-7".into()),
+            lineage: None,
+        };
+        let model = || Some("claude-opus-4-7".to_string());
+        let body = vec![
+            Message {
+                role: Role::User,
+                content: vec![
+                    Block::Image {
+                        source: ImageSource {
+                            source_type: "base64".into(),
+                            media_type: "image/png".into(),
+                            data: "AAAA".into(),
+                        },
+                    },
+                    Block::Text {
+                        text: "please edit".into(),
+                    },
+                ],
+                timestamp: ts("2026-01-02T03:04:06.000Z"),
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    Block::Thinking {
+                        text: "thinking".into(),
+                        signature: None,
+                        encrypted: None,
+                    },
+                    Block::Text {
+                        text: "On it.".into(),
+                    },
+                    Block::ToolUse {
+                        id: "c1".into(),
+                        tool: Tool::from_canonical("Bash", json!({ "command": "ls" })),
+                    },
+                ],
+                timestamp: ts("2026-01-02T03:04:07.000Z"),
+                model: model(),
+                stop_reason: None,
+                usage: None,
+            },
+            Message {
+                role: Role::User,
+                content: vec![Block::ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: ToolOutput::Text("ok".into()),
+                    is_error: false,
+                }],
+                timestamp: ts("2026-01-02T03:04:08.000Z"),
+                model: None,
+                stop_reason: None,
+                usage: None,
+            },
+        ];
+        Transcript::new(meta, body)
+    }
+
+    #[test]
+    fn flattens_the_legacy_export_into_the_2x_document() {
+        let native = OpenCode::from_common(&sample()).unwrap();
+        let doc = build_v2_document(&native.body, "prj_1");
+
+        // 2.x refuses an import without the project row and the location object.
+        assert_eq!(doc["info"]["projectID"], "prj_1");
+        assert_eq!(doc["info"]["location"]["directory"], "/repo");
+        assert_eq!(doc["info"]["title"], "Demo");
+        assert_eq!(doc["info"]["outcome"], "succeeded");
+
+        let user = &doc["messages"][0];
+        assert_eq!(user["type"], "user");
+        assert_eq!(user["text"], "[Image 1]\n\nplease edit");
+        assert_eq!(user["files"][0]["mime"], "image/png");
+        assert_eq!(user["files"][0]["data"], "AAAA");
+        assert_eq!(user["files"][0]["mention"]["text"], "[Image 1]");
+
+        let assistant = &doc["messages"][1];
+        assert_eq!(assistant["type"], "assistant");
+        assert_eq!(assistant["content"][0]["type"], "reasoning");
+        assert_eq!(assistant["content"][1]["type"], "text");
+        let tool = &assistant["content"][2];
+        assert_eq!(tool["type"], "tool");
+        assert_eq!(tool["name"], "bash");
+        assert_eq!(tool["id"], "c1");
+        assert_eq!(tool["state"]["status"], "completed");
+        // The result moved from `state.output` into 2.x's `state.content`.
+        assert_eq!(tool["state"]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn round_trip_reuses_the_marker_already_in_the_text() {
+        // A v2 session OpenCode itself wrote — or that txcript exported
+        // earlier — keeps the `[Image N]` marker in the text. Rebuilding the
+        // document must point the mention at that occurrence, not grow a
+        // second copy of the marker.
+        let mut transcript = sample();
+        transcript.body[0].content = vec![
+            Block::Text {
+                text: "[Image 1]\n\nplease edit".into(),
+            },
+            Block::Image {
+                source: ImageSource {
+                    source_type: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+            },
+        ];
+        let native = OpenCode::from_common(&transcript).unwrap();
+        let doc = build_v2_document(&native.body, "prj_1");
+
+        let user = &doc["messages"][0];
+        assert_eq!(user["text"], "[Image 1]\n\nplease edit");
+        assert_eq!(user["files"][0]["mention"]["start"], 0);
+        assert_eq!(user["files"][0]["mention"]["end"], 9);
+    }
+
+    #[test]
+    fn mention_offsets_are_utf16_string_indices() {
+        // The composer places attachment extmarks with `String.length`, so the
+        // offsets are UTF-16 code units: 🦀 is one char, four UTF-8 bytes and
+        // two UTF-16 units. A byte offset would say 10, a char count 7.
+        let mut transcript = sample();
+        transcript.body[0].content = vec![
+            Block::Text {
+                text: "\u{1F980}ello".into(),
+            },
+            Block::Image {
+                source: ImageSource {
+                    source_type: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+            },
+        ];
+        let native = OpenCode::from_common(&transcript).unwrap();
+        let doc = build_v2_document(&native.body, "prj_1");
+
+        let user = &doc["messages"][0];
+        assert_eq!(user["text"], "\u{1F980}ello\n\n[Image 1]");
+        assert_eq!(user["files"][0]["mention"]["start"], 8);
+        assert_eq!(user["files"][0]["mention"]["end"], 17);
+    }
+
+    #[test]
+    fn normalizes_attachment_payloads_to_canonical_base64() {
+        // The import schema accepts nothing but canonical base64; a payload
+        // with missing padding is re-encoded the way OpenCode's own migration
+        // does instead of failing the whole import.
+        let mut transcript = sample();
+        transcript.body[0].content = vec![Block::Image {
+            source: ImageSource {
+                source_type: "base64".into(),
+                media_type: "image/png".into(),
+                data: "AAA".into(),
+            },
+        }];
+        let native = OpenCode::from_common(&transcript).unwrap();
+        let doc = build_v2_document(&native.body, "prj_1");
+
+        assert_eq!(doc["messages"][0]["files"][0]["data"], "AAA=");
+    }
+
+    #[test]
+    fn parse_file_image_re_encodes_percent_encoded_payloads() {
+        // 1.x also stored attachments as data URLs without a `;base64`
+        // header — a percent-encoded payload the 2.x import schema would
+        // reject and OpenCode's migration re-encodes.
+        let part = json!({
+            "type": "file",
+            "mime": "image/png",
+            "url": "data:image/png,%FF%FE%00%01",
+        });
+        let source = parse_file_image(&part).unwrap();
+        assert_eq!(
+            source.data,
+            base64::engine::general_purpose::STANDARD.encode([0xFFu8, 0xFE, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn base64_canonicality_mirrors_the_import_schema() {
+        // The schema's linear check: `length % 4 == 0` and the standard
+        // alphabet with at most two trailing `=`.
+        for canonical in ["", "AAAA", "AA==", "AAA=", "+/=="] {
+            assert!(!super::non_canonical_base64(canonical), "{canonical:?}");
+        }
+        for non_canonical in ["A", "AA", "AAA", "AA AA", "A===", "AAAA=", "=AAA", "AA-_"] {
+            assert!(
+                super::non_canonical_base64(non_canonical),
+                "{non_canonical:?}"
+            );
         }
     }
 }

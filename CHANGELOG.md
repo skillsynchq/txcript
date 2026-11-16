@@ -13,6 +13,7 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 
 ### Fixed
 
+- Support OpenCode 2.x. 2.x writes new sessions to `session_v2`/`session_message`, moved `opencode import` to `opencode session import`, and requires `info.projectID` plus `info.location` in the import document; a database holding those tables now gets the flattened 2.x document (the project id is read from the `project` table when it matches, including from a repo subdirectory, and falls back to OpenCode's own `global` sentinel — the server derives the project from the import directory anyway), while 1.x databases keep the legacy path. A duplicate session id is reported as an error instead of a silent no-op, and 2.x sessions are also discovered, loaded, fingerprinted and archived through the new tables.
 - Resolve a session id that exists in several stores to the most recently modified copy. `view`, `export`, `continue` and `crop` used to load whichever copy the file system listed first; discovery now breaks start-time ties by file mtime.
 
 ### Added
