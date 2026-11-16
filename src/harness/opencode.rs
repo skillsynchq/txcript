@@ -862,7 +862,12 @@ fn v2_tool_part(part: &Value, ts: i64) -> Value {
         "type": "tool",
         "id": call_id,
         "name": name,
-        "executed": true,
+        // `executed` is OpenCode's "providerExecuted" flag: true means the
+        // provider ran the tool server-side, and replay then insists on a
+        // server-tool result type it only knows for web_search / code_execution
+        // / web_fetch. Imported history was run locally by the source harness,
+        // so this must stay false.
+        "executed": false,
         "state": state_json,
         "time": { "created": started, "completed": completed },
     })
@@ -2787,6 +2792,12 @@ mod v2_document_tests {
         assert_eq!(tool["state"]["status"], "completed");
         // The result moved from `state.output` into 2.x's `state.content`.
         assert_eq!(tool["state"]["content"][0]["text"], "ok");
+        // `executed` is OpenCode's `providerExecuted`. Marking an imported
+        // call as provider-executed makes replay treat its result as a server
+        // tool result, which Anthropic Messages only knows for web_search,
+        // code_execution and web_fetch — it fails with "does not know how to
+        // round-trip server tool result for <name>" on anything else.
+        assert_eq!(tool["executed"], false);
     }
 
     #[test]
