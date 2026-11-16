@@ -58,10 +58,11 @@ parts}]}` document that `opencode export` emits — that export shape, not the
 raw rows, is txcript's native `Body` for this harness. Loading a 2.x session
 selects `session_message` rows by `seq` and expands each flat message back
 into the same `{info, parts}` record, so both generations converge on one code
-path. One asymmetry to know about: txcript's native `Body` is the 1.x export
-shape, so a file produced by 2.x `opencode session export` (the flat shape)
-is not something `from_text` parses, and a 2.x session loaded from the
-database serializes back as the 1.x-shaped records.
+path. A 2.x record with no 1.x shape — `compaction`, `idle`, `shell`,
+`system`, … — rides through as an opaque record the codec skips and an export
+writes back unchanged. The text form (`from_text`/`to_text`, used by the WASM
+converters) speaks the 2.x `opencode session export` document and reads the
+1.x export shape as well.
 
 ## Writing into OpenCode 2.x
 
@@ -80,20 +81,37 @@ array) and it *requires* two fields the 1.x export never had:
   own `"global"` static when nothing does. `info.location.directory` is kept
   in step with the `--directory` argument txcript passes.
 
-`OpenCodeStore::save` therefore inspects the live database first: a 1.x
-database gets the legacy document through `opencode import`, a 2.x database
-gets the flat document through `opencode session import --directory …`. The
-conversion is mechanical: a user turn's text parts join into `text`, `file`
+`OpenCodeStore::save` asks `opencode --version` which generation it is
+talking to: a CLI before 2.1 gets the legacy document through
+`opencode import`, 2.1 and later get the flat document through
+`opencode session import --directory …`. The binary, not the database, is the
+signal because an upgraded CLI migrates an old database on its next start —
+the import may legitimately run first.
+
+The conversion is mechanical: a user turn's text parts join into `text`, `file`
 parts become `files[]` entries with an inline `[Image N]` marker, assistant
 `text`/`reasoning` parts map one-to-one, a `tool` part moves `state.output`
-into `state.content`, and `tool_use` becomes `finish: "tool-calls"`. Token
-counts roll up into `info.tokens`. Attachment payloads are normalized to the
-canonical base64 the import schema demands — 1.x also stored percent-encoded
-data URLs and wrapped base64, and OpenCode's own migration re-encodes both —
-and mention offsets are written as JS string indices (UTF-16 code units),
-matching how the composer places extmarks. An `[Image N]` marker already
-present in the text is pointed at rather than appended a second time, so a
-round-trip doesn't fork the marker.
+into `state.content`, and `tool_use` becomes `finish: "tool-calls"`. Injected
+(`synthetic`) user text becomes its own `synthetic` record. Token counts roll
+up into `info.tokens`, every per-message token object is written in the full
+shape the schema validates, and tool input is forced to an object (a freeform
+Codex code-mode input rides as `{"input": …}`).
+
+2.x also renamed the built-in tools and several input keys, so the document
+uses its names (`packages/core/src/tool/plugin/*.ts`): `bash` is `shell`
+(`timeout_ms` → `timeout`, `run_in_background` → `background`), `read`,
+`edit` and `write` take `path` for `filePath`, `grep` takes `include` for
+`glob` and `limit` for `head_limit` (its `-i` flag is the inverse of
+`caseSensitive`), `task` is `subagent` (`subagent_type` → `agent`), `Skill`
+is `skill` (`skill` → `id`), and `WebSearch` is `websearch`. Reading maps
+them back, so every other key survives a round trip unchanged.
+
+Attachment payloads are normalized to the canonical base64 the import schema
+demands — 1.x also stored percent-encoded data URLs and wrapped base64, and
+OpenCode's own migration re-encodes both — and mention offsets are written as
+JS string indices (UTF-16 code units), matching how the composer places
+extmarks. An `[Image N]` marker already present in the text is pointed at
+rather than appended a second time, so a round-trip doesn't fork the marker.
 
 Re-importing a session whose id already exists does not update it: 2.x
 rejects the duplicate (the CLI prints `Session already exists` to stderr and

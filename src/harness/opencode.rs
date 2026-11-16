@@ -77,15 +77,88 @@ impl Codec for OpenCode {
 }
 
 impl TextCodec for OpenCode {
-    /// The text form is the `opencode export` JSON document.
+    /// The text form is the current `opencode session export` document (2.x,
+    /// flat records); the 1.x `opencode export` shape is read as well.
     fn from_text(text: &str) -> Result<Transcript<Self>> {
-        let export: Export = serde_json::from_str(text)?;
+        let doc: Value = serde_json::from_str(text)?;
+        let export = if is_v2_document(&doc) {
+            v2_document_to_export(&doc)
+        } else {
+            serde_json::from_value(doc)?
+        };
         let meta = meta_from_info(&export.info);
         Ok(Transcript::new(meta, export))
     }
 
     fn to_text(transcript: &Transcript<Self>) -> Result<String> {
-        Ok(serde_json::to_string(&transcript.body)?)
+        Ok(serde_json::to_string(&build_v2_document(
+            &transcript.body,
+            "global",
+        ))?)
+    }
+}
+
+/// True when the document is `opencode session export`'s 2.x layout: a flat
+/// message record (a `type`, no `parts`), or — with no messages — a 2.x header,
+/// which names the working directory in `location` rather than `directory`.
+fn is_v2_document(doc: &Value) -> bool {
+    match doc
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.first())
+    {
+        Some(first) => first.get("type").is_some() && first.get("parts").is_none(),
+        None => doc
+            .get("info")
+            .is_some_and(|info| info.get("projectID").is_some() || info.get("location").is_some()),
+    }
+}
+
+/// The native (1.x-shaped) body for a 2.x document, so `from_text` accepts what
+/// `opencode session export` produces and the codec keeps one shape.
+fn v2_document_to_export(doc: &Value) -> Export {
+    let mut header = doc.get("info").cloned().unwrap_or_else(|| json!({}));
+    // The 1.x header spells the working directory `directory`; 2.x nests it in
+    // `location`, and everything that reads the native body expects the former.
+    let directory = header
+        .pointer("/location/directory")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map(String::from);
+    if header.get("directory").is_none()
+        && let Some(directory) = directory
+    {
+        header["directory"] = json!(directory);
+    }
+    let messages = doc
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|record| {
+                    let kind = record.get("type").and_then(Value::as_str)?;
+                    let id = record.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let ts = record
+                        .pointer("/time/created")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    Some(match kind {
+                        "user" => v2_user_record(id, record, ts),
+                        "assistant" => v2_assistant_record(id, record, ts),
+                        // A record with no 1.x shape rides verbatim.
+                        _ => MessageRecord {
+                            info: record.clone(),
+                            parts: Vec::new(),
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Export {
+        info: header,
+        messages,
     }
 }
 
@@ -523,39 +596,52 @@ fn build_v2_document(export: &Export, project_id: &str) -> Value {
             .and_then(Value::as_i64)
             .unwrap_or(created);
         match record.info.get("role").and_then(Value::as_str) {
-            Some("user") => messages.push(v2_user_message(record, ts)),
+            Some("user") => messages.extend(v2_user_records(record, ts)),
             Some("assistant") => messages.push(v2_assistant_message(record, ts)),
-            _ => {}
+            // A 2.x record with no 1.x shape (`compaction`, `idle`, `shell`,
+            // `synthetic`, …) rides through verbatim.
+            _ => {
+                if record.info.get("type").is_some() {
+                    messages.push(record.info.clone());
+                }
+            }
         }
     }
 
     let tokens = aggregate_tokens(&messages);
-    json!({
-        "info": {
-            "id": read("id"),
-            "projectID": project_id,
-            "agent": "build",
-            "model": info.get("model").cloned().filter(Value::is_object)
-                .unwrap_or_else(|| json!({ "providerID": "anthropic" })),
-            "cost": 0.0,
-            "tokens": tokens,
-            "outcome": "succeeded",
-            "time": { "created": created, "updated": updated },
-            "title": read("title"),
-            "location": { "directory": read("directory") },
-        },
-        "messages": messages,
-    })
+    let mut header = json!({
+        "id": read("id"),
+        "projectID": project_id,
+        "agent": info.get("agent").and_then(Value::as_str).unwrap_or("build"),
+        "model": info.get("model").cloned().filter(Value::is_object)
+            .unwrap_or_else(|| json!({ "providerID": "anthropic" })),
+        "cost": info.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+        "tokens": tokens,
+        "outcome": info.get("outcome").and_then(Value::as_str).unwrap_or("succeeded"),
+        "time": { "created": created, "updated": updated },
+        "title": read("title"),
+        "location": { "directory": read("directory") },
+    });
+    if let Some(parent) = info.get("parentID").and_then(Value::as_str) {
+        header["parentID"] = json!(parent);
+    }
+    json!({ "info": header, "messages": messages })
 }
 
-fn v2_user_message(record: &MessageRecord, ts: i64) -> Value {
+fn v2_user_records(record: &MessageRecord, ts: i64) -> Vec<Value> {
     let mut text = String::new();
+    let mut synthetic = Vec::new();
     let mut files = Vec::new();
     for part in &record.parts {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
                 let chunk = part.get("text").and_then(Value::as_str).unwrap_or_default();
                 if chunk.trim().is_empty() {
+                    continue;
+                }
+                // Injected text has its own 2.x record; it is not the prompt.
+                if is_synthetic(part) {
+                    synthetic.push(chunk);
                     continue;
                 }
                 if !text.is_empty() {
@@ -613,20 +699,38 @@ fn v2_user_message(record: &MessageRecord, ts: i64) -> Value {
             _ => {}
         }
     }
-    json!({
-        "id": record.info.get("id").cloned().unwrap_or(Value::Null),
-        "time": { "created": ts },
-        "text": text,
-        "files": files,
-        "agents": [],
-        "type": "user",
-    })
+    let id = record.info.get("id").cloned().unwrap_or(Value::Null);
+    let mut out = Vec::new();
+    if !text.is_empty() || !files.is_empty() {
+        out.push(json!({
+            "id": id,
+            "time": { "created": ts },
+            "text": text,
+            "files": files,
+            "agents": [],
+            "type": "user",
+        }));
+    }
+    for (i, body) in synthetic.into_iter().enumerate() {
+        let id = id
+            .as_str()
+            .map_or_else(|| format!("msg_s{i}"), |id| format!("{id}_s{i}"));
+        out.push(json!({
+            "id": id,
+            "type": "synthetic",
+            "time": { "created": ts },
+            "text": body,
+        }));
+    }
+    out
 }
 
 fn v2_assistant_message(record: &MessageRecord, ts: i64) -> Value {
     let mut content = Vec::new();
     for part in &record.parts {
         match part.get("type").and_then(Value::as_str) {
+            // Injected text is not model output; 2.x has no assistant slot for it.
+            Some("text") if is_synthetic(part) => {}
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(Value::as_str)
                     && !text.trim().is_empty()
@@ -647,7 +751,7 @@ fn v2_assistant_message(record: &MessageRecord, ts: i64) -> Value {
                 let mime = part.get("mime").and_then(Value::as_str).unwrap_or("image");
                 content.push(json!({ "type": "text", "text": format!("[Image omitted: {mime}]") }));
             }
-            Some("tool") => content.push(v2_tool_part(part)),
+            Some("tool") => content.push(v2_tool_part(part, ts)),
             _ => {}
         }
     }
@@ -656,7 +760,8 @@ fn v2_assistant_message(record: &MessageRecord, ts: i64) -> Value {
         .info
         .get("modelID")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .filter(|id| !id.is_empty())
+        .unwrap_or("unknown");
     let provider = record
         .info
         .get("providerID")
@@ -678,22 +783,19 @@ fn v2_assistant_message(record: &MessageRecord, ts: i64) -> Value {
         "id": record.info.get("id").cloned().unwrap_or(Value::Null),
         "time": { "created": ts, "completed": completed },
         "type": "assistant",
-        "agent": "build",
+        "agent": record.info.get("agent").and_then(Value::as_str).unwrap_or("build"),
         "model": { "id": model_id, "providerID": provider },
         "content": content,
         "finish": finish,
         "rawFinish": raw_finish,
-        "cost": 0.0,
-        "tokens": record.info.get("tokens").cloned()
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({ "input": 0, "output": 0, "reasoning": 0,
-                                       "cache": { "read": 0, "write": 0 } })),
+        "cost": record.info.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+        "tokens": full_tokens(record.info.get("tokens")),
     })
 }
 
 /// A legacy `tool` part (call and result folded into `state.output`/`state.error`) rewritten as
 /// the 2.x part, which keeps the result in `state.content`.
-fn v2_tool_part(part: &Value) -> Value {
+fn v2_tool_part(part: &Value, ts: i64) -> Value {
     let name = part
         .get("tool")
         .and_then(Value::as_str)
@@ -705,14 +807,27 @@ fn v2_tool_part(part: &Value) -> Value {
         .unwrap_or_default()
         .to_string();
     let state = part.get("state");
-    let input = state
-        .and_then(|s| s.get("input"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let input = object_input(
+        state
+            .and_then(|s| s.get("input"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    );
+    // 2.x renamed the built-in tools and several input keys; write its names.
+    let (name, input) = tool_to_v2(&name, input);
     let status = state
         .and_then(|s| s.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("completed");
+    // 1.x keeps the call's timing inside `state.time`; 2.x wants it on the part.
+    let started = state
+        .and_then(|s| s.pointer("/time/start"))
+        .and_then(Value::as_i64)
+        .unwrap_or(ts);
+    let completed = state
+        .and_then(|s| s.pointer("/time/end"))
+        .and_then(Value::as_i64)
+        .unwrap_or(started);
 
     let state_json = if status == "error" {
         let message = state
@@ -726,7 +841,7 @@ fn v2_tool_part(part: &Value) -> Value {
             "error": { "type": "tool.execution", "message": message },
             "metadata": { "truncated": false },
         })
-    } else {
+    } else if status == "completed" {
         let output = state
             .and_then(|s| s.get("output"))
             .and_then(Value::as_str)
@@ -738,6 +853,9 @@ fn v2_tool_part(part: &Value) -> Value {
             "content": [{ "type": "text", "text": output }],
             "metadata": { "truncated": false },
         })
+    } else {
+        // pending / running: still in flight.
+        json!({ "status": "running", "input": input, "metadata": { "truncated": false } })
     };
 
     json!({
@@ -746,7 +864,7 @@ fn v2_tool_part(part: &Value) -> Value {
         "name": name,
         "executed": true,
         "state": state_json,
-        "time": { "created": 0, "completed": 0 },
+        "time": { "created": started, "completed": completed },
     })
 }
 
@@ -790,6 +908,168 @@ fn aggregate_tokens(messages: &[Value]) -> Value {
         "output": output,
         "reasoning": reasoning,
         "cache": { "read": read, "write": write },
+    })
+}
+
+/// The full `TokenUsage.Info` object 2.x validates; a partial 1.x object fills
+/// its missing counts with 0 rather than failing the import.
+fn full_tokens(tokens: Option<&Value>) -> Value {
+    let count = |path: &[&str]| -> i64 {
+        let mut cursor = tokens;
+        for key in path {
+            cursor = cursor.and_then(|value| value.get(key));
+        }
+        cursor.and_then(Value::as_i64).unwrap_or(0)
+    };
+    json!({
+        "input": count(&["input"]),
+        "output": count(&["output"]),
+        "reasoning": count(&["reasoning"]),
+        "cache": { "read": count(&["cache", "read"]), "write": count(&["cache", "write"]) },
+    })
+}
+
+// ── 2.x record → legacy body ───────────────────────────────────────────
+
+/// The 1.x-shaped record for a 2.x user record: text and attachments become
+/// parts, so `to_common` stays the single code path for both generations.
+fn v2_user_record(id: &str, data: &Value, ts: i64) -> MessageRecord {
+    let mut parts = Vec::new();
+    if let Some(text) = data
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    for file in data
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let mime = file
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        let payload = file.get("data").and_then(Value::as_str).unwrap_or_default();
+        parts.push(json!({
+            "type": "file",
+            "mime": mime,
+            "url": format!("data:{mime};base64,{payload}"),
+        }));
+    }
+    MessageRecord {
+        info: json!({ "id": id, "role": "user", "time": { "created": ts } }),
+        parts,
+    }
+}
+
+/// The 1.x-shaped record for a 2.x assistant record.
+fn v2_assistant_record(id: &str, data: &Value, ts: i64) -> MessageRecord {
+    let mut parts = Vec::new();
+    for item in data
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    parts.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    parts.push(json!({ "type": "reasoning", "text": text }));
+                }
+            }
+            Some("file") => {
+                let mime = item
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                if let Some(url) = item.get("url").and_then(Value::as_str) {
+                    parts.push(json!({ "type": "file", "mime": mime, "url": url }));
+                }
+            }
+            Some("tool") => parts.push(v2_tool_record_part(item)),
+            _ => {}
+        }
+    }
+    let completed = data
+        .pointer("/time/completed")
+        .and_then(Value::as_i64)
+        .unwrap_or(ts);
+    MessageRecord {
+        info: json!({
+            "id": id,
+            "role": "assistant",
+            "agent": data.get("agent").and_then(Value::as_str).unwrap_or("build"),
+            "modelID": data.pointer("/model/id").and_then(Value::as_str).unwrap_or_default(),
+            "providerID": data.pointer("/model/providerID").and_then(Value::as_str)
+                .unwrap_or("anthropic"),
+            "finish": data.get("finish").and_then(Value::as_str).unwrap_or("stop"),
+            "cost": data.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+            "tokens": data.get("tokens").cloned().unwrap_or_else(|| json!({})),
+            "time": { "created": ts, "completed": completed },
+        }),
+        parts,
+    }
+}
+
+/// The 1.x-shaped part for a 2.x tool part: the names and keys map back to the
+/// legacy boundary the codec knows (`shell` → `bash`, `path` → `filePath`, …),
+/// the result moves from `state.content` back into `state.output`, and the
+/// call timing moves to `state.time`.
+fn v2_tool_record_part(item: &Value) -> Value {
+    let state = item.get("state");
+    let status = state
+        .and_then(|s| s.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let (name, input) = tool_from_v2(
+        item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+        state
+            .and_then(|s| s.get("input"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    );
+    let mut legacy_state = json!({ "status": status, "input": input });
+    if status == "error" {
+        let message = state
+            .and_then(|s| s.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Tool call failed");
+        legacy_state["error"] = json!(message);
+    } else {
+        let output = state
+            .and_then(|s| s.get("content"))
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        legacy_state["output"] = json!(output);
+    }
+    if let Some(time) = item.get("time") {
+        let start = time.get("created").and_then(Value::as_i64);
+        let end = time.get("completed").and_then(Value::as_i64).or(start);
+        if let Some(start) = start {
+            legacy_state["time"] = json!({ "start": start, "end": end.unwrap_or(start) });
+        }
+    }
+    json!({
+        "type": "tool",
+        "tool": name,
+        "callID": item.get("id").and_then(Value::as_str).unwrap_or_default(),
+        "state": legacy_state,
     })
 }
 
@@ -987,6 +1267,89 @@ fn denormalize_tool(name: &str, input: Value) -> (String, Value) {
         "Task" => ("task".to_string(), input),
         "Question" => ("question".to_string(), input),
         other => (other.to_string(), input),
+    }
+}
+
+/// A built-in tool 2.x renamed: the name at the legacy boundary — what
+/// [`denormalize_tool`] writes and [`normalize_tool`] reads — its 2.x name, and
+/// the input keys as `(legacy key, 2.x key)`. Sources:
+/// `packages/core/src/tool/plugin/*.ts`.
+type ToolRename = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+/// 2.x renamed the built-in tools and several input keys: `bash` is `shell`
+/// with `timeout`/`background`, the file tools take `path`, `task` is
+/// `subagent`, and so on. Keys not listed pass through, so unknown tools and
+/// extra arguments survive either direction.
+const TOOLS_V2: &[ToolRename] = &[
+    (
+        "bash",
+        "shell",
+        &[
+            ("timeout_ms", "timeout"),
+            ("run_in_background", "background"),
+        ],
+    ),
+    ("read", "read", &[("filePath", "path")]),
+    ("edit", "edit", &[("filePath", "path")]),
+    ("write", "write", &[("filePath", "path")]),
+    (
+        "grep",
+        "grep",
+        &[("glob", "include"), ("head_limit", "limit")],
+    ),
+    ("task", "subagent", &[("subagent_type", "agent")]),
+    ("Skill", "skill", &[("skill", "id")]),
+    ("WebSearch", "websearch", &[]),
+];
+
+/// The 2.x name and input of a tool call the legacy boundary names.
+fn tool_to_v2(name: &str, input: Value) -> (String, Value) {
+    let Some((_, v2_name, keys)) = TOOLS_V2.iter().find(|(legacy, ..)| *legacy == name) else {
+        return (name.to_string(), input);
+    };
+    let mut input = rename_keys(input, keys);
+    if *v2_name == "grep" {
+        // `-i` means case-insensitive; 2.x's `caseSensitive` is the inverse.
+        flip_flag(&mut input, "-i", "caseSensitive");
+    }
+    ((*v2_name).to_string(), input)
+}
+
+/// The legacy name and input of a 2.x tool call; the inverse of [`tool_to_v2`].
+fn tool_from_v2(name: &str, input: Value) -> (String, Value) {
+    let Some((legacy, _, keys)) = TOOLS_V2.iter().find(|(_, v2_name, _)| *v2_name == name) else {
+        return (name.to_string(), input);
+    };
+    let reversed: Vec<(&str, &str)> = keys.iter().map(|(from, to)| (*to, *from)).collect();
+    let mut input = rename_keys(input, &reversed);
+    if *legacy == "grep" {
+        flip_flag(&mut input, "caseSensitive", "-i");
+    }
+    ((*legacy).to_string(), input)
+}
+
+/// Moves a boolean from `from` to `to`, negated; any other value stays put.
+fn flip_flag(input: &mut Value, from: &str, to: &str) {
+    if let Value::Object(obj) = input
+        && let Some(Value::Bool(flag)) = obj.get(from).cloned()
+    {
+        obj.remove(from);
+        obj.insert(to.to_string(), Value::Bool(!flag));
+    }
+}
+
+/// 2.x validates tool input as an object (a `Record`); a freeform input — a
+/// Codex code-mode call, an unmodeled harness tool — rides as
+/// `{"input": <value>}`, which keeps the document importable.
+fn object_input(input: Value) -> Value {
+    match input {
+        Value::Object(_) => input,
+        Value::Null => Value::Object(Map::new()),
+        other => json!({ "input": other }),
     }
 }
 
@@ -1225,7 +1588,9 @@ mod store {
     use rusqlite::{Connection, OpenFlags};
     use serde_json::{Value, json};
 
-    use super::{Export, MessageRecord, OpenCode, build_v2_document};
+    use super::{
+        Export, MessageRecord, OpenCode, build_v2_document, v2_assistant_record, v2_user_record,
+    };
     use crate::common::{Lineage, Meta, Relation};
     use crate::error::{Error, Result};
     use crate::transcript::{Discovered, Saved, Store, Transcript};
@@ -1274,22 +1639,27 @@ mod store {
                 .map_err(sqlite_err)
         }
 
-        /// The schema of the live database. A database that does not exist yet is initialized
-        /// (and the directory registered as a project) by running `OpenCode` itself.
-        fn live_schema(&self, directory: Option<&Path>) -> Result<Schema> {
-            if self.db_path.is_file() {
-                let conn = self.open()?;
-                return schema_of(&conn);
-            }
-            if let Some(dir) = directory.filter(|dir| dir.is_dir()) {
-                let _ = run_opencode(&["session", "list"], dir);
-            }
-            if self.db_path.is_file() {
-                let conn = self.open()?;
-                return schema_of(&conn);
-            }
-            // Still nothing: an OpenCode that has never run here is the 1.x-era one.
-            Ok(Schema::Legacy)
+        /// Whether the installed `opencode` binary speaks 2.x: it moved the
+        /// import command and flattened the document, so the generation picks
+        /// both. Reads the binary rather than the database because an upgraded
+        /// CLI migrates an old database on its next start — the importer may
+        /// have to run before that has happened.
+        fn cli_generation() -> Result<Schema> {
+            use std::process::{Command, Stdio};
+
+            let output = Command::new("opencode")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| Error::Unconvertible {
+                    harness: "opencode",
+                    detail: format!("running `opencode --version`: {e} (is OpenCode on PATH?)"),
+                })?;
+            Ok(parse_generation(&format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )))
         }
 
         /// `session import` in 2.x requires `info.projectID`, but the server
@@ -1382,6 +1752,22 @@ mod store {
         })
     }
 
+    /// `opencode v2.1.4`, `2.0.3`, `v1.17.20`: the flat document and
+    /// `session import` arrived in 2.1. A version that cannot be read is taken
+    /// as current — the error it produces names the command.
+    fn parse_generation(text: &str) -> Schema {
+        let version = text.split_whitespace().find_map(|word| {
+            let mut numbers = word.trim_start_matches('v').split('.');
+            let major: u32 = numbers.next()?.parse().ok()?;
+            let minor: u32 = numbers.next()?.parse().ok()?;
+            Some((major, minor))
+        });
+        match version {
+            Some(version) if version < (2, 1) => Schema::Legacy,
+            _ => Schema::V2,
+        }
+    }
+
     fn discover_v2(conn: &Connection) -> Result<Vec<Discovered<String>>> {
         let mut stmt = conn
             .prepare(
@@ -1461,136 +1847,30 @@ mod store {
             match kind.as_str() {
                 "user" => out.push(v2_user_record(&id, &data, ts)),
                 "assistant" => out.push(v2_assistant_record(&id, &data, ts)),
-                // idle markers, compaction checkpoints and other bookkeeping are not conversation.
-                _ => {}
+                // Records with no 1.x shape (`compaction`, `idle`, `shell`,
+                // `synthetic`, `system`, …) ride through verbatim: the codec
+                // skips a record without a role, and a document rebuilt from
+                // this body puts them back unchanged.
+                _ => out.push(MessageRecord {
+                    info: verbatim_record(&id, &kind, &data, ts),
+                    parts: Vec::new(),
+                }),
             }
         }
         Ok(out)
     }
 
-    fn v2_user_record(id: &str, data: &Value, ts: i64) -> MessageRecord {
-        let mut parts = Vec::new();
-        if let Some(text) = data
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-        {
-            parts.push(json!({ "type": "text", "text": text }));
+    /// A 2.x record as it stands, with the columnar `id`/`type` and a fallback
+    /// `time.created` injected so it is a complete document record.
+    fn verbatim_record(id: &str, kind: &str, data: &Value, ts: i64) -> Value {
+        let mut record = data.clone();
+        if let Value::Object(obj) = &mut record {
+            obj.insert("id".into(), json!(id));
+            obj.insert("type".into(), json!(kind));
+            obj.entry("time")
+                .or_insert_with(|| json!({ "created": ts }));
         }
-        for file in data
-            .get("files")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let mime = file
-                .get("mime")
-                .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream");
-            let payload = file.get("data").and_then(Value::as_str).unwrap_or_default();
-            parts.push(json!({
-                "type": "file",
-                "mime": mime,
-                "url": format!("data:{mime};base64,{payload}"),
-            }));
-        }
-        MessageRecord {
-            info: json!({ "id": id, "role": "user", "time": { "created": ts } }),
-            parts,
-        }
-    }
-
-    fn v2_assistant_record(id: &str, data: &Value, ts: i64) -> MessageRecord {
-        let mut parts = Vec::new();
-        for item in data
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            match item.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        parts.push(json!({ "type": "text", "text": text }));
-                    }
-                }
-                Some("reasoning") => {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        parts.push(json!({ "type": "reasoning", "text": text }));
-                    }
-                }
-                Some("file") => {
-                    let mime = item
-                        .get("mime")
-                        .and_then(Value::as_str)
-                        .unwrap_or("application/octet-stream");
-                    if let Some(url) = item.get("url").and_then(Value::as_str) {
-                        parts.push(json!({ "type": "file", "mime": mime, "url": url }));
-                    }
-                }
-                Some("tool") => parts.push(v2_tool_record_part(item)),
-                _ => {}
-            }
-        }
-        let completed = data
-            .pointer("/time/completed")
-            .and_then(Value::as_i64)
-            .unwrap_or(ts);
-        MessageRecord {
-            info: json!({
-                "id": id,
-                "role": "assistant",
-                "modelID": data.pointer("/model/id").and_then(Value::as_str).unwrap_or_default(),
-                "providerID": data.pointer("/model/providerID").and_then(Value::as_str)
-                    .unwrap_or("anthropic"),
-                "finish": data.get("finish").and_then(Value::as_str).unwrap_or("stop"),
-                "tokens": data.get("tokens").cloned().unwrap_or_else(|| json!({})),
-                "time": { "created": ts, "completed": completed },
-            }),
-            parts,
-        }
-    }
-
-    /// The 2.x tool part keeps the result in `state.content` (or `state.error`); the legacy part
-    /// carries it as `state.output` before `parse_tool` splits off the result block.
-    fn v2_tool_record_part(item: &Value) -> Value {
-        let state = item.get("state");
-        let status = state
-            .and_then(|s| s.get("status"))
-            .and_then(Value::as_str)
-            .unwrap_or("completed");
-        let input = state
-            .and_then(|s| s.get("input"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let mut legacy_state = json!({ "status": status, "input": input });
-        if status == "error" {
-            let message = state
-                .and_then(|s| s.get("error"))
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("Tool call failed");
-            legacy_state["error"] = json!(message);
-        } else {
-            let output = state
-                .and_then(|s| s.get("content"))
-                .and_then(Value::as_array)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            legacy_state["output"] = json!(output);
-        }
-        json!({
-            "type": "tool",
-            "tool": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
-            "callID": item.get("id").and_then(Value::as_str).unwrap_or_default(),
-            "state": legacy_state,
-        })
+        record
     }
 
     fn session_row_v2(conn: &Connection, id: &str) -> Result<(Meta, Value)> {
@@ -1738,36 +2018,6 @@ mod store {
             .to_string())
     }
 
-    /// Runs one `OpenCode` CLI command in a directory — used to bootstrap a
-    /// database when `OpenCode` has never run there.
-    fn run_opencode(args: &[&str], cwd: &Path) -> Result<()> {
-        use std::process::{Command, Stdio};
-
-        let output = Command::new("opencode")
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| Error::Unconvertible {
-                harness: "opencode",
-                detail: format!("running `opencode {}`: {e} (is OpenCode on PATH?)", args[0]),
-            })?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Unconvertible {
-                harness: "opencode",
-                detail: format!(
-                    "`opencode {}` failed: {}",
-                    args[0],
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            })
-        }
-    }
-
     impl Store for OpenCodeStore {
         type H = OpenCode;
         type Ref = String;
@@ -1892,7 +2142,7 @@ mod store {
         fn save(&self, transcript: &Transcript<OpenCode>) -> Result<Saved<String>> {
             // OpenCode owns its schema; hand it the document and let its own importer normalize
             // and persist. Which document (and which command) depends on the generation of the
-            // database in front of us. Requires the `opencode` binary.
+            // installed CLI. Requires the `opencode` binary.
             let export = &transcript.body;
             // The recorded cwd may have been a temp checkout that no longer exists; imports land
             // in a live project, so fall back to the process directory in that case.
@@ -1906,7 +2156,7 @@ mod store {
                 .filter(|dir| dir.is_dir())
                 .or_else(|| std::env::current_dir().ok());
 
-            let imported = match self.live_schema(directory.as_deref())? {
+            let imported = match Self::cli_generation()? {
                 Schema::Legacy => import_document(&serde_json::to_string(export)?, false, None)?,
                 Schema::V2 => {
                     let project_id = self.project_id(directory.as_deref());
@@ -2381,6 +2631,23 @@ mod store {
         }
 
         #[test]
+        fn cli_generation_reads_the_import_surface_from_the_version() {
+            assert_eq!(
+                super::parse_generation("opencode v2.3.0"),
+                super::Schema::V2
+            );
+            assert_eq!(super::parse_generation("2.1.4"), super::Schema::V2);
+            assert_eq!(
+                super::parse_generation("opencode v1.19.5"),
+                super::Schema::Legacy
+            );
+            assert_eq!(super::parse_generation("2.0.3"), super::Schema::Legacy);
+            // Unreadable output is taken as current; the error it produces
+            // names the command, so a wrong guess is diagnosable.
+            assert_eq!(super::parse_generation("unknown"), super::Schema::V2);
+        }
+
+        #[test]
         fn duplicate_import_is_an_error_not_a_silent_success() {
             // 2.x reports a conflicting id on stderr while exiting 0; treating
             // that as success would leave the stored session silently stale.
@@ -2411,11 +2678,11 @@ mod store {
 mod v2_document_tests {
     use base64::Engine as _;
     use chrono::{DateTime, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{OpenCode, build_v2_document, parse_file_image};
     use crate::common::{Block, ImageSource, Message, Meta, Role, Tool, ToolOutput};
-    use crate::transcript::{Codec, Common, Transcript};
+    use crate::transcript::{Codec, Common, TextCodec, Transcript};
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
@@ -2514,11 +2781,199 @@ mod v2_document_tests {
         assert_eq!(assistant["content"][1]["type"], "text");
         let tool = &assistant["content"][2];
         assert_eq!(tool["type"], "tool");
-        assert_eq!(tool["name"], "bash");
+        // 2.x renamed `bash` to `shell`.
+        assert_eq!(tool["name"], "shell");
         assert_eq!(tool["id"], "c1");
         assert_eq!(tool["state"]["status"], "completed");
         // The result moved from `state.output` into 2.x's `state.content`.
         assert_eq!(tool["state"]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn tool_names_and_inputs_follow_the_2x_renames() {
+        let cases = [
+            (
+                "bash",
+                json!({ "command": "ls", "timeout_ms": 5000, "run_in_background": true, "description": "list" }),
+                "shell",
+                json!({ "command": "ls", "timeout": 5000, "background": true, "description": "list" }),
+            ),
+            (
+                "read",
+                json!({ "filePath": "/a.rs", "offset": 3 }),
+                "read",
+                json!({ "path": "/a.rs", "offset": 3 }),
+            ),
+            (
+                "edit",
+                json!({ "filePath": "/a.rs", "oldString": "a", "newString": "b" }),
+                "edit",
+                json!({ "path": "/a.rs", "oldString": "a", "newString": "b" }),
+            ),
+            (
+                "grep",
+                json!({ "pattern": "fn", "glob": "*.rs", "-i": true, "head_limit": 5 }),
+                "grep",
+                json!({ "pattern": "fn", "include": "*.rs", "caseSensitive": false, "limit": 5 }),
+            ),
+            (
+                "task",
+                json!({ "subagent_type": "explore", "description": "d", "prompt": "p" }),
+                "subagent",
+                json!({ "agent": "explore", "description": "d", "prompt": "p" }),
+            ),
+            (
+                "Skill",
+                json!({ "skill": "pdf" }),
+                "skill",
+                json!({ "id": "pdf" }),
+            ),
+            (
+                "WebSearch",
+                json!({ "query": "rust" }),
+                "websearch",
+                json!({ "query": "rust" }),
+            ),
+            (
+                "todowrite",
+                json!({ "todos": [] }),
+                "todowrite",
+                json!({ "todos": [] }),
+            ),
+        ];
+        for (legacy, legacy_input, v2_name, v2_input) in cases {
+            assert_eq!(
+                super::tool_to_v2(legacy, legacy_input.clone()),
+                (v2_name.to_string(), v2_input.clone()),
+                "{legacy} → 2.x"
+            );
+            assert_eq!(
+                super::tool_from_v2(v2_name, v2_input),
+                (legacy.to_string(), legacy_input),
+                "{v2_name} → legacy"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_parts_read_back_with_the_legacy_names_and_keys() {
+        // A session OpenCode 2.x wrote names `shell` and uses `path`; the codec
+        // reads it back as the `Bash`/`Edit` tools the rest of txcript knows.
+        let record = super::v2_assistant_record(
+            "msg_a",
+            &json!({
+                "type": "assistant",
+                "agent": "build",
+                "model": { "id": "m", "providerID": "anthropic" },
+                "finish": "tool-calls",
+                "time": { "created": 5, "completed": 6 },
+                "content": [{
+                    "type": "tool",
+                    "id": "c1",
+                    "name": "shell",
+                    "time": { "created": 5, "completed": 6 },
+                    "state": {
+                        "status": "completed",
+                        "input": { "command": "ls", "timeout": 5000, "background": true },
+                        "content": [{ "type": "text", "text": "ok" }],
+                    },
+                }],
+            }),
+            5,
+        );
+        let native = Transcript::new(
+            sample().meta,
+            super::Export {
+                info: json!({}),
+                messages: vec![record],
+            },
+        );
+        let msgs = OpenCode::to_common(&native).unwrap().body;
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(
+            &msgs[0].content[0],
+            Block::ToolUse { id, tool: Tool::Bash { timeout_ms, run_in_background, .. } }
+                if id == "c1" && *timeout_ms == Some(5000) && *run_in_background
+        ));
+    }
+
+    #[test]
+    fn freeform_tool_input_is_wrapped_for_the_2x_schema() {
+        // 2.x validates tool input as an object; a Codex code-mode call carries
+        // a string input, which must not make the whole document invalid.
+        let mut transcript = sample();
+        transcript.body[1].content = vec![Block::ToolUse {
+            id: "c1".into(),
+            tool: Tool::Raw {
+                tool_name: "exec".into(),
+                input: json!("print('hi')"),
+            },
+        }];
+        let native = OpenCode::from_common(&transcript).unwrap();
+        let doc = build_v2_document(&native.body, "prj_1");
+        assert_eq!(
+            doc["messages"][1]["content"][0]["state"]["input"],
+            json!({ "input": "print('hi')" })
+        );
+    }
+
+    #[test]
+    fn text_form_is_the_2x_document_and_reads_both_layouts() {
+        let native = OpenCode::from_common(&sample()).unwrap();
+        let text = OpenCode::to_text(&native).unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["messages"][0]["type"], "user");
+        assert_eq!(doc["messages"][1]["type"], "assistant");
+        assert_eq!(doc["messages"][1]["content"][2]["name"], "shell");
+
+        // The flat document reads back to the same conversation (message
+        // boundaries converge the way the 1.x path already splits turns).
+        let reread = OpenCode::from_text(&text).unwrap();
+        assert_eq!(reread.meta.id, "ses_1");
+        assert_eq!(reread.meta.cwd.as_deref(), Some("/repo"));
+        let common = OpenCode::to_common(&reread).unwrap();
+        assert_eq!(common.body.len(), 4);
+        assert!(matches!(
+            &common.body[2].content[0],
+            Block::ToolUse { tool: Tool::Bash { command, .. }, .. } if command == "ls"
+        ));
+
+        // A 1.x export is still read.
+        let legacy = serde_json::to_string(&native.body).unwrap();
+        let reread = OpenCode::from_text(&legacy).unwrap();
+        assert_eq!(reread.body.messages.len(), native.body.messages.len());
+    }
+
+    #[test]
+    fn unmodeled_records_ride_through_a_text_round_trip() {
+        // `idle`, `compaction`, `shell`, … have no 1.x shape; they must survive
+        // an export/import round trip unchanged.
+        let doc = json!({
+            "info": {
+                "id": "ses_1", "projectID": "global",
+                "location": { "directory": "/repo" },
+                "cost": 0.0,
+                "tokens": { "input": 0, "output": 0, "reasoning": 0,
+                            "cache": { "read": 0, "write": 0 } },
+                "time": { "created": 1, "updated": 2 },
+            },
+            "messages": [
+                { "id": "msg_u", "type": "user", "time": { "created": 1 },
+                  "text": "hi", "files": [], "agents": [] },
+                { "id": "msg_i", "type": "idle", "time": { "created": 2 },
+                  "outcome": "succeeded" },
+                { "id": "msg_c", "type": "compaction", "status": "completed",
+                  "reason": "auto", "summary": "sum", "time": { "created": 3 } },
+            ],
+        });
+        let native = OpenCode::from_text(&doc.to_string()).unwrap();
+        assert_eq!(native.body.messages.len(), 3);
+        assert_eq!(native.body.messages[1].info["type"], "idle");
+
+        let out = OpenCode::to_text(&native).unwrap();
+        let back: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(back["messages"][1], doc["messages"][1]);
+        assert_eq!(back["messages"][2], doc["messages"][2]);
     }
 
     #[test]
