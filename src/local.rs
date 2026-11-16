@@ -716,9 +716,9 @@ pub struct WriteOpts<'a> {
 
 /// Persist a canonical transcript in `target`'s native, resumable format.
 /// `root` overrides the harness's default on-disk root (file-backed stores
-/// only; `OpenCode` always goes through `opencode import` into the live
-/// database, so a root override for it is refused rather than silently
-/// redirected).
+/// only; `OpenCode` always goes through `opencode import` / `opencode session
+/// import`, which write into the live database, so a root override for it is
+/// refused rather than silently redirected).
 ///
 /// # Errors
 /// When conversion to the target fails or its store rejects the write.
@@ -906,13 +906,13 @@ pub fn write_with(
                      from Simple documents, not written into them"
                 .to_string(),
         }),
-        // `opencode import` writes into the live database wherever it lives;
+        // OpenCode's import command writes into the live database wherever it lives;
         // honoring a root override is impossible, and ignoring it would send
         // an "export" into the user's real store.
         HarnessId::OpenCode if root.is_some() => Err(Error::Unconvertible {
             harness: "opencode",
             detail: "opencode sessions can only be imported into the live \
-                     opencode database (via `opencode import`); writing to \
+                     opencode database (via OpenCode's import command); writing to \
                      an alternate directory is not supported"
                 .to_string(),
         }),
@@ -1090,7 +1090,7 @@ fn write_opencode(common: &Transcript<Common>) -> Result<Written> {
     let saved = store.save(&native)?;
     Ok(Written {
         id: saved.id,
-        location: "imported via `opencode import`".to_string(),
+        location: "imported via OpenCode's import command".to_string(),
     })
 }
 
