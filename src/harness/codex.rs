@@ -331,16 +331,16 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             .and_then(Value::as_str)
                             .map(String::from)
                         {
-                            let content = match payload.get("output") {
-                                Some(Value::String(s)) => ToolOutput::Text(s.clone()),
-                                Some(Value::Array(items)) => content_items_output(items),
-                                _ => ToolOutput::Text(String::new()),
+                            let (content, is_error) = match payload.get("output") {
+                                Some(Value::String(s)) => (ToolOutput::Text(s.clone()), false),
+                                Some(Value::Array(items)) => parse_content_items_output(items),
+                                _ => (ToolOutput::Text(String::new()), false),
                             };
                             queued.push(tool_result(
                                 ts,
                                 result_key(&call_id),
                                 content,
-                                false,
+                                is_error,
                                 true,
                             ));
                         }
@@ -387,7 +387,7 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             // the whole result.
                             let (content, is_error) = match payload.get("output") {
                                 Some(Value::String(raw)) => parse_custom_tool_output(raw),
-                                Some(Value::Array(items)) => (content_items_output(items), false),
+                                Some(Value::Array(items)) => parse_content_items_output(items),
                                 _ => parse_custom_tool_output(""),
                             };
                             canonical_results.insert(result_key(&call_id));
@@ -1661,6 +1661,37 @@ fn format_exec_output(payload: &Value) -> String {
 /// `output_text`, `input_image`, ...). All-text lists collapse to their text,
 /// one item per line; anything else is kept verbatim as JSON so no part of the
 /// result is lost.
+/// Read a content-item list output together with its error bit.
+///
+/// Codex keeps a call's `success` flag as internal metadata and never writes
+/// it to the rollout: a content-item list serializes as the bare array. The
+/// only on-disk failure signal is the status header code mode inserts as the
+/// first item, `"{status}\nWall time ...\nOutput:\n"`, where `status` is
+/// `Script failed` exactly when the script raised (`error_text` is set, so
+/// `success` is false). `Script completed`, `Script terminated`, and
+/// `Script running with cell ID ...` all carry `success: true`. Lists without
+/// that header (MCP results, images) have no error signal and stay
+/// non-errors, as string `function_call_output`s do.
+fn parse_content_items_output(items: &[Value]) -> (ToolOutput, bool) {
+    let is_error = items.first().is_some_and(|first| {
+        first.get("type").and_then(Value::as_str) == Some("input_text")
+            && first
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(is_failed_script_header)
+    });
+    (content_items_output(items), is_error)
+}
+
+/// `Script failed\nWall time <timing> seconds[ (...)]\nOutput:\n`, the
+/// whole item and nothing else, so script output that merely starts with
+/// those words is not mistaken for the header.
+fn is_failed_script_header(text: &str) -> bool {
+    text.strip_prefix("Script failed\nWall time ")
+        .and_then(|rest| rest.strip_suffix("\nOutput:\n"))
+        .is_some_and(|timing| !timing.contains('\n') && timing.contains(" seconds"))
+}
+
 fn content_items_output(items: &[Value]) -> ToolOutput {
     let texts: Option<Vec<&str>> = items
         .iter()

@@ -287,6 +287,7 @@ fn parse_tool(part: &Value) -> Option<(Block, Option<Block>)> {
         .and_then(|s| s.get("input"))
         .cloned()
         .unwrap_or(Value::Object(Map::new()));
+    let raw_input = unwrap_freeform_input(state, raw_input);
     let (name, input) = normalize_tool(tool, raw_input);
     let use_block = Block::ToolUse {
         id: call_id.clone(),
@@ -571,17 +572,22 @@ fn assistant_part(
             // object"), and Codex freeform calls (code-mode `exec`,
             // `apply_patch`) carry a raw string. Keep the payload inside an
             // object, as the Claude Code export does.
-            let oc_input = if oc_input.is_object() {
-                oc_input
+            // The wrap is flagged in `state.metadata` so the reader can undo
+            // exactly this wrap and never a genuine `{"input": ...}` input.
+            let (oc_input, oc_metadata) = if oc_input.is_object() {
+                (oc_input, json!({}))
             } else {
-                json!({ "input": oc_input })
+                (
+                    json!({ "input": oc_input }),
+                    json!({ (WRAPPED_INPUT_KEY): true }),
+                )
             };
             let mut state = json!({
                 "status": "completed",
                 "input": oc_input,
                 "output": "",
                 "title": oc_name,
-                "metadata": {},
+                "metadata": oc_metadata,
                 "time": time,
             });
             // Fold matching ToolResult from the following user turn into state.output.
@@ -656,6 +662,29 @@ fn normalize_tool(tool: &str, input: Value) -> (String, Value) {
         "task" => ("Task".to_string(), input),
         "question" => ("Question".to_string(), input),
         other => (other.to_string(), input),
+    }
+}
+
+/// `state.metadata` flag set when the writer wrapped a non-object tool input
+/// (for example a Codex code-mode script) as `{"input": <value>}`, since
+/// `opencode import` only accepts object inputs.
+const WRAPPED_INPUT_KEY: &str = "txcriptWrappedInput";
+
+/// Undo the writer's `{"input": <value>}` wrap. Only parts that carry the
+/// metadata flag are unwrapped, and only when the input is still exactly
+/// that one-key object: a real tool whose input happens to be
+/// `{"input": ...}` has no flag and passes through untouched.
+fn unwrap_freeform_input(state: Option<&Value>, input: Value) -> Value {
+    let flagged = state
+        .and_then(|s| s.get("metadata"))
+        .and_then(|m| m.get(WRAPPED_INPUT_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match input {
+        Value::Object(mut obj) if flagged && obj.len() == 1 && obj.contains_key("input") => {
+            obj.remove("input").unwrap_or(Value::Null)
+        }
+        other => other,
     }
 }
 
