@@ -615,13 +615,16 @@ impl<'m> Blocks<'_, 'm> {
                     if *is_error { "1;31" } else { "1;32" },
                     color,
                 );
+                let text = content.as_text();
                 match content {
-                    ToolOutput::Text(text) => human_body(out, text),
-                    ToolOutput::Json(value) => {
+                    // Other JSON stays pretty-printed; `as_text` is its
+                    // compact form only when it is not a block array.
+                    ToolOutput::Json(value) if text == value.to_string() => {
                         let body = serde_json::to_string_pretty(value)
                             .unwrap_or_else(|_| value.to_string());
                         human_body(out, &body);
                     }
+                    ToolOutput::Text(_) | ToolOutput::Json(_) => human_body(out, &text),
                 }
             }
             Block::Image { source } => {
@@ -860,6 +863,38 @@ mod tests {
 
         assert!(pipeline.starts_with("[session]\n"));
         assert!(pipeline.contains("── #1 ──\n[user]\nPlease fix it."));
+    }
+
+    #[test]
+    fn human_tool_results_show_block_arrays_as_text_and_keep_other_json_pretty() {
+        let mut common = transcript();
+        let outputs = [
+            ToolOutput::Json(serde_json::json!([
+                {"type": "text", "text": "row1: alpha\nrow2: \"beta\""},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD".repeat(5000)}},
+            ])),
+            ToolOutput::Json(serde_json::json!({"count": 3})),
+        ];
+        common.body = outputs
+            .into_iter()
+            .enumerate()
+            .map(|(n, content)| Message {
+                content: vec![Block::ToolResult {
+                    tool_use_id: format!("call-{n}"),
+                    content,
+                    is_error: false,
+                }],
+                ..common.body[0].clone()
+            })
+            .collect();
+        let rendered = Document::new(common, Span(0..2), false, None)
+            .render(60, Filters::default())
+            .unwrap()
+            .text;
+
+        assert!(rendered.contains("row1: alpha\nrow2: \"beta\"\n\n[image: image/png]"));
+        assert!(!rendered.contains("QUJD"));
+        assert!(rendered.contains("{\n  \"count\": 3\n}"));
     }
 
     #[test]

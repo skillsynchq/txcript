@@ -433,7 +433,7 @@ fn db_from_messages(meta: &Meta, messages: &[Message]) -> Result<CursorDb> {
                                     "type": "tool-result",
                                     "toolCallId": tool_use_id,
                                     "toolName": tool_name,
-                                    "result": tool_output_text(content),
+                                    "result": content.as_text(),
                                 }],
                                 "createdAt": message.timestamp.timestamp_millis(),
                                 "isError": is_error,
@@ -721,7 +721,7 @@ fn orphan_tool_result_state_text(blocks: &[Block], known_tool_uses: &HashSet<Str
                 let status = if *is_error { "error" } else { "result" };
                 Some(format!(
                     "Tool {status} for {tool_use_id}:\n{}",
-                    tool_output_text(content)
+                    content.as_text()
                 ))
             }
             // Other blocks are not tool results.
@@ -888,7 +888,7 @@ fn cursor_shell_result_proto(
     workdir: &str,
     result: &CursorStateToolResult,
 ) -> Vec<u8> {
-    let output = tool_output_text(&result.content);
+    let output = result.content.as_text();
     let mut shell_result = Vec::new();
     if result.is_error {
         let mut failure = Vec::new();
@@ -943,7 +943,7 @@ fn cursor_read_result_proto(
     result: &CursorStateToolResult,
 ) -> Vec<u8> {
     let mut read_result = Vec::new();
-    let text = tool_output_text(&result.content);
+    let text = result.content.as_text();
     if result.is_error {
         let mut error = Vec::new();
         pb_string(&mut error, 1, &text);
@@ -998,7 +998,7 @@ fn cursor_edit_result_proto(
     payload: &CursorEditPayload,
     result: &CursorStateToolResult,
 ) -> Vec<u8> {
-    let output = tool_output_text(&result.content);
+    let output = result.content.as_text();
     let mut edit_result = Vec::new();
     if result.is_error {
         let mut error = Vec::new();
@@ -1120,7 +1120,7 @@ fn edit_success_message(
 ) -> String {
     result
         .filter(|result| !result.is_error)
-        .map(|result| tool_output_text(&result.content))
+        .map(|result| result.content.as_text().into_owned())
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| match fallback_action {
             "written" => format!("Wrote contents to {path}"),
@@ -1358,7 +1358,7 @@ fn serialize_user_block(block: &Block) -> Value {
             let text = match other {
                 Block::Thinking { text, .. } => text.clone(),
                 Block::ToolUse { tool, .. } => format!("{tool:?}"),
-                Block::ToolResult { content, .. } => tool_output_text(content),
+                Block::ToolResult { content, .. } => content.as_text().into_owned(),
                 Block::Artifact { artifact } => artifact.display_text(),
                 Block::Text { .. } | Block::Image { .. } => String::new(),
             };
@@ -1805,13 +1805,6 @@ fn clean_redacted_text(text: &str) -> String {
 
 fn looks_error(text: &str) -> bool {
     text.starts_with("Error:") || text.contains(" exited with code ")
-}
-
-fn tool_output_text(out: &ToolOutput) -> String {
-    match out {
-        ToolOutput::Text(s) => s.clone(),
-        ToolOutput::Json(v) => v.to_string(),
-    }
 }
 
 fn truncate_title(text: &str) -> String {

@@ -10,6 +10,8 @@
 //! `Vec<Message>`. The model is harness-agnostic: it does not record where it
 //! came from.
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -230,6 +232,63 @@ pub enum ArtifactSource {
 pub enum ToolOutput {
     Text(String),
     Json(Value),
+}
+
+impl ToolOutput {
+    /// The output as readable text, for harnesses and views that carry tool
+    /// results as plain strings.
+    ///
+    /// An Anthropic-style content-block array (the shape of MCP and image
+    /// tool results) renders block by block, joined by a blank line: text
+    /// blocks as their text, image blocks as `[image: <media type>]` (never
+    /// the encoded bytes), any other block as its compact JSON. Every other
+    /// JSON value, including an array of only unrecognized blocks, is its
+    /// compact JSON.
+    #[must_use]
+    pub fn as_text(&self) -> Cow<'_, str> {
+        match self {
+            Self::Text(text) => Cow::Borrowed(text),
+            Self::Json(value) => match value.as_array() {
+                Some(blocks) if is_readable_block_array(blocks) => Cow::Owned(
+                    blocks
+                        .iter()
+                        .map(block_text)
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                ),
+                _ => Cow::Owned(value.to_string()),
+            },
+        }
+    }
+}
+
+/// Whether every element is a typed block object and at least one is a text
+/// or image block, so rendering block by block beats dumping the array.
+fn is_readable_block_array(blocks: &[Value]) -> bool {
+    blocks
+        .iter()
+        .all(|b| b.is_object() && block_type(b).is_some())
+        && blocks
+            .iter()
+            .any(|b| matches!(block_type(b), Some("text" | "image")))
+}
+
+fn block_type(block: &Value) -> Option<&str> {
+    block.get("type").and_then(Value::as_str)
+}
+
+fn block_text(block: &Value) -> String {
+    match block_type(block) {
+        Some("text") => block.get("text").and_then(Value::as_str),
+        Some("image") => {
+            return match block.pointer("/source/media_type").and_then(Value::as_str) {
+                Some(media_type) => format!("[image: {media_type}]"),
+                None => "[image]".to_owned(),
+            };
+        }
+        _ => None,
+    }
+    .map_or_else(|| block.to_string(), str::to_owned)
 }
 
 /// A canonical tool invocation.
@@ -602,6 +661,104 @@ mod tests {
         let tool = Tool::from_canonical("Bash", input.clone());
         assert!(matches!(tool, Tool::Bash { .. }));
         assert_eq!(tool.to_canonical().1, input);
+    }
+
+    fn as_text(value: Value) -> String {
+        ToolOutput::Json(value).as_text().into_owned()
+    }
+
+    #[test]
+    fn text_output_is_returned_as_is() {
+        let out = ToolOutput::Text("a \"b\"\nc".into());
+        assert!(matches!(out.as_text(), Cow::Borrowed("a \"b\"\nc")));
+    }
+
+    /// Text blocks render as their text, not as escaped JSON.
+    #[test]
+    fn text_blocks_join_with_a_blank_line() {
+        let text = as_text(json!([
+            {"type": "text", "text": "row1: alpha\nrow2: \"beta\""},
+            {"type": "text", "text": "second \u{1f389} naïve 日本語"},
+        ]));
+        assert_eq!(
+            text,
+            "row1: alpha\nrow2: \"beta\"\n\nsecond \u{1f389} naïve 日本語"
+        );
+        assert_eq!(as_text(json!([{"type": "text", "text": "only"}])), "only");
+    }
+
+    /// An image block becomes a placeholder; its bytes never reach the text.
+    #[test]
+    fn image_blocks_render_a_placeholder_without_the_payload() {
+        let payload = "A".repeat(150_000);
+        let text = as_text(json!([
+            {"type": "text", "text": "shot"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": payload}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": payload}},
+        ]));
+        assert_eq!(text, "shot\n\n[image: image/png]\n\n[image: image/jpeg]");
+    }
+
+    #[test]
+    fn image_without_a_media_type_renders_a_bare_placeholder() {
+        assert_eq!(as_text(json!([{"type": "image"}])), "[image]");
+        assert_eq!(
+            as_text(
+                json!([{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}])
+            ),
+            "[image]"
+        );
+    }
+
+    /// Other block types keep their compact JSON, in place among readable ones.
+    #[test]
+    fn unrecognized_blocks_render_as_compact_json() {
+        let text = as_text(json!([
+            {"type": "text", "text": "found"},
+            {"type": "tool_reference", "tool_name": "Read"},
+            {"type": "search_result", "title": "T", "content": [{"type": "text", "text": "nested"}]},
+        ]));
+        assert_eq!(
+            text,
+            "found\n\n{\"tool_name\":\"Read\",\"type\":\"tool_reference\"}\n\n\
+             {\"content\":[{\"text\":\"nested\",\"type\":\"text\"}],\"title\":\"T\",\"type\":\"search_result\"}"
+        );
+        // A text block without a string `text` is not readable text either.
+        assert_eq!(
+            as_text(json!([{"type": "text", "text": 5}, {"type": "text", "text": "ok"}])),
+            "{\"text\":5,\"type\":\"text\"}\n\nok"
+        );
+    }
+
+    /// Everything that is not a readable block array stays compact JSON.
+    #[test]
+    fn other_json_is_compact_json() {
+        let cases = [
+            json!([]),
+            json!({"count": 3, "rows": ["a", "b"]}),
+            json!({"type": "text", "text": "an object, not an array"}),
+            json!(["a", "b"]),
+            json!([1, 2, 3]),
+            json!([{"no": "type"}, {"type": "text", "text": "x"}]),
+            json!([{"type": 7}, {"type": "text", "text": "x"}]),
+            json!([{"type": "text", "text": "x"}, "stray"]),
+            // Only unrecognized blocks: the array stays whole.
+            json!([{"tool_name": "WebFetch", "type": "tool_reference"}]),
+            json!(42),
+            json!(null),
+            json!(true),
+            json!("a json string"),
+        ];
+        for value in cases {
+            assert_eq!(as_text(value.clone()), value.to_string(), "{value}");
+        }
+    }
+
+    #[test]
+    fn very_long_text_blocks_are_not_truncated() {
+        let long = "x".repeat(1_000_000);
+        let text = as_text(json!([{"type": "text", "text": long.clone()}]));
+        assert_eq!(text, long);
     }
 }
 

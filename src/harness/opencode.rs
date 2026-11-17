@@ -590,16 +590,16 @@ fn assistant_part(
             {
                 if result.1 {
                     obj.insert("status".into(), json!("error"));
-                    obj.insert("error".into(), json!(output_to_string(result.0)));
+                    obj.insert("error".into(), json!(result.0.as_text()));
                     obj.remove("output");
                 } else {
-                    obj.insert("output".into(), json!(output_to_string(result.0)));
+                    obj.insert("output".into(), json!(result.0.as_text()));
                 }
             }
             json!({ "type": "tool", "tool": oc_name, "callID": id, "state": state })
         }
         Block::ToolResult { content, .. } => {
-            json!({ "type": "text", "text": output_to_string(content), "time": time })
+            json!({ "type": "text", "text": content.as_text(), "time": time })
         }
     };
     if let Value::Object(obj) = &mut p {
@@ -780,13 +780,6 @@ fn value_to_output(v: Value) -> ToolOutput {
     match v {
         Value::String(s) => ToolOutput::Text(s),
         other => ToolOutput::Json(other),
-    }
-}
-
-fn output_to_string(out: &ToolOutput) -> String {
-    match out {
-        ToolOutput::Text(s) => s.clone(),
-        ToolOutput::Json(v) => v.to_string(),
     }
 }
 
