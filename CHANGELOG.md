@@ -11,6 +11,10 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 
 ## Unreleased
 
+### Fixed
+
+- Resolve a session id that exists in several stores to the most recently modified copy. `view`, `export`, `continue` and `crop` used to load whichever copy the file system listed first; discovery now breaks start-time ties by file mtime.
+
 ### Added
 
 - Add read-side session lineage (`Meta::lineage`): fork/continue/spawn relationships read from

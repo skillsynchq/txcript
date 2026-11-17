@@ -70,5 +70,8 @@ can compare across machines.
 - Every test file opens with `#![allow(clippy::expect_used, clippy::panic,
   clippy::unwrap_used)]`; the production lint set (workspace `Cargo.toml`)
   denies all three.
+- CLI behavior that needs the real binary (id resolution, for one) is tested
+  in `cli/tests/`: the `txcript` binary runs against a synthetic store in a
+  temp dir, with every store environment variable pointed at an empty one.
 - Feature-gated surfaces gate at the module declaration in `main.rs`
   (`search`) or on the test (`opencode` store).

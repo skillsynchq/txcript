@@ -241,6 +241,64 @@ fn discover_without_archived_dir_only_finds_active_sessions() {
     assert_eq!(found[0].meta.id, "sess-1");
 }
 
+/// Codex reads the plain rollout when a compressed copy sits beside it, as
+/// one does for a moment while Codex compresses or expands a session.
+/// Discovery lists that one, so the session appears once.
+#[cfg(feature = "codex_zstd")]
+#[test]
+fn discover_lists_a_rollout_once_when_both_forms_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let rollout = format!(
+        "{}\n",
+        r#"{"timestamp":"2026-01-02T03:04:05.000Z","type":"session_meta","payload":{"id":"sess-1"}}"#,
+    );
+    let plain = dir.path().join("rollout-2026-01-02T03-04-05-sess-1.jsonl");
+    std::fs::write(&plain, &rollout).unwrap();
+    std::fs::write(
+        dir.path()
+            .join("rollout-2026-01-02T03-04-05-sess-1.jsonl.zst"),
+        zstd::stream::encode_all(rollout.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let found = codex::CodexStore::new(dir.path()).discover().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].reference, plain);
+}
+
+/// A rollout with no id inside takes its file name's, and a compressed
+/// rollout's name is the plain name with `.zst` after it: both forms of one
+/// session must come out with the same id.
+#[cfg(feature = "codex_zstd")]
+#[test]
+fn load_names_a_compressed_rollout_as_its_plain_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let rollout = format!(
+        "{}\n",
+        r#"{"timestamp":"2026-01-02T03:04:06.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+    );
+    let plain = dir.path().join("rollout-2026-01-02T03-04-05-sess-1.jsonl");
+    let compressed = dir
+        .path()
+        .join("rollout-2026-01-02T03-04-05-sess-2.jsonl.zst");
+    std::fs::write(&plain, &rollout).unwrap();
+    std::fs::write(
+        &compressed,
+        zstd::stream::encode_all(rollout.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let store = codex::CodexStore::new(dir.path());
+    assert_eq!(
+        store.load(&plain).unwrap().meta.id,
+        "rollout-2026-01-02T03-04-05-sess-1"
+    );
+    assert_eq!(
+        store.load(&compressed).unwrap().meta.id,
+        "rollout-2026-01-02T03-04-05-sess-2"
+    );
+}
+
 /// Shaped at codex's granularity: each assistant block is its own message
 /// (codex stores one `response_item` per line), every assistant turn carries a
 /// model, only the final text turn carries usage, and `stop_reason` is None
@@ -335,6 +393,84 @@ fn codec_fixpoint_through_common_loses_nothing() {
     let native = codex::Codex::from_common(&common).unwrap();
     let back = codex::Codex::to_common(&native).unwrap();
     assert_eq!(common, back);
+}
+
+#[test]
+fn from_common_preserves_interleaved_block_ordering() {
+    let meta = common::Meta {
+        id: "interleave-1".into(),
+        timestamp: ts("2026-01-02T03:04:05.000Z"),
+        cwd: Some("/repo".into()),
+        git_branch: Some("main".into()),
+        title: None,
+        cli_version: Some("0.104.0".into()),
+        model: Some("gpt-5.2-codex".into()),
+        lineage: None,
+    };
+    let body = vec![common::Message {
+        role: common::Role::Assistant,
+        content: vec![
+            common::Block::Text {
+                text: "Checking the directory first.".into(),
+            },
+            common::Block::ToolUse {
+                id: "call-ls".into(),
+                tool: common::Tool::Bash {
+                    command: "ls".into(),
+                    workdir: None,
+                    timeout_ms: None,
+                    description: None,
+                    run_in_background: false,
+                },
+            },
+            common::Block::Text {
+                text: "Directory check completed.".into(),
+            },
+        ],
+        timestamp: ts("2026-01-02T03:04:06.000Z"),
+        model: Some("gpt-5.2-codex".into()),
+        stop_reason: None,
+        usage: None,
+    }];
+    let transcript = Transcript::new(meta, body);
+    let native = codex::Codex::from_common(&transcript).unwrap();
+
+    let kinds: Vec<(&str, Option<&str>)> = native
+        .body
+        .iter()
+        .map(|line| {
+            let line_type = line.kind.as_str();
+            let payload_type = line.payload.get("type").and_then(serde_json::Value::as_str);
+            (line_type, payload_type)
+        })
+        .collect();
+
+    assert_eq!(
+        kinds,
+        vec![
+            ("session_meta", None),
+            ("turn_context", None),
+            ("response_item", Some("message")),
+            ("event_msg", Some("agent_message")),
+            ("response_item", Some("function_call")),
+            ("response_item", Some("message")),
+            ("event_msg", Some("agent_message")),
+        ]
+    );
+
+    // Verify first message text came before the tool call
+    let first_text = native.body[2].payload["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(first_text, "Checking the directory first.");
+
+    let call_id = native.body[4].payload["call_id"].as_str().unwrap();
+    assert_eq!(call_id, "call-ls");
+
+    let second_text = native.body[5].payload["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(second_text, "Directory check completed.");
 }
 
 #[test]
