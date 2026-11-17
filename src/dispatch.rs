@@ -4,7 +4,7 @@
 //!
 //! No filesystem, no `SQLite`, no subprocess: this is the codec layer alone
 //! (see [`TextCodec`]), so it is available on every target, WASM included. The
-//! WASM bindings and [`fidelity`](crate::fidelity) both route through it.
+//! WASM bindings route through it. A later conversion-fidelity report will too.
 
 use crate::harness::{
     amp, antigravity, campfire, chatgpt, claude_chat, claude_code, codex, cowork, cowork_remote,
