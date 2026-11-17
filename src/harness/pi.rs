@@ -296,7 +296,21 @@ pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Reco
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut parent_id: Option<String> = None;
 
+    let joins = joins_previous_response(messages);
+
     for (i, msg) in messages.iter().enumerate() {
+        // Written as part of the response that starts before it.
+        if joins[i] {
+            continue;
+        }
+        let run_end = i + 1 + joins[i + 1..].iter().take_while(|&&j| j).count();
+        let merged;
+        let msg = if run_end > i + 1 {
+            merged = merge_response(&messages[i..run_end]);
+            &merged
+        } else {
+            msg
+        };
         let ts_iso = msg.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
         let ts_ms = msg.timestamp.timestamp_millis();
         for (j, payload) in pi_payloads_for(msg, ts_ms, &mut tool_names)
@@ -315,6 +329,59 @@ pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Reco
         }
     }
     records
+}
+
+/// `joins[i]`: message `i` belongs to the same model response as message
+/// `i - 1` and is written into the same pi assistant message.
+///
+/// Sources that record one block per message (Codex's `function_call` items,
+/// Claude Code's one-line-per-block JSONL) give a parallel call batch as
+/// consecutive assistant messages with every result after them. pi keeps a
+/// response's tool calls in one assistant message; replaying call A in a
+/// message of its own, followed by another assistant message, makes pi pair A
+/// with a synthetic "No result provided" error and leaves A's real result
+/// orphaned. So a run of consecutive assistant messages is one response when
+/// a tool call sits anywhere before its last message: exactly the runs pi
+/// would otherwise break. Other runs (thinking then text) are left as is.
+fn joins_previous_response(messages: &[Message]) -> Vec<bool> {
+    let mut joins = vec![false; messages.len()];
+    let mut start = 0;
+    while start < messages.len() {
+        let mut end = start + 1;
+        if messages[start].role == Role::Assistant {
+            while end < messages.len() && messages[end].role == Role::Assistant {
+                end += 1;
+            }
+            let calls_before_last = messages[start..end - 1]
+                .iter()
+                .any(|m| m.content.iter().any(|b| matches!(b, Block::ToolUse { .. })));
+            if calls_before_last {
+                joins[start + 1..end].fill(true);
+            }
+        }
+        start = end;
+    }
+    joins
+}
+
+/// One assistant message for a response recorded over several: the blocks in
+/// order, the first timestamp and model, and the last stop reason and usage
+/// (a response's final ones).
+fn merge_response(run: &[Message]) -> Message {
+    let mut merged = run[0].clone();
+    for msg in &run[1..] {
+        merged.content.extend(msg.content.iter().cloned());
+        if merged.model.is_none() {
+            merged.model.clone_from(&msg.model);
+        }
+        if msg.stop_reason.is_some() {
+            merged.stop_reason.clone_from(&msg.stop_reason);
+        }
+        if msg.usage.is_some() {
+            merged.usage.clone_from(&msg.usage);
+        }
+    }
+    merged
 }
 
 fn pi_payloads_for(

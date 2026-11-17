@@ -10,6 +10,7 @@ mod claude_tool_result;
 #[cfg(feature = "codex_zstd")]
 mod codex_compressed;
 mod codex_pairing;
+mod parallel_tool_calls;
 
 use chrono::{DateTime, Utc};
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
