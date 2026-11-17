@@ -331,12 +331,11 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             .and_then(Value::as_str)
                             .map(String::from)
                         {
-                            let content = payload
-                                .get("output")
-                                .and_then(Value::as_str)
-                                .map_or(ToolOutput::Text(String::new()), |s| {
-                                    ToolOutput::Text(s.to_string())
-                                });
+                            let content = match payload.get("output") {
+                                Some(Value::String(s)) => ToolOutput::Text(s.clone()),
+                                Some(Value::Array(items)) => content_items_output(items),
+                                _ => ToolOutput::Text(String::new()),
+                            };
                             queued.push(tool_result(
                                 ts,
                                 result_key(&call_id),
@@ -382,11 +381,15 @@ fn lines_to_messages(lines: &[Line], fallback_ts: DateTime<Utc>) -> Vec<Message>
                             .and_then(Value::as_str)
                             .map(String::from)
                         {
-                            let raw = payload
-                                .get("output")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            let (content, is_error) = parse_custom_tool_output(raw);
+                            // Code mode (`exec`) writes the output as an
+                            // array of `input_text` content items rather
+                            // than a string; reading only strings dropped
+                            // the whole result.
+                            let (content, is_error) = match payload.get("output") {
+                                Some(Value::String(raw)) => parse_custom_tool_output(raw),
+                                Some(Value::Array(items)) => (content_items_output(items), false),
+                                _ => parse_custom_tool_output(""),
+                            };
                             canonical_results.insert(result_key(&call_id));
                             queued.push(tool_result(
                                 ts,
@@ -1651,6 +1654,33 @@ fn format_exec_output(payload: &Value) -> String {
             (true, false) => stderr.to_string(),
             (true, true) => String::new(),
         }
+    }
+}
+
+/// A tool output written as a list of content items (`input_text`,
+/// `output_text`, `input_image`, ...). All-text lists collapse to their text,
+/// one item per line; anything else is kept verbatim as JSON so no part of the
+/// result is lost.
+fn content_items_output(items: &[Value]) -> ToolOutput {
+    let texts: Option<Vec<&str>> = items
+        .iter()
+        .map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => item.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect();
+    match texts {
+        Some(texts) => {
+            let mut out = String::new();
+            for text in texts {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            ToolOutput::Text(out)
+        }
+        None => ToolOutput::Json(Value::Array(items.to_vec())),
     }
 }
 

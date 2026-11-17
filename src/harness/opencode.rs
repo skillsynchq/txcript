@@ -567,6 +567,15 @@ fn assistant_part(
         Block::ToolUse { id, tool } => {
             let (name, input) = tool.to_canonical();
             let (oc_name, oc_input) = denormalize_tool(&name, input);
+            // `opencode import` rejects a non-object `state.input` ("Expected
+            // object"), and Codex freeform calls (code-mode `exec`,
+            // `apply_patch`) carry a raw string. Keep the payload inside an
+            // object, as the Claude Code export does.
+            let oc_input = if oc_input.is_object() {
+                oc_input
+            } else {
+                json!({ "input": oc_input })
+            };
             let mut state = json!({
                 "status": "completed",
                 "input": oc_input,
