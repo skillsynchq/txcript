@@ -340,7 +340,6 @@ impl clap::builder::TypedValueParser for HarnessParser {
 
 /// Run a parsed `txcript` command line to completion, reporting errors on
 /// stderr. This is the whole of the `txcript` binary.
-#[must_use]
 pub fn run(cli: Cli) -> ExitCode {
     let options = Options {
         program: None,
