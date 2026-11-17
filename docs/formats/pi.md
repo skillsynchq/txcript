@@ -115,6 +115,11 @@ out is not implemented yet — `from_common` never emits it.
   thinking), re-derives entry ids deterministically (8 chars, matching pi's
   truncated-uuid convention), guesses `provider`/`api` from the model id,
   zeroes cost, and collapses `StopSequence`/`Other` stop reasons to `"stop"`.
+- **User commands become text.** pi has no user-side tool call, so a
+  `Tool::Command` (e.g. a Claude Code `/rename`) is written as the user
+  text that was typed, and its output as user text too. More generally a
+  `toolResult` is only written when its `toolCall` was: an orphan result
+  makes providers reject the session on resume (#105).
 - **bashExecution honors pi's context rule**: runs flagged
   `excludeFromContext` (pi's `!!` prefix) produce no turn.
 - **Two timestamps per line.** The envelope carries ISO-8601, the message

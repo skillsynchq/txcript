@@ -340,18 +340,35 @@ fn pi_payloads_for(
                         content: result,
                         is_error,
                     } => {
-                        let tool_name = tool_names
-                            .get(tool_use_id)
-                            .cloned()
-                            .unwrap_or_else(|| "tool".to_string());
-                        out.push(json!({
-                            "role": "toolResult",
-                            "toolCallId": tool_use_id,
-                            "toolName": tool_name,
-                            "content": [{"type": "text", "text": tool_output_text(result)}],
-                            "isError": is_error,
-                            "timestamp": ts_ms,
-                        }));
+                        // A `toolResult` is only valid answering a `toolCall`
+                        // pi already holds; providers reject an orphan and
+                        // refuse the whole session on resume (#105). Output
+                        // with no call written — a user command's, or one
+                        // that never had a call — stays user-visible text.
+                        if let Some(tool_name) = tool_names.get(tool_use_id) {
+                            out.push(json!({
+                                "role": "toolResult",
+                                "toolCallId": tool_use_id,
+                                "toolName": tool_name,
+                                "content": [{"type": "text", "text": tool_output_text(result)}],
+                                "isError": is_error,
+                                "timestamp": ts_ms,
+                            }));
+                        } else {
+                            content.push(json!({"type": "text", "text": tool_output_text(result)}));
+                        }
+                    }
+                    // pi has no user-side tool call: a slash command the user
+                    // ran becomes the text they typed.
+                    Block::ToolUse {
+                        tool: Tool::Command { command, args },
+                        ..
+                    } => {
+                        let text = match args.as_deref().map(str::trim) {
+                            Some(args) if !args.is_empty() => format!("{command} {args}"),
+                            _ => command.clone(),
+                        };
+                        content.push(json!({"type": "text", "text": text}));
                     }
                     // Not expressible in a pi user message.
                     Block::Thinking { .. } | Block::ToolUse { .. } => {}
