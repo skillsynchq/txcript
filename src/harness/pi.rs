@@ -437,8 +437,13 @@ fn pi_payloads_for(
                         };
                         content.push(json!({"type": "text", "text": text}));
                     }
-                    // Not expressible in a pi user message.
-                    Block::Thinking { .. } | Block::ToolUse { .. } => {}
+                    Block::ToolUse { tool, .. } => {
+                        if let Some(cmd) = tool.command_display() {
+                            content.push(json!({"type": "text", "text": cmd}));
+                        }
+                    }
+                    // Thinking is not expressible in a pi user message.
+                    Block::Thinking { .. } => {}
                 }
             }
             if !content.is_empty() {
