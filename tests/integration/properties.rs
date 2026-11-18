@@ -19,7 +19,7 @@ use serde_json::json;
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
 use txcript::harness::{
     amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, fx, grok,
-    grok_bot, hermes, opencode, pi, simple,
+    grok_bot, hermes, opencode, pi, qoder, simple,
 };
 use txcript::{Codec, Common, Transcript};
 
@@ -269,6 +269,7 @@ proptest! {
         assert_fixpoint::<codex::Codex>("codex", &common)?;
         assert_fixpoint::<opencode::OpenCode>("opencode", &common)?;
         assert_fixpoint::<pi::Pi>("pi", &common)?;
+        assert_fixpoint::<qoder::Qoder>("qoder", &common)?;
         assert_fixpoint::<campfire::Campfire>("campfire", &common)?;
         assert_fixpoint::<cursor::Cursor>("cursor", &common)?;
         assert_fixpoint::<cursor_desktop::CursorDesktop>("cursor_desktop", &common)?;

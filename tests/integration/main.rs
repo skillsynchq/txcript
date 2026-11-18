@@ -24,6 +24,7 @@ mod opencode;
 mod path_safety;
 mod pi;
 mod properties;
+mod qoder;
 mod simple;
 mod store_delete;
 

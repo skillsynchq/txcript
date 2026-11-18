@@ -54,6 +54,7 @@ than none.
 | [fx.md](fx.md) | fx (Vercel) | `src/harness/fx.rs` |
 | [hermes.md](hermes.md) | Hermes Agent | `src/harness/hermes.rs` |
 | [antigravity.md](antigravity.md) | Antigravity (Google) | `src/harness/antigravity.rs` |
+| [qoder.md](qoder.md) | Qoder CLI | `src/harness/qoder.rs` |
 | [pi.md](pi.md) | pi | `src/harness/pi.rs` |
 | [campfire.md](campfire.md) | Campfire (embeds pi) | `src/harness/campfire.rs` |
 | [simple.md](simple.md) | Simple (txcript's own interchange format) | `src/harness/simple.rs` |

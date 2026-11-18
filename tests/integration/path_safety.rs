@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
 use txcript::harness::{
-    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, pi,
+    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, pi, qoder,
 };
 use txcript::{Codec, Common, Store, Transcript};
 
@@ -80,6 +80,7 @@ fn hostile_ids_cannot_escape_any_file_backed_store() {
     assert_save_confined(&claude_code::ClaudeStore::new(root.to_path_buf()), root);
     assert_save_confined(&codex::CodexStore::new(root.to_path_buf()), root);
     assert_save_confined(&pi::PiStore::new(root.to_path_buf()), root);
+    assert_save_confined(&qoder::QoderStore::new(root.to_path_buf()), root);
     assert_save_confined(&campfire::CampfireStore::new(root.to_path_buf()), root);
     assert_save_confined(&cursor::CursorStore::new(root.to_path_buf()), root);
     assert_save_confined(&grok::GrokStore::new(root.to_path_buf()), root);
@@ -405,4 +406,41 @@ fn codex_delete_refuses_symlink_escapes_from_both_roots() {
             "a rejected reference must remain untouched"
         );
     }
+}
+
+#[test]
+fn qoder_delete_refuses_paths_outside_the_sessions_root() {
+    let sessions = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let foreign = victim.path().join("session.jsonl");
+    std::fs::write(&foreign, b"{}").unwrap();
+
+    let store = qoder::QoderStore::new(sessions.path().to_path_buf());
+    assert!(
+        store.delete(&foreign).is_err(),
+        "a session.jsonl outside the sessions root must be refused"
+    );
+    assert!(victim.path().is_dir(), "the foreign directory must survive");
+    assert!(foreign.is_file(), "the foreign file must survive");
+}
+
+#[cfg(unix)]
+#[test]
+fn qoder_delete_refuses_symlink_escapes_and_discovery_ignores_project_links() {
+    let root = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let foreign = victim.path().join("session.jsonl");
+    std::fs::write(&foreign, b"{}").unwrap();
+    let project = root.path().join("-work-proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let link = project.join("linked.jsonl");
+    std::os::unix::fs::symlink(&foreign, &link).unwrap();
+    let store = qoder::QoderStore::new(root.path());
+    assert!(store.delete(&link).is_err());
+    assert!(foreign.is_file());
+    assert!(link.is_symlink());
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(victim.path(), root.path().join("outside-project")).unwrap();
+    std::os::unix::fs::symlink(root.path(), project.join("loop")).unwrap();
+    assert!(store.discover().unwrap().is_empty());
 }
