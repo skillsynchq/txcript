@@ -1,0 +1,1614 @@
+//! `dsh` sessions: `$DSH_HOME/sessions` (default `~/.dsh/sessions`).
+//!
+//! Official persistence writes one append-only JSONL log per session, Zstandard
+//! framed by default, named for its format generation
+//! (`session[.vN].jsonl[.zstd]`; currently `session.v4.jsonl.zstd`). The first
+//! line is a `type: session` header; the rest are `SessionEvent` records (and,
+//! in v0–v1, packed `*-chunks` rows). The reader understands generations 0
+//! through 4 directly.
+//!
+//! dsh finds sessions by walking its root, so no import command is needed —
+//! but it also validates what it finds, and three of its checks fail the
+//! *whole* listing rather than skipping one session: a first Zstandard frame
+//! that is not exactly the header line, a header whose id and cwd do not name
+//! the path it was found at, and a root that mixes `.jsonl` with
+//! `.jsonl.zstd`. Writing therefore reproduces dsh's own layout exactly.
+//!
+//! Native body retains the header and every log line as raw JSON, including
+//! packed chunk rows and unknown event types. The Common projection uses the
+//! ordered surface (`system/message`, `developer/message`, `user/message`,
+//! `assistant/message`, `tool/result`), minus the environment context dsh
+//! injects as user messages.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::common::{
+    Block, Lineage, Message, Meta, Relation, Role, StopReason, Tool, ToolOutput, Usage,
+};
+use crate::error::{Error, Result};
+use crate::harness::jsonl;
+use crate::transcript::{Codec, Common, Discovered, Harness, Saved, Store, TextCodec, Transcript};
+
+/// On-disk format version stamped into every header txcript writes from
+/// Common. Official readers migrate older versions and refuse newer ones;
+/// txcript still loads the native body so unknown future logs are not silently
+/// dropped.
+const SESSION_FORMAT_VERSION: u64 = 4;
+
+/// The `dsh` harness marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dsh;
+
+impl Harness for Dsh {
+    const NAME: &'static str = "dsh";
+    type Body = DshSession;
+}
+
+/// Header line plus the remaining JSONL records, kept raw.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DshSession {
+    pub header: Value,
+    #[serde(default)]
+    pub events: Vec<Value>,
+}
+
+impl TextCodec for Dsh {
+    fn from_text(text: &str) -> Result<Transcript<Self>> {
+        let body: DshSession = serde_json::from_str(text)?;
+        let meta = meta_from_body(&body);
+        Ok(Transcript::new(meta, body))
+    }
+
+    fn to_text(transcript: &Transcript<Self>) -> Result<String> {
+        Ok(serde_json::to_string_pretty(&transcript.body)?)
+    }
+}
+
+impl Codec for Dsh {
+    fn to_common(transcript: &Transcript<Self>) -> Result<Transcript<Common>> {
+        Ok(Transcript::new(
+            transcript.meta.clone(),
+            events_to_messages(&transcript.body.events, transcript.meta.timestamp),
+        ))
+    }
+
+    fn from_common(transcript: &Transcript<Common>) -> Result<Transcript<Self>> {
+        Ok(Transcript::new(
+            transcript.meta.clone(),
+            body_from_common(transcript),
+        ))
+    }
+}
+
+/// Read/write access to `dsh` session directories.
+#[derive(Debug, Clone)]
+pub struct DshStore {
+    pub sessions_dir: PathBuf,
+}
+
+impl DshStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            sessions_dir: path.into(),
+        }
+    }
+
+    /// `$DSH_HOME/sessions`, then `~/.dsh/sessions`. Empty `$DSH_HOME` is unset.
+    #[must_use]
+    pub fn default_root() -> Option<Self> {
+        std::env::var_os("DSH_HOME")
+            .filter(|value| !value.is_empty() && !value.to_string_lossy().trim().is_empty())
+            .map(|home| Self::new(PathBuf::from(home).join("sessions")))
+            .or_else(|| super::home_dir().map(|home| Self::new(home.join(".dsh").join("sessions"))))
+    }
+}
+
+impl Store for DshStore {
+    type H = Dsh;
+    type Ref = PathBuf;
+
+    fn discover(&self) -> Result<Vec<Discovered<PathBuf>>> {
+        let mut found = Vec::new();
+        let Ok(projects) = fs::read_dir(&self.sessions_dir) else {
+            return Ok(found);
+        };
+        for project in projects.flatten().map(|entry| entry.path()) {
+            if !project.is_dir() {
+                continue;
+            }
+            let Ok(sessions) = fs::read_dir(&project) else {
+                continue;
+            };
+            for session_dir in sessions.flatten().map(|entry| entry.path()) {
+                if !session_dir.is_dir() {
+                    continue;
+                }
+                let Some(log) = log_path(&session_dir) else {
+                    continue;
+                };
+                let Ok(body) = load_body(&log) else {
+                    continue;
+                };
+                let mut meta = meta_from_body(&body);
+                if meta.id.is_empty() {
+                    meta.id = jsonl::file_id(&session_dir);
+                }
+                found.push(Discovered {
+                    meta,
+                    reference: session_dir,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    fn load(&self, reference: &PathBuf) -> Result<Transcript<Dsh>> {
+        let log = log_path(reference).ok_or_else(|| Error::Malformed {
+            harness: Dsh::NAME,
+            detail: format!("no session log in {}", reference.display()),
+        })?;
+        let body = load_body(&log)?;
+        let mut meta = meta_from_body(&body);
+        if meta.id.is_empty() {
+            meta.id = jsonl::file_id(reference);
+        }
+        Ok(Transcript::new(meta, body))
+    }
+
+    fn save(&self, transcript: &Transcript<Dsh>) -> Result<Saved<PathBuf>> {
+        let id = session_id(transcript);
+        let cwd = session_cwd(transcript);
+        let dir = self
+            .sessions_dir
+            .join(project_key(cwd.as_deref()))
+            .join(encode_segment(&id)?);
+
+        let mut body = transcript.body.clone();
+        stamp_identity(&mut body.header, &id, cwd.as_deref());
+
+        let compressed = self.root_compresses();
+        // dsh rejects a log whose file name and header disagree on the
+        // version, so a native body is written under its own generation.
+        let version = body
+            .header
+            .get("version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let name = log_file_name(version, compressed);
+        let bytes = if compressed {
+            encode_log(&body)?
+        } else {
+            plain_log(&body)?.into_bytes()
+        };
+        fs::create_dir_all(&dir)?;
+        // Write beside the log and rename over it, so a failed write neither
+        // truncates a previous log at this path nor leaves a partial one. The
+        // temporary name carries no `.jsonl`, so dsh never mistakes it for a
+        // log of either encoding.
+        let tmp = dir.join(".txcript-save.tmp");
+        if let Err(error) = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, dir.join(&name)))
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        // The saved log replaces the whole session. A newer generation left
+        // beside it would be the one dsh (and txcript) read, and the opposite
+        // encoding is the same poison as one elsewhere in the root.
+        retire_other_generations(&dir, &name);
+        // Only now that the replacement is on disk: a copy under another
+        // project directory is the last one left if this save had failed.
+        self.retire_other_copies(&id, &dir);
+        Ok(Saved { id, reference: dir })
+    }
+
+    fn delete(&self, reference: &PathBuf) -> Result<()> {
+        if log_path(reference).is_none() {
+            return Err(Error::Malformed {
+                harness: Dsh::NAME,
+                detail: format!("not a dsh session directory: {}", reference.display()),
+            });
+        }
+        // Resolve symlinks before checking containment, and require the exact
+        // `<project>/<session>` depth so neither the root nor a project
+        // directory can be removed wholesale.
+        let canon = reference.canonicalize()?;
+        let root = self.sessions_dir.canonicalize()?;
+        let contained = canon
+            .strip_prefix(&root)
+            .is_ok_and(|rest| rest.components().count() == 2);
+        if !contained {
+            return Err(Error::Malformed {
+                harness: Dsh::NAME,
+                detail: format!(
+                    "refusing to delete outside the sessions root: {}",
+                    reference.display()
+                ),
+            });
+        }
+        Ok(fs::remove_dir_all(canon)?)
+    }
+
+    fn fingerprints(&self, refs: &[PathBuf]) -> Result<HashMap<String, String>> {
+        let mut output = HashMap::with_capacity(refs.len());
+        for reference in refs {
+            let cursor =
+                log_path(reference).map_or_else(String::new, |path| file_fingerprint(&path));
+            output.insert(reference.to_string_lossy().into_owned(), cursor);
+        }
+        Ok(output)
+    }
+}
+
+impl DshStore {
+    /// Remove copies of `id` filed under a different project directory.
+    ///
+    /// A session's project directory is keyed by its cwd, so a re-save after a
+    /// cwd change lands somewhere new. dsh treats one id under two project
+    /// directories as corruption and fails its whole listing, so the stale copy
+    /// cannot stay. Best effort: a copy that cannot be removed is not worth
+    /// failing an otherwise good write over.
+    fn retire_other_copies(&self, id: &str, keep: &Path) {
+        let Ok(encoded) = encode_segment(id) else {
+            return;
+        };
+        let Ok(projects) = fs::read_dir(&self.sessions_dir) else {
+            return;
+        };
+        for project in projects.flatten().map(|entry| entry.path()) {
+            let candidate = project.join(&encoded);
+            if candidate != keep && log_path(&candidate).is_some() {
+                let _ = fs::remove_dir_all(&candidate);
+            }
+        }
+    }
+
+    /// Whether a new log should be Zstandard framed.
+    ///
+    /// dsh refuses to list *any* session in a root that holds both `.jsonl`
+    /// and `.jsonl.zstd` artifacts — under either configuration, not just the
+    /// mismatched one. So the root's existing artifacts decide, and only an
+    /// empty root falls back to dsh's own default of `zstd`.
+    fn root_compresses(&self) -> bool {
+        let Ok(projects) = fs::read_dir(&self.sessions_dir) else {
+            return true;
+        };
+        for project in projects.flatten().map(|entry| entry.path()) {
+            let Ok(sessions) = fs::read_dir(&project) else {
+                continue;
+            };
+            for session_dir in sessions.flatten().map(|entry| entry.path()) {
+                if let Some(log) = log_path(&session_dir) {
+                    return log.extension().is_some_and(|ext| ext == "zstd");
+                }
+            }
+        }
+        true
+    }
+}
+
+/// `meta` is the canonical identity, not the retained native header: a copy is
+/// given a new id and timestamp before it is written, and the header it
+/// inherited still names the original.
+fn session_id(transcript: &Transcript<Dsh>) -> String {
+    if !transcript.meta.id.is_empty() {
+        return transcript.meta.id.clone();
+    }
+    transcript
+        .body
+        .header
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map_or_else(
+            || format!("session-{}", Uuid::new_v5(&NS, b"empty-id")),
+            String::from,
+        )
+}
+
+fn session_cwd(transcript: &Transcript<Dsh>) -> Option<String> {
+    transcript
+        .meta
+        .cwd
+        .clone()
+        .or_else(|| {
+            transcript
+                .body
+                .header
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .filter(|cwd| !cwd.is_empty())
+}
+
+/// dsh cross-checks a log it finds against the path its own header would
+/// name, and a mismatch fails the whole listing rather than skipping the one
+/// session. So the header is stamped with the id and cwd that built the path.
+fn stamp_identity(header: &mut Value, id: &str, cwd: Option<&str>) {
+    let Some(object) = header.as_object_mut() else {
+        return;
+    };
+    object.insert("id".to_string(), json!(id));
+    match cwd {
+        Some(cwd) => {
+            object.insert("cwd".to_string(), json!(cwd));
+        }
+        // `cwd: null` is not the same as an absent `cwd`: dsh keys `_no-cwd`
+        // off `undefined`, and a null would not round-trip through its header
+        // schema.
+        None => {
+            object.remove("cwd");
+        }
+    }
+}
+
+/// dsh's `encodeSegment`: injective over UTF-16 code units, which is what
+/// neutralizes `..`, absolute paths, and separators in an id that is otherwise
+/// an unvalidated string.
+fn encode_segment(raw: &str) -> Result<String> {
+    use std::fmt::Write as _;
+
+    if raw.is_empty() {
+        return Err(Error::Unconvertible {
+            harness: Dsh::NAME,
+            detail: "a dsh session id cannot be empty".to_string(),
+        });
+    }
+    match raw {
+        "." => return Ok("~002E".to_string()),
+        ".." => return Ok("~002E~002E".to_string()),
+        _ => {}
+    }
+    let mut out = String::with_capacity(raw.len());
+    for unit in raw.encode_utf16() {
+        match char::from_u32(u32::from(unit)) {
+            Some(ch) if is_path_safe(ch) => out.push(ch),
+            _ => {
+                let _ = write!(out, "~{unit:04X}");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// dsh's `projectKey`: separators collapse to a single `-`, unsafe units take
+/// the same `~XXXX` escape, and the result is wrapped in `--`. Deliberately
+/// lossy — it groups sessions for humans, and the session id below it is what
+/// identifies them.
+fn project_key(cwd: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let Some(cwd) = cwd else {
+        return "_no-cwd".to_string();
+    };
+    let mut readable = String::with_capacity(cwd.len());
+    let mut separator_run = false;
+    for unit in cwd.encode_utf16() {
+        match char::from_u32(u32::from(unit)) {
+            Some('/' | '\\' | ':') => {
+                if !separator_run {
+                    readable.push('-');
+                }
+                separator_run = true;
+            }
+            Some(ch) if is_path_safe(ch) => {
+                readable.push(ch);
+                separator_run = false;
+            }
+            _ => {
+                let _ = write!(readable, "~{unit:04X}");
+                separator_run = false;
+            }
+        }
+    }
+    // Every retained unit is ASCII — safe characters are, and escapes are —
+    // so truncating by byte matches dsh's truncation by UTF-16 unit.
+    let trimmed = readable.trim_start_matches('-');
+    let name = if trimmed.is_empty() { "root" } else { trimmed };
+    format!("--{}--", &name[..name.len().min(251)])
+}
+
+fn is_path_safe(ch: char) -> bool {
+    ch != '~' && (ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+/// The uncompressed artifact: the header line, then one line per event.
+fn plain_log(body: &DshSession) -> Result<String> {
+    Ok(format!("{}{}", header_line(body)?, event_lines(body)?))
+}
+
+/// The Zstandard artifact: one frame holding exactly the header line, then one
+/// holding the event lines. dsh checks that the first frame decodes to a
+/// single line, so the split is part of the format, not a writer's choice.
+fn encode_log(body: &DshSession) -> Result<Vec<u8>> {
+    let mut out = compress_frame(header_line(body)?.as_bytes())?;
+    out.extend(compress_frame(event_lines(body)?.as_bytes())?);
+    Ok(out)
+}
+
+fn header_line(body: &DshSession) -> Result<String> {
+    Ok(format!("{}\n", serde_json::to_string(&body.header)?))
+}
+
+fn event_lines(body: &DshSession) -> Result<String> {
+    let lines = body
+        .events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n");
+    Ok(format!("{lines}\n"))
+}
+
+#[cfg(feature = "dsh_zstd")]
+fn compress_frame(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+
+    // dsh compresses every frame with the content checksum enabled, and
+    // validates it on read.
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)?;
+    encoder.include_checksum(true)?;
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish()?)
+}
+
+#[cfg(not(feature = "dsh_zstd"))]
+fn compress_frame(_bytes: &[u8]) -> Result<Vec<u8>> {
+    Err(Error::Malformed {
+        harness: Dsh::NAME,
+        detail: "writing a compressed dsh session log needs txcript's `dsh_zstd` feature"
+            .to_string(),
+    })
+}
+
+/// The live log in a session directory. dsh names each format generation
+/// `session[.vN].jsonl[.zstd]` (no `.vN` is version 0) and, when it migrates
+/// a session, publishes the new generation beside the old one rather than
+/// replacing it, so the numerically highest generation is the current one.
+fn log_path(session_dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(session_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let generation = log_generation(&name)?;
+            let path = entry.path();
+            let compressed = path.extension().is_some_and(|ext| ext == "zstd");
+            path.is_file().then_some(((generation, compressed), path))
+        })
+        .max_by_key(|(key, _)| *key)
+        .map(|(_, path)| path)
+}
+
+/// The format generation a canonical log file name carries, or `None` for
+/// anything else in the directory (the lock file, in-flight `.tmp` files).
+/// dsh's canonical generation name: version 0 carries no `.vN`.
+fn log_file_name(version: u64, compressed: bool) -> String {
+    let stem = if version == 0 {
+        "session.jsonl".to_string()
+    } else {
+        format!("session.v{version}.jsonl")
+    };
+    if compressed {
+        format!("{stem}.zstd")
+    } else {
+        stem
+    }
+}
+
+/// Remove every log in `dir` other than `keep`. Best effort, like
+/// [`DshStore::retire_other_copies`].
+fn retire_other_generations(dir: &Path, keep: &str) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name != keep && log_generation(&name).is_some() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn log_generation(name: &str) -> Option<u64> {
+    let stem = name.strip_prefix("session")?;
+    let stem = stem.strip_suffix(".zstd").unwrap_or(stem);
+    let stem = stem.strip_suffix(".jsonl")?;
+    if stem.is_empty() {
+        return Some(0);
+    }
+    let digits = stem.strip_prefix(".v")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn load_body(path: &Path) -> Result<DshSession> {
+    let text = read_log_text(path)?;
+    parse_log(&text)
+}
+
+fn parse_log(text: &str) -> Result<DshSession> {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return Err(Error::Malformed {
+            harness: Dsh::NAME,
+            detail: "empty session log".to_string(),
+        });
+    };
+    let header: Value = serde_json::from_str(first)?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return Err(Error::Malformed {
+            harness: Dsh::NAME,
+            detail: "first line is not a session header".to_string(),
+        });
+    }
+    let events = lines
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    Ok(DshSession { header, events })
+}
+
+fn read_log_text(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    if path.extension().is_some_and(|ext| ext == "zstd") {
+        return decode_zstd(&bytes);
+    }
+    String::from_utf8(bytes).map_err(|error| Error::Malformed {
+        harness: Dsh::NAME,
+        detail: format!("session log is not utf-8: {error}"),
+    })
+}
+
+#[cfg(feature = "dsh_zstd")]
+fn decode_zstd(bytes: &[u8]) -> Result<String> {
+    use std::io::Read as _;
+
+    // The official JSONL backend concatenates independent Zstandard frames
+    // (header frame, then one per append batch). The streaming decoder parses
+    // frame structure and continues across frame boundaries on its own, so the
+    // whole file decodes in one pass. Splitting on the frame magic instead
+    // would be wrong: those four bytes also occur inside compressed block
+    // payloads and checksums, and a false split turns a valid log into a
+    // decoder error.
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))?.read_to_end(&mut out)?;
+    String::from_utf8(out).map_err(|error| Error::Malformed {
+        harness: Dsh::NAME,
+        detail: format!("zstd session log is not utf-8: {error}"),
+    })
+}
+
+#[cfg(not(feature = "dsh_zstd"))]
+fn decode_zstd(_bytes: &[u8]) -> Result<String> {
+    Err(Error::Malformed {
+        harness: Dsh::NAME,
+        detail: "a compressed dsh session log needs txcript's `dsh_zstd` feature".to_string(),
+    })
+}
+
+fn file_fingerprint(path: &Path) -> String {
+    let Ok(metadata) = fs::metadata(path) else {
+        return String::new();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .map(|time| {
+            DateTime::<Utc>::from(time)
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    format!("{}:{modified}", metadata.len())
+}
+
+fn meta_from_body(body: &DshSession) -> Meta {
+    let header = &body.header;
+    let id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let timestamp = header
+        .get("createdAt")
+        .and_then(Value::as_i64)
+        .and_then(DateTime::from_timestamp_millis)
+        .or_else(|| first_event_time(&body.events))
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let cwd = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(String::from);
+    let title = body.events.iter().rev().find_map(|event| {
+        (event.get("type").and_then(Value::as_str) == Some("session/title"))
+            .then(|| {
+                event
+                    .get("data")
+                    .and_then(|data| data.get("title"))
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.is_empty())
+                    .map(String::from)
+            })
+            .flatten()
+    });
+    let model = body.events.iter().rev().find_map(|event| {
+        match event.get("type").and_then(Value::as_str) {
+            Some("request/context") => event
+                .get("data")
+                .and_then(|data| data.get("model"))
+                .and_then(Value::as_str)
+                .map(String::from),
+            Some("request/header") => event
+                .get("data")
+                .and_then(|data| data.get("header"))
+                .and_then(|header| header.get("config"))
+                .and_then(|config| config.get("model"))
+                .and_then(Value::as_str)
+                .map(String::from),
+            _ => None,
+        }
+    });
+    Meta {
+        id,
+        timestamp,
+        cwd,
+        git_branch: None,
+        title,
+        cli_version: None,
+        model,
+        lineage: lineage_from_header(header),
+    }
+}
+
+/// `parentSession` is the id of the session this one was seeded from. A
+/// subagent run also carries `origin: "subagent"`; a user fork carries no
+/// origin. dsh resumes a session under its own id, so there is no
+/// continuation link.
+fn lineage_from_header(header: &Value) -> Option<Lineage> {
+    let parent = header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty())?;
+    let relation = if header.get("origin").and_then(Value::as_str) == Some("subagent") {
+        Relation::Spawn
+    } else {
+        Relation::Fork
+    };
+    Some(Lineage {
+        parent: parent.to_string(),
+        relation,
+    })
+}
+
+fn first_event_time(events: &[Value]) -> Option<DateTime<Utc>> {
+    events
+        .iter()
+        .find_map(|event| event.get("time").and_then(Value::as_i64))
+        .and_then(DateTime::from_timestamp_millis)
+}
+
+/// `data.usage` is dsh's `TokenUsage`: required `inputTokens`/`outputTokens`
+/// plus optional cache and reasoning tallies. Common has no reasoning counter,
+/// so `reasoningTokens` survives only in the native body.
+fn usage_from_data(data: Option<&Value>) -> Option<Usage> {
+    let usage = data?.get("usage")?;
+    Some(Usage {
+        input_tokens: usage.get("inputTokens").and_then(Value::as_u64)?,
+        output_tokens: usage.get("outputTokens").and_then(Value::as_u64)?,
+        cache_read_input_tokens: usage.get("cacheReadTokens").and_then(Value::as_u64),
+        cache_creation_input_tokens: usage.get("cacheWriteTokens").and_then(Value::as_u64),
+    })
+}
+
+fn event_time(event: &Value, fallback: DateTime<Utc>) -> DateTime<Utc> {
+    event
+        .get("time")
+        .and_then(Value::as_i64)
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap_or(fallback)
+}
+
+/// Resolve a `replace` op's inclusive seq range to surface positions. `None`
+/// when either endpoint is missing from the current surface or the range runs
+/// backwards — the same conditions dsh itself rejects.
+fn replacement_range(
+    surface: &[(Option<u64>, &Value)],
+    op: &serde_json::Map<String, Value>,
+) -> Option<(usize, usize)> {
+    let position = |seq: Option<&Value>| {
+        let seq = seq.and_then(Value::as_u64)?;
+        surface.iter().position(|(node, _)| *node == Some(seq))
+    };
+    // v3 renamed the endpoints from `start`/`end` to `startSeq`/`endSeq`.
+    let start = position(op.get("startSeq").or_else(|| op.get("start")))?;
+    let end = position(op.get("endSeq").or_else(|| op.get("end")))?;
+    (start <= end).then_some((start, end))
+}
+
+/// Rebuild the ordered surface, then project those nodes into Common messages.
+/// Packed `*-chunks` rows and log-only events stay in the native body.
+fn events_to_messages(events: &[Value], fallback: DateTime<Utc>) -> Vec<Message> {
+    // The surface is an ordered list of event seqs, not a list of log indexes:
+    // log-only events (turn/step markers, chunks, packed rows) sit between
+    // surface nodes, so a node's seq and its surface position diverge
+    // immediately. A `replace` op names the inclusive *seq* range it shadows,
+    // and both endpoints must currently be on the surface.
+    let mut surface: Vec<(Option<u64>, &Value)> = Vec::new();
+    for event in events {
+        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        // System and developer messages (v3+) never become Common messages,
+        // but they are surface nodes a replacement span is counted across.
+        if !matches!(
+            kind,
+            "system/message"
+                | "developer/message"
+                | "user/message"
+                | "assistant/message"
+                | "tool/result"
+        ) {
+            continue;
+        }
+        let seq = event.get("seq").and_then(Value::as_u64);
+        let node = (seq, event);
+        match event.get("surfaceOp") {
+            Some(Value::Object(op)) if op.get("op").and_then(Value::as_str) == Some("replace") => {
+                match replacement_range(&surface, op) {
+                    Some((start, end)) => {
+                        surface.splice(start..=end, std::iter::once(node));
+                    }
+                    // A range we cannot resolve (truncated log, unknown seq)
+                    // shadows nothing; keep the node rather than drop history.
+                    None => surface.push(node),
+                }
+            }
+            _ => surface.push(node),
+        }
+    }
+
+    let mut messages = Vec::new();
+    for (_, event) in surface {
+        let timestamp = event_time(event, fallback);
+        match event.get("type").and_then(Value::as_str) {
+            Some("user/message") => {
+                if is_environment_injection(event.get("data")) {
+                    continue;
+                }
+                let blocks = user_text_blocks(event.get("data"));
+                if !blocks.is_empty() {
+                    messages.push(user_message(blocks, timestamp));
+                }
+            }
+            Some("assistant/message") => {
+                let data = event.get("data");
+                let content = data
+                    .and_then(|value| value.get("message"))
+                    .and_then(|message| message.get("content"));
+                let blocks = assistant_blocks(content);
+                if blocks.is_empty() {
+                    continue;
+                }
+                let model = data
+                    .and_then(|value| value.get("message"))
+                    .and_then(|message| message.get("source"))
+                    .and_then(|source| source.get("model"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let has_tool = blocks
+                    .iter()
+                    .any(|block| matches!(block, Block::ToolUse { .. }));
+                // `data.interrupted` is only ever `true`, and marks the partial
+                // prefix a cancelled turn had already streamed.
+                let interrupted = data
+                    .and_then(|value| value.get("interrupted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let stop_reason = if interrupted {
+                    StopReason::Aborted
+                } else if has_tool {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                };
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: blocks,
+                    timestamp,
+                    model,
+                    stop_reason: Some(stop_reason),
+                    usage: usage_from_data(data),
+                });
+            }
+            Some("tool/result") => {
+                if let Some(block) = tool_result_block(event.get("data")) {
+                    messages.push(user_message(vec![block], timestamp));
+                }
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+/// Message sources dsh regenerates from its own environment on every request —
+/// runtime and sandbox snapshots, the skill catalog, instruction files,
+/// clocks. They ride on `user/message` but are not part of the conversation,
+/// and would misdescribe any other harness a session is continued in. Every
+/// other source stays, unknown ones included: a compaction checkpoint, for
+/// one, carries the only remaining copy of the history it replaced.
+const ENVIRONMENT_SOURCES: &[&str] = &[
+    "runtime-context",
+    "skill-catalog",
+    "agent-instructions",
+    "time-context",
+    "tmux-context",
+    "repeat-tool-reminder",
+    "model-selection",
+    "plan-mode",
+];
+
+fn is_environment_injection(message: Option<&Value>) -> bool {
+    let Some(source) = message.and_then(|message| message.get("source")) else {
+        return false;
+    };
+    let kind = match source.get("kind").and_then(Value::as_str) {
+        // Before v4 a producer was `{ kind: "plugin", plugin }`; v4 renamed
+        // the system-prompt plugin's non-system messages `runtime-context`
+        // and kept every other first-party name.
+        Some("plugin") => match source.get("plugin").and_then(Value::as_str) {
+            Some("@deepseek-ai/dsh-system-prompt") => "runtime-context",
+            Some(plugin) => plugin,
+            None => return false,
+        },
+        Some(kind) => kind,
+        None => return false,
+    };
+    ENVIRONMENT_SOURCES.contains(&kind)
+}
+
+fn user_message(content: Vec<Block>, timestamp: DateTime<Utc>) -> Message {
+    Message {
+        role: Role::User,
+        content,
+        timestamp,
+        model: None,
+        stop_reason: None,
+        usage: None,
+    }
+}
+
+fn user_text_blocks(data: Option<&Value>) -> Vec<Block> {
+    let Some(content) = data
+        .and_then(|value| value.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter_map(|part| {
+            if part.get("type").and_then(Value::as_str) != Some("text") {
+                return None;
+            }
+            Some(Block::Text {
+                text: part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .filter(|block| match block {
+            Block::Text { text } => !text.is_empty(),
+            _ => true,
+        })
+        .collect()
+}
+
+fn assistant_blocks(content: Option<&Value>) -> Vec<Block> {
+    let Some(parts) = content.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                (!text.is_empty()).then(|| Block::Text {
+                    text: text.to_string(),
+                })
+            }
+            Some("reasoning") => {
+                let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                (!text.is_empty()).then(|| Block::Thinking {
+                    text: text.to_string(),
+                    signature: None,
+                    encrypted: None,
+                })
+            }
+            Some("tool-call") => {
+                let id = part
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = part
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let input = part
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .or_else(|| part.get("arguments").cloned())
+                    .unwrap_or(Value::Null);
+                Some(Block::ToolUse {
+                    id,
+                    tool: Tool::from_canonical(name, input),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_block(data: Option<&Value>) -> Option<Block> {
+    let message = data.and_then(|value| value.get("message"))?;
+    // v4 lifted the result onto a tool-role message; before that it was a
+    // user-role message holding one `tool-result` wrapper block.
+    let result = if message.get("role").and_then(Value::as_str) == Some("tool") {
+        message
+    } else {
+        message
+            .get("content")?
+            .as_array()?
+            .iter()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("tool-result"))?
+    };
+    let tool_use_id = result
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|inner| {
+            inner
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .map(|part| part.get("text").and_then(Value::as_str).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    Some(Block::ToolResult {
+        tool_use_id,
+        content: ToolOutput::Text(text),
+        is_error,
+    })
+}
+
+const NS: Uuid = Uuid::from_bytes([
+    0x4d, 0x73, 0x68, 0x2d, 0x74, 0x78, 0x63, 0x72, 0x69, 0x70, 0x74, 0x2d, 0x64, 0x73, 0x68, 0x31,
+]);
+
+/// What dsh itself writes for a tool call the model asked for but that never
+/// started. The official validator accepts an unanswered call only as this
+/// exact repair, so a Common call without a result is closed the same way.
+const NOT_STARTED_TEXT: &str = "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.";
+
+/// dsh requires a provider and model on every assistant source; Common
+/// records neither provider nor, always, a model.
+const IMPORTED_PROVIDER: &str = "txcript";
+const UNKNOWN_MODEL: &str = "unknown";
+
+fn body_from_common(transcript: &Transcript<Common>) -> DshSession {
+    let created = transcript.meta.timestamp.timestamp_millis();
+    let id = if transcript.meta.id.is_empty() {
+        format!("session-{}", Uuid::new_v5(&NS, b"empty-id"))
+    } else {
+        transcript.meta.id.clone()
+    };
+    let mut header = json!({
+        "type": "session",
+        "version": SESSION_FORMAT_VERSION,
+        "id": id,
+        "createdAt": created,
+        "isSeeded": false,
+        "delegationDepth": 0,
+    });
+    if let Some(cwd) = &transcript.meta.cwd {
+        header["cwd"] = json!(cwd);
+    }
+    let model = transcript.meta.model.as_deref().unwrap_or(UNKNOWN_MODEL);
+    let mut log = LogWriter::new(&id, created);
+    if let Some(title) = &transcript.meta.title {
+        // A `fallback` title must cite the human message it was derived
+        // from; this one was set elsewhere, which dsh records as `user`.
+        log.push(json!({
+            "type": "session/title",
+            "time": created,
+            "data": { "title": title, "messageSeqs": [], "source": { "kind": "user" } }
+        }));
+    }
+    for (index, message) in transcript.body.iter().enumerate() {
+        if message.role == Role::User {
+            log.user(index, message);
+        } else {
+            log.assistant(index, message, model);
+        }
+    }
+    let events = log.finish();
+    DshSession { header, events }
+}
+
+/// Lays Common messages out as dsh's turn/step lifecycle, which the official
+/// reader checks: a human message opens a turn and its first step, a model
+/// response after tool results opens the next step, and every tool call is
+/// started (`tool/call`) and answered (`tool/result`) before its step ends.
+struct LogWriter<'a> {
+    id: &'a str,
+    events: Vec<Value>,
+    time: i64,
+    turn: u64,
+    turn_open: bool,
+    step: u64,
+    step_state: StepState,
+    interrupted: bool,
+    /// Calls advertised in the open step and not yet answered, in order:
+    /// `(id, name, arguments)`.
+    pending: Vec<(String, String, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepState {
+    Closed,
+    Open,
+    /// A tool result has answered the step since its last model response.
+    Answered,
+}
+
+impl<'a> LogWriter<'a> {
+    fn new(id: &'a str, time: i64) -> Self {
+        Self {
+            id,
+            events: Vec::new(),
+            time,
+            turn: 0,
+            turn_open: false,
+            step: 0,
+            step_state: StepState::Closed,
+            interrupted: false,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, mut event: Value) -> u64 {
+        let seq = self.events.len() as u64;
+        event["seq"] = json!(seq);
+        self.events.push(event);
+        seq
+    }
+
+    fn user(&mut self, index: usize, message: &Message) {
+        self.time = message.timestamp.timestamp_millis();
+        for block in &message.content {
+            if let Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+            {
+                self.tool_result(index, tool_use_id, content, *is_error);
+            }
+        }
+        let texts: Vec<Value> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(json!({"type": "text", "text": text})),
+                _ => None,
+            })
+            .collect();
+        if texts.is_empty() {
+            return;
+        }
+        self.close_turn();
+        self.open_turn();
+        self.open_step();
+        let msg_id = Uuid::new_v5(&NS, format!("{}:{index}:user", self.id).as_bytes()).to_string();
+        self.push(json!({
+            "type": "user/message",
+            "time": self.time,
+            "data": {
+                "role": "user",
+                "id": msg_id,
+                "content": texts,
+                "source": { "kind": "user" }
+            },
+            "surfaceOp": "append"
+        }));
+    }
+
+    /// A result whose call is not pending in the open step has nothing dsh
+    /// would accept it against, and is left out.
+    fn tool_result(&mut self, index: usize, call_id: &str, content: &ToolOutput, is_error: bool) {
+        let Some(position) = self.pending.iter().position(|(id, ..)| id == call_id) else {
+            return;
+        };
+        let (_, name, arguments) = self.pending.remove(position);
+        let call_seq = self.push(json!({
+            "type": "tool/call",
+            "time": self.time,
+            "data": {
+                "turn": self.turn,
+                "step": self.step,
+                "callId": call_id,
+                "name": name,
+                "arguments": arguments
+            }
+        }));
+        let text = match content {
+            ToolOutput::Text(text) => text.clone(),
+            ToolOutput::Json(value) => value.to_string(),
+        };
+        let msg_id = Uuid::new_v5(
+            &NS,
+            format!("{}:{index}:result:{call_id}", self.id).as_bytes(),
+        )
+        .to_string();
+        self.push(json!({
+            "type": "tool/result",
+            "time": self.time,
+            "data": {
+                "turn": self.turn,
+                "step": self.step,
+                "message": {
+                    "role": "tool",
+                    "id": msg_id,
+                    "toolCallId": call_id,
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": is_error,
+                    "source": { "kind": "tool", "callId": call_id }
+                }
+            },
+            "sourceEventSeqs": [call_seq],
+            "surfaceOp": "append"
+        }));
+        self.step_state = StepState::Answered;
+    }
+
+    fn assistant(&mut self, index: usize, message: &Message, default_model: &str) {
+        let mut content = Vec::new();
+        let mut calls = Vec::new();
+        for block in &message.content {
+            match block {
+                Block::Text { text } => content.push(json!({"type": "text", "text": text})),
+                Block::Thinking { text, .. } => {
+                    content.push(json!({"type": "reasoning", "text": text}));
+                }
+                Block::ToolUse { id: call_id, tool } => {
+                    let (name, input) = tool.to_canonical();
+                    let arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                    content.push(json!({
+                        "type": "tool-call",
+                        "id": call_id,
+                        "name": name,
+                        "arguments": arguments
+                    }));
+                    calls.push((call_id.clone(), name, arguments));
+                }
+                Block::ToolResult { .. } | Block::Image { .. } | Block::Artifact { .. } => {}
+            }
+        }
+        if content.is_empty() {
+            return;
+        }
+        self.time = message.timestamp.timestamp_millis();
+        if !self.turn_open {
+            self.open_turn();
+        }
+        // A response after a tool result is a new model call, so a new step.
+        if self.step_state == StepState::Answered {
+            self.close_step();
+        }
+        self.open_step();
+        let msg_id =
+            Uuid::new_v5(&NS, format!("{}:{index}:assistant", self.id).as_bytes()).to_string();
+        let model = message.model.as_deref().unwrap_or(default_model);
+        let mut data = json!({
+            "turn": self.turn,
+            "step": self.step,
+            "message": {
+                "role": "assistant",
+                "id": msg_id,
+                "content": content,
+                "source": { "kind": "model", "provider": IMPORTED_PROVIDER, "model": model }
+            },
+            // The provider stream is not recorded in Common. dsh replays an
+            // embedded stream against the message it produced, and skips
+            // that check only for an empty one.
+            "stream": []
+        });
+        if let Some(usage) = &message.usage {
+            let mut tokens = json!({
+                "inputTokens": usage.input_tokens,
+                "outputTokens": usage.output_tokens,
+            });
+            if let Some(read) = usage.cache_read_input_tokens {
+                tokens["cacheReadTokens"] = json!(read);
+            }
+            if let Some(write) = usage.cache_creation_input_tokens {
+                tokens["cacheWriteTokens"] = json!(write);
+            }
+            data["usage"] = tokens;
+        }
+        // dsh only ever writes `interrupted: true`; absence means a
+        // completed response.
+        if message.stop_reason == Some(StopReason::Aborted) {
+            data["interrupted"] = json!(true);
+            self.interrupted = true;
+        }
+        self.push(json!({
+            "type": "assistant/message",
+            "time": self.time,
+            "data": data,
+            "surfaceOp": "append"
+        }));
+        for call in calls {
+            if !self.pending.iter().any(|(id, ..)| *id == call.0) {
+                self.pending.push(call);
+            }
+        }
+    }
+
+    fn open_turn(&mut self) {
+        self.turn += 1;
+        self.turn_open = true;
+        self.step = 0;
+        self.interrupted = false;
+        self.push(json!({
+            "type": "turn/start",
+            "time": self.time,
+            "data": { "turn": self.turn }
+        }));
+    }
+
+    fn open_step(&mut self) {
+        if self.step_state != StepState::Closed {
+            return;
+        }
+        self.step += 1;
+        self.step_state = StepState::Open;
+        self.push(json!({
+            "type": "step/start",
+            "time": self.time,
+            "data": { "turn": self.turn, "step": self.step }
+        }));
+        if self.turn == 1 && self.step == 1 {
+            self.system_head();
+        }
+    }
+
+    /// dsh appends its current system prompt to the history of a session it
+    /// resumes, and accepts that only behind a system message heading the
+    /// surface; without one, the resumed log fails dsh's next load. Common has
+    /// no system prompt to put there, so the head is empty.
+    fn system_head(&mut self) {
+        let msg_id = Uuid::new_v5(&NS, format!("{}:system", self.id).as_bytes()).to_string();
+        self.push(json!({
+            "type": "system/message",
+            "time": self.time,
+            "data": {
+                "turn": self.turn,
+                "step": self.step,
+                "message": {
+                    "role": "system",
+                    "id": msg_id,
+                    "content": [],
+                    "source": { "kind": "system-prompt" }
+                }
+            },
+            "surfaceOp": "append"
+        }));
+    }
+
+    /// Close the open step, answering each unanswered call with dsh's own
+    /// not-started repair.
+    fn close_step(&mut self) {
+        if self.step_state == StepState::Closed {
+            return;
+        }
+        for (call_id, ..) in std::mem::take(&mut self.pending) {
+            let seq = self.events.len();
+            self.push(json!({
+                "type": "tool/result",
+                "time": self.time,
+                "data": {
+                    "turn": self.turn,
+                    "step": self.step,
+                    "message": {
+                        "role": "tool",
+                        "id": format!("interrupted-tool-result-{call_id}-{seq}"),
+                        "toolCallId": call_id,
+                        "content": [{ "type": "text", "text": NOT_STARTED_TEXT }],
+                        "isError": true,
+                        "source": { "kind": "tool", "callId": call_id }
+                    },
+                    "error": { "name": "ToolNotStartedError", "code": "TOOL_NOT_STARTED" }
+                },
+                "surfaceOp": "append"
+            }));
+            self.interrupted = true;
+        }
+        self.push(json!({
+            "type": "step/end",
+            "time": self.time,
+            "data": { "turn": self.turn, "step": self.step }
+        }));
+        self.step_state = StepState::Closed;
+    }
+
+    fn close_turn(&mut self) {
+        if !self.turn_open {
+            return;
+        }
+        self.close_step();
+        let reason = if self.interrupted {
+            "interrupted"
+        } else {
+            "completed"
+        };
+        self.push(json!({
+            "type": "turn/end",
+            "time": self.time,
+            "data": { "turn": self.turn, "reason": { "kind": reason } }
+        }));
+        self.turn_open = false;
+    }
+
+    fn finish(mut self) -> Vec<Value> {
+        self.close_turn();
+        self.events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(ms: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn header_line_feeds_meta() {
+        let body = DshSession {
+            header: json!({
+                "type": "session",
+                "version": 0,
+                "id": "session-abc",
+                "createdAt": 1_786_637_231_769_i64,
+                "cwd": "/repo",
+                "delegationDepth": 0,
+                "agentPreset": "standard"
+            }),
+            events: vec![
+                json!({"type": "session/title", "seq": 0, "time": 1, "data": {"title": "hello"}}),
+                json!({"type": "request/context", "seq": 1, "time": 2, "data": {"provider": "deepseek-official", "model": "deepseek-v4-flash"}}),
+            ],
+        };
+        let meta = meta_from_body(&body);
+        assert_eq!(meta.id, "session-abc");
+        assert_eq!(meta.cwd.as_deref(), Some("/repo"));
+        assert_eq!(meta.title.as_deref(), Some("hello"));
+        assert_eq!(meta.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(meta.timestamp, ts(1_786_637_231_769));
+    }
+
+    #[test]
+    fn surface_projection_keeps_text_thinking_and_tools() {
+        let events = vec![
+            json!({"type": "user/message", "seq": 0, "time": 10, "data": {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}],
+                "source": {"kind": "user"}
+            }, "surfaceOp": "append"}),
+            json!({"type": "assistant/chunk", "seq": 1, "time": 11, "data": {"turn": 1, "step": 1, "chunk": {"type": "block-start"}}}),
+            json!({"type": "reasoning-chunks", "seq0": 2, "time0": 12, "data": {"texts": ["skip"]}}),
+            json!({"type": "assistant/message", "seq": 3, "time": 13, "data": {
+                "turn": 1, "step": 1,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "reasoning", "text": "think"},
+                        {"type": "text", "text": "ok"},
+                        {"type": "tool-call", "id": "c1", "name": "bash", "arguments": "{\"command\":\"ls\"}"}
+                    ],
+                    "source": {"kind": "model", "model": "deepseek-v4-flash"}
+                }
+            }, "surfaceOp": "append"}),
+            json!({"type": "tool/result", "seq": 4, "time": 14, "data": {
+                "message": {"content": [{
+                    "type": "tool-result",
+                    "toolCallId": "c1",
+                    "isError": false,
+                    "content": [{"type": "text", "text": "a.rs"}]
+                }]}
+            }, "surfaceOp": "append"}),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "hi"));
+        assert!(matches!(&messages[1].content[0], Block::Thinking { text, .. } if text == "think"));
+        assert!(matches!(&messages[1].content[2], Block::ToolUse { id, .. } if id == "c1"));
+        assert_eq!(messages[1].model.as_deref(), Some("deepseek-v4-flash"));
+        assert!(matches!(
+            &messages[2].content[0],
+            Block::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "c1" && !is_error
+        ));
+    }
+
+    fn user_event(seq: u64, text: &str, surface_op: &Value) -> Value {
+        json!({"type": "user/message", "seq": seq, "time": seq, "data": {
+            "content": [{"type": "text", "text": text}]
+        }, "surfaceOp": surface_op})
+    }
+
+    #[test]
+    fn surface_replace_drops_shadowed_nodes() {
+        // Log-only events between surface nodes push each node's seq past its
+        // surface position, so a replace op must be resolved by seq.
+        let events = vec![
+            user_event(0, "old", &json!("append")),
+            json!({"type": "step/start", "seq": 1, "time": 1, "data": {}}),
+            user_event(2, "kept", &json!("append")),
+            user_event(
+                3,
+                "summary",
+                &json!({"op": "replace", "start": 0, "end": 0}),
+            ),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "summary"));
+        assert!(matches!(&messages[1].content[0], Block::Text { text } if text == "kept"));
+    }
+
+    #[test]
+    fn surface_replace_spans_the_whole_seq_range() {
+        // Compaction shadows a contiguous run: nodes at seq 1 and 3 must both
+        // go, even though seq 3 sits at surface index 1.
+        let events = vec![
+            user_event(1, "first", &json!("append")),
+            json!({"type": "assistant/chunk", "seq": 2, "time": 2, "data": {}}),
+            user_event(3, "second", &json!("append")),
+            user_event(4, "kept", &json!("append")),
+            user_event(
+                9,
+                "summary",
+                &json!({"op": "replace", "start": 1, "end": 3}),
+            ),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "summary"));
+        assert!(matches!(&messages[1].content[0], Block::Text { text } if text == "kept"));
+    }
+
+    #[test]
+    fn surface_replace_with_unresolvable_range_keeps_history() {
+        // A range naming a seq that never reached the surface shadows nothing.
+        let events = vec![
+            user_event(4, "kept", &json!("append")),
+            user_event(
+                7,
+                "summary",
+                &json!({"op": "replace", "start": 2, "end": 2}),
+            ),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0].content[0], Block::Text { text } if text == "kept"));
+        assert!(matches!(&messages[1].content[0], Block::Text { text } if text == "summary"));
+    }
+
+    #[test]
+    fn assistant_usage_and_interruption_survive_projection() {
+        let events = vec![
+            json!({"type": "assistant/message", "seq": 0, "time": 5, "data": {
+            "turn": 1, "step": 1,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "partial"}],
+                "source": {"kind": "model", "model": "deepseek-v4-flash"}
+            },
+            "usage": {
+                "inputTokens": 13972,
+                "outputTokens": 205,
+                "cacheReadTokens": 64,
+                "cacheWriteTokens": 32,
+                "reasoningTokens": 106
+            },
+            "interrupted": true
+        }, "surfaceOp": "append"}),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].stop_reason, Some(StopReason::Aborted));
+        let usage = messages[0].usage.expect("usage projected");
+        assert_eq!(usage.input_tokens, 13972);
+        assert_eq!(usage.output_tokens, 205);
+        assert_eq!(usage.cache_read_input_tokens, Some(64));
+        assert_eq!(usage.cache_creation_input_tokens, Some(32));
+    }
+
+    #[test]
+    fn assistant_without_usage_keeps_normal_stop_reason() {
+        let events = vec![
+            json!({"type": "assistant/message", "seq": 0, "time": 5, "data": {
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+        }, "surfaceOp": "append"}),
+        ];
+        let messages = events_to_messages(&events, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(messages[0].stop_reason, Some(StopReason::EndTurn));
+        assert!(messages[0].usage.is_none());
+    }
+
+    #[cfg(feature = "dsh_zstd")]
+    #[test]
+    fn decode_zstd_spans_concatenated_frames() {
+        // The backend writes the header in its own frame, then one frame per
+        // append batch; all of them must decode as a single JSONL stream.
+        let header = b"{\"type\":\"session\",\"version\":0,\"id\":\"s1\"}\n";
+        let batch = b"{\"type\":\"user/message\",\"seq\":0,\"time\":1,\"data\":{},\"surfaceOp\":\"append\"}\n";
+        let mut bytes = zstd::encode_all(&header[..], 0).unwrap();
+        bytes.extend(zstd::encode_all(&batch[..], 0).unwrap());
+
+        let text = decode_zstd(&bytes).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.starts_with("{\"type\":\"session\""));
+        assert!(text.contains("user/message"));
+    }
+
+    #[test]
+    fn only_canonical_log_names_carry_a_generation() {
+        assert_eq!(log_generation("session.jsonl"), Some(0));
+        assert_eq!(log_generation("session.jsonl.zstd"), Some(0));
+        assert_eq!(log_generation("session.v4.jsonl.zstd"), Some(4));
+        assert_eq!(log_generation("session.v12.jsonl"), Some(12));
+        // dsh publishes through a temporary sibling, then links it into place.
+        assert_eq!(
+            log_generation("session.v4.jsonl.zstd.af44d7226f77.tmp"),
+            None
+        );
+        assert_eq!(log_generation("session.lock"), None);
+        assert_eq!(log_generation("session.v.jsonl"), None);
+        assert_eq!(log_generation("._session.v4.jsonl.zstd"), None);
+    }
+
+    #[test]
+    fn parse_log_requires_session_header() {
+        let err = parse_log("{\"type\":\"user/message\"}\n").unwrap_err();
+        assert!(err.to_string().contains("session header"));
+    }
+}

@@ -456,6 +456,7 @@ pub enum HarnessId {
     CursorDesktop,
     Grok,
     GrokBot,
+    Dsh,
     Fx,
     Hermes,
     Amp,
@@ -465,7 +466,7 @@ pub enum HarnessId {
 }
 
 impl HarnessId {
-    pub const ALL: [HarnessId; 18] = [
+    pub const ALL: [HarnessId; 19] = [
         HarnessId::ClaudeCode,
         HarnessId::ClaudeChat,
         HarnessId::CoworkRemote,
@@ -478,6 +479,7 @@ impl HarnessId {
         HarnessId::CursorDesktop,
         HarnessId::Grok,
         HarnessId::GrokBot,
+        HarnessId::Dsh,
         HarnessId::Fx,
         HarnessId::Hermes,
         HarnessId::Amp,
@@ -502,6 +504,7 @@ impl HarnessId {
             HarnessId::CursorDesktop => "cursor_desktop",
             HarnessId::Grok => "grok",
             HarnessId::GrokBot => "grok_bot",
+            HarnessId::Dsh => "dsh",
             HarnessId::Fx => "fx",
             HarnessId::Hermes => "hermes",
             HarnessId::Amp => "amp",
@@ -547,6 +550,9 @@ impl FromStr for HarnessId {
             }
             "grok_bot" | "grok-bot" | "grokbot" | "grok_desktop" | "grok-desktop" => {
                 Ok(HarnessId::GrokBot)
+            }
+            "dsh" | "deepseek" | "deepseek_harness" | "deepseek-harness" | "deepseekharness" => {
+                Ok(HarnessId::Dsh)
             }
             "fx" | "fx_cli" | "fx-cli" | "fxcli" | "vercel_fx" | "vercel-fx" => Ok(HarnessId::Fx),
             "hermes" | "hermes_agent" | "hermes-agent" | "hermesagent" => Ok(HarnessId::Hermes),
