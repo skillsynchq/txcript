@@ -12,6 +12,7 @@ mod codex_compressed;
 mod codex_pairing;
 mod fx_tool_result;
 mod parallel_tool_calls;
+mod pi_slash_command;
 
 use chrono::{DateTime, Utc};
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
