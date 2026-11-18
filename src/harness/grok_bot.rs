@@ -313,6 +313,7 @@ fn result_to_output(result: &Value, is_error: bool) -> ToolOutput {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn messages_to_records(_meta: &Meta, messages: &[Message]) -> Vec<Value> {
     let mut records = Vec::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
@@ -342,7 +343,14 @@ fn messages_to_records(_meta: &Meta, messages: &[Message]) -> Vec<Value> {
                                 "result": output_to_result(content, *is_error),
                             }));
                         }
-                        Block::Image { .. } | Block::Artifact { .. } | Block::Thinking { .. } => {}
+                        Block::Artifact { artifact } => {
+                            text_blocks
+                                .push(json!({"type": "text", "text": artifact.display_text()}));
+                        }
+                        Block::Image { source } => {
+                            text_blocks.push(json!({"type": "text", "text": format!("[image: {}]", source.media_type)}));
+                        }
+                        Block::Thinking { .. } => {}
                         Block::ToolUse { id, tool } => {
                             // Rare on user turns (e.g. slash commands); emit as assistant-shaped.
                             let (native_name, input) = denormalize_tool_use(id, tool);
@@ -400,8 +408,13 @@ fn messages_to_records(_meta: &Meta, messages: &[Message]) -> Vec<Value> {
                                 "input": input,
                             }));
                         }
-                        Block::ToolResult { .. } | Block::Image { .. } | Block::Artifact { .. } => {
+                        Block::Artifact { artifact } => {
+                            content.push(json!({"type": "text", "text": artifact.display_text()}));
                         }
+                        Block::Image { source } => {
+                            content.push(json!({"type": "text", "text": format!("[image: {}]", source.media_type)}));
+                        }
+                        Block::ToolResult { .. } => {}
                     }
                 }
                 if !content.is_empty() {
