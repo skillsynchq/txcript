@@ -20,6 +20,7 @@ mod fx;
 mod grok;
 mod grok_bot;
 mod hermes;
+mod kimi;
 mod opencode;
 mod path_safety;
 mod pi;

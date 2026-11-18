@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use chrono::{TimeZone, Utc};
 use txcript::common::{Block, Message, Meta, Role};
 use txcript::harness::{
-    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, pi,
+    amp, antigravity, campfire, claude_code, codex, cowork, cursor, fx, grok, grok_bot, kimi, pi,
 };
 use txcript::{Codec, Common, Store, Transcript};
 
@@ -84,6 +84,7 @@ fn hostile_ids_cannot_escape_any_file_backed_store() {
     assert_save_confined(&cursor::CursorStore::new(root.to_path_buf()), root);
     assert_save_confined(&grok::GrokStore::new(root.to_path_buf()), root);
     assert_save_confined(&grok_bot::GrokBotStore::new(root.to_path_buf()), root);
+    assert_save_confined(&kimi::KimiStore::new(root.to_path_buf()), root);
     assert_save_confined(&amp::AmpStore::new(root.to_path_buf()), root);
     assert_save_confined(
         &antigravity::AntigravityStore::new(root.to_path_buf()),
@@ -170,6 +171,62 @@ fn grok_delete_refuses_a_symlink_into_the_sessions_root() {
     );
     assert!(
         victim.path().join("updates.jsonl").is_file(),
+        "the symlink target must survive"
+    );
+}
+
+#[test]
+fn kimi_delete_refuses_paths_outside_the_sessions_root() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    // Give the victim a session's shape: the guard must hold even when the
+    // directory looks like a real session.
+    std::fs::write(victim.path().join("state.json"), b"{}").unwrap();
+
+    let store = kimi::KimiStore::new(sessions.clone());
+    assert!(
+        store.delete(&victim.path().to_path_buf()).is_err(),
+        "a session-shaped directory outside the root must be refused"
+    );
+    assert!(victim.path().is_dir(), "the foreign directory must survive");
+
+    // A workspace directory holds sessions but isn't one itself.
+    let workspace = sessions.join("wd_proj_0123456789ab");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("state.json"), b"{}").unwrap();
+    assert!(store.delete(&workspace).is_err());
+    assert!(workspace.is_dir());
+
+    // A directory with no state.json isn't a session at all.
+    let bare = workspace.join("session_bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    assert!(store.delete(&bare).is_err());
+    assert!(bare.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn kimi_delete_refuses_a_symlink_into_the_sessions_root() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    let victim = tempfile::tempdir().unwrap();
+    std::fs::write(victim.path().join("state.json"), b"{}").unwrap();
+
+    // Plant a link at the exact depth delete expects a session at.
+    let workspace = sessions.join("wd_proj_0123456789ab");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let link = workspace.join("session_linked");
+    std::os::unix::fs::symlink(victim.path(), &link).unwrap();
+
+    let store = kimi::KimiStore::new(sessions);
+    assert!(
+        store.delete(&link).is_err(),
+        "a symlink resolving outside the root must be refused"
+    );
+    assert!(
+        victim.path().join("state.json").is_file(),
         "the symlink target must survive"
     );
 }
