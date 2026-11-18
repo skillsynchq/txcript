@@ -1283,22 +1283,28 @@ impl Store for CursorDesktopStore {
     fn delete(&self, reference: &String) -> Result<()> {
         super::checked_id_component(CursorDesktop::NAME, reference)?;
         let conn = Connection::open(self.db_path()).map_err(sqlite_err)?;
-        let deleted: usize = conn
-            .execute(
+        let deleted_headers = if has_table(&conn, "composerHeaders")? {
+            conn.execute(
                 "DELETE FROM composerHeaders WHERE composerId = ?1",
                 params![reference],
             )
+            .map_err(sqlite_err)?
+        } else {
+            0
+        };
+        let escaped = escape_like_pattern(reference);
+        let deleted_kv: usize = conn
+            .execute(
+                "DELETE FROM cursorDiskKV WHERE key = ?1 OR key LIKE ?2 ESCAPE '\\' OR key LIKE ?3 ESCAPE '\\' OR key LIKE ?4 ESCAPE '\\'",
+                params![
+                    format!("composerData:{reference}"),
+                    format!("bubbleId:{escaped}:%"),
+                    format!("%:{escaped}"),
+                    format!("%:{escaped}:%"),
+                ],
+            )
             .map_err(sqlite_err)?;
-        conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key = ?1 OR key LIKE ?2 OR key LIKE ?3",
-            params![
-                format!("composerData:{reference}"),
-                format!("bubbleId:{reference}:%"),
-                format!("%:{reference}%"),
-            ],
-        )
-        .map_err(sqlite_err)?;
-        if deleted == 0 {
+        if deleted_headers == 0 && deleted_kv == 0 {
             return Err(Error::Malformed {
                 harness: CursorDesktop::NAME,
                 detail: format!("no such session: {reference}"),
@@ -1437,6 +1443,18 @@ fn discover_from_headers(conn: &Connection) -> Result<Vec<Discovered<String>>> {
             reference: cid,
         })
         .collect())
+}
+
+#[cfg(feature = "opencode")]
+fn escape_like_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Half-open key range covering every key that starts with `prefix`: the
