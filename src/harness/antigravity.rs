@@ -706,7 +706,17 @@ fn stop_reason_to_native(reason: &StopReason) -> Option<u64> {
         StopReason::ToolUse => Some(10),
         StopReason::Error => Some(13),
         StopReason::Aborted => Some(16),
-        StopReason::Other(s) => s.strip_prefix("stop-").and_then(|n| n.parse().ok()),
+        StopReason::Other(s) => s
+            .strip_prefix("stop-")
+            .and_then(|n| n.parse().ok())
+            .or_else(|| match StopReason::parse(s) {
+                StopReason::EndTurn | StopReason::StopSequence => Some(2),
+                StopReason::MaxTokens => Some(3),
+                StopReason::ToolUse => Some(10),
+                StopReason::Error => Some(13),
+                StopReason::Aborted => Some(16),
+                StopReason::Other(_) => None,
+            }),
     }
 }
 

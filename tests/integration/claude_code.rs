@@ -574,6 +574,20 @@ fn commands_are_searchable_by_name() {
     );
 }
 
+#[test]
+fn claude_code_preserves_aborted_and_error_stop_reasons() {
+    let mut common = sample_common();
+    common.body[3].stop_reason = Some(common::StopReason::Aborted);
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let back = claude_code::ClaudeCode::to_common(&native).unwrap();
+    assert_eq!(back.body[3].stop_reason, Some(common::StopReason::Aborted));
+
+    common.body[3].stop_reason = Some(common::StopReason::Error);
+    let native = claude_code::ClaudeCode::from_common(&common).unwrap();
+    let back = claude_code::ClaudeCode::to_common(&native).unwrap();
+    assert_eq!(back.body[3].stop_reason, Some(common::StopReason::Error));
+}
+
 // ── teammate lineage ────────────────────────────────────────────────────
 
 /// One minimal `user` line for a session, optionally carrying the

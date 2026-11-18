@@ -171,6 +171,14 @@ impl Codec for ChatGpt {
                 model,
                 stop_reason: (role == "assistant").then_some(if has_tool {
                     StopReason::ToolUse
+                } else if let Some(finish) = native
+                    .pointer("/metadata/finish_details/type")
+                    .and_then(Value::as_str)
+                {
+                    match finish {
+                        "interrupted" => StopReason::Aborted,
+                        other => StopReason::parse(other),
+                    }
                 } else if native.get("end_turn").and_then(Value::as_bool) == Some(true) {
                     StopReason::EndTurn
                 } else {

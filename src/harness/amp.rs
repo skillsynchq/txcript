@@ -307,14 +307,7 @@ fn parse_state(state: Option<&Value>) -> Option<StopReason> {
 }
 
 fn parse_stop_reason(s: &str) -> StopReason {
-    match s {
-        "end_turn" => StopReason::EndTurn,
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "error" => StopReason::Error,
-        other => StopReason::Other(other.to_string()),
-    }
+    StopReason::parse(s)
 }
 
 fn parse_usage(u: &Value) -> Option<Usage> {
