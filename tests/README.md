@@ -35,8 +35,11 @@ three contracts every harness must honor:
   extracted correctly.
 
 Plus cross-cutting modules: `cross_harness` (a conversation survives a hop
-through every harness), `path_safety` (adversarial ids, symlinks, and
-references cannot escape a store root), `store_delete`, `search`, and
+through every harness), `fidelity` (what converting into each harness loses,
+pinned in one golden table that also feeds `docs/formats/README.md`; update
+both deliberately when a codec change moves it), `path_safety` (adversarial
+ids, symlinks, and references cannot escape a store root), `store_delete`,
+`search`, and
 `properties` — proptest sweeps asserting the codec fixpoint over generated
 conversations for every harness that writes (all but the pull-only Claude
 Chat and ChatGPT) at once. The generator in `properties`
@@ -70,8 +73,9 @@ can compare across machines.
 - Every test file opens with `#![allow(clippy::expect_used, clippy::panic,
   clippy::unwrap_used)]`; the production lint set (workspace `Cargo.toml`)
   denies all three.
-- CLI behavior that needs the real binary (id resolution, for one) is tested
-  in `cli/tests/`: the `txcript` binary runs against a synthetic store in a
-  temp dir, with every store environment variable pointed at an empty one.
+- CLI behavior that needs the real binary (id resolution, `check`, the loss
+  note on `continue`) is tested in `cli/tests/`: the `txcript` binary runs
+  against a synthetic store in a temp dir, with every store environment
+  variable pointed at an empty one.
 - Feature-gated surfaces gate at the module declaration in `main.rs`
   (`search`) or on the test (`opencode` store).
