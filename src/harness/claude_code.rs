@@ -265,6 +265,7 @@ pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Reco
             _ => None,
         })
         .collect();
+    let response_ids = response_message_ids(&session_id, messages);
     let mut parent_uuid: Option<String> = None;
     for (i, msg) in messages.iter().enumerate() {
         let uuid = entry_uuid(&session_id, i);
@@ -294,7 +295,10 @@ pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Reco
             model: msg.model.clone(),
             stop_reason: msg.stop_reason.as_ref().map(stop_reason_str),
             usage: msg.usage.as_ref().map(serialize_usage),
-            extra: Map::new(),
+            extra: response_ids[i]
+                .as_ref()
+                .map(|id| Map::from_iter([("id".to_string(), Value::String(id.clone()))]))
+                .unwrap_or_default(),
         };
         let entry = EntryLine {
             parent_uuid: parent_uuid.clone(),
@@ -342,6 +346,45 @@ pub(crate) fn messages_to_records(meta: &Meta, messages: &[Message]) -> Vec<Reco
     }
 
     records
+}
+
+/// The `message.id` each assistant line carries, shared by the lines of one
+/// model response.
+///
+/// Claude Code writes a response one content block per line, every line with
+/// the response's `message.id`, and on resume merges consecutive assistant
+/// lines with the same id back into one API message. Sources that record one
+/// block per message (Codex's `function_call` items, Claude Code itself) give
+/// a parallel call batch as consecutive assistant messages with every result
+/// after them. Written without an id, each call replays as its own assistant
+/// message, so the first is no longer followed by its result: Claude Code
+/// then swaps that result for "[Tool result missing due to internal error]"
+/// and the real output never reaches the model.
+///
+/// A run of consecutive assistant messages is one response when a tool call
+/// sits anywhere before its last message: exactly the runs that would
+/// otherwise break. Those lines share a deterministic id; every other line
+/// keeps writing none, as before.
+fn response_message_ids(session_id: &str, messages: &[Message]) -> Vec<Option<String>> {
+    let mut ids = vec![None; messages.len()];
+    let mut start = 0;
+    while start < messages.len() {
+        let mut end = start + 1;
+        if messages[start].role == Role::Assistant {
+            while end < messages.len() && messages[end].role == Role::Assistant {
+                end += 1;
+            }
+            let calls_before_last = messages[start..end - 1]
+                .iter()
+                .any(|m| m.content.iter().any(|b| matches!(b, Block::ToolUse { .. })));
+            if calls_before_last {
+                let id = format!("msg_{}", entry_uuid(session_id, start).replace('-', ""));
+                ids[start..end].fill(Some(id));
+            }
+        }
+        start = end;
+    }
+    ids
 }
 
 /// Claude Code's native artifact is a normal `Artifact` tool call followed
