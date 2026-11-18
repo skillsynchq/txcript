@@ -24,6 +24,7 @@ pub mod hermes;
 pub mod opencode;
 pub mod pi;
 pub mod simple;
+pub mod uji;
 
 pub(crate) mod jsonl;
 

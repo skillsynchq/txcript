@@ -19,7 +19,7 @@ use serde_json::json;
 use txcript::common::{Block, Message, Meta, Role, Tool, ToolOutput};
 use txcript::harness::{
     amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, fx, grok,
-    grok_bot, hermes, opencode, pi, simple,
+    grok_bot, hermes, opencode, pi, simple, uji,
 };
 use txcript::{Codec, Common, Transcript};
 
@@ -280,5 +280,6 @@ proptest! {
         assert_fixpoint::<antigravity::Antigravity>("antigravity", &common)?;
         assert_fixpoint::<simple::Simple>("simple", &common)?;
         assert_fixpoint::<cowork::Cowork>("cowork", &common)?;
+        assert_fixpoint::<uji::Uji>("uji", &common)?;
     }
 }

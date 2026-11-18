@@ -125,6 +125,7 @@ writeFileSync("rollout.jsonl", output);
 | [Grok Bot](../formats/grok-bot.md) | `grok_bot` | Да | Через локальный шлюз |
 | [fx](../formats/fx.md) | `fx` | Да | Да |
 | [Antigravity](../formats/antigravity.md) | `antigravity` | Да | Да |
+| [uji](../formats/uji.md) | `uji` | Да | Да |
 | [Hermes Agent](../formats/hermes.md) | `hermes` | Да | Нет |
 | [Amp](../formats/amp.md) | `amp` | Да | Нет |
 | [Claude Chat](../formats/claude-chat.md) | `claude_chat` | Онлайн-аккаунт | Нет |

@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use txcript::common;
 use txcript::harness::{
     amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, fx, grok,
-    grok_bot, hermes, opencode, pi, simple,
+    grok_bot, hermes, opencode, pi, simple, uji,
 };
 use txcript::{Codec, Common, Transcript, convert};
 
@@ -303,8 +303,10 @@ fn assert_cycle(common: &Transcript<Common>, context: &str) {
         "{context}: cowork"
     );
 
-    // And all the way back to Claude.
-    let round = convert::<cowork::Cowork, claude_code::ClaudeCode>(&cowork).unwrap();
+    let uji = convert::<cowork::Cowork, uji::Uji>(&cowork).unwrap();
+
+    // And all the way back to Claude, through uji.
+    let round = convert::<uji::Uji, claude_code::ClaudeCode>(&uji).unwrap();
     assert_eq!(
         signature(&claude_code::ClaudeCode::to_common(&round).unwrap()),
         expected,
