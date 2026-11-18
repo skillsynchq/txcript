@@ -92,6 +92,27 @@ fn store_round_trip_is_lossless_on_disk() {
 }
 
 #[test]
+fn store_save_empty_id_synthesizes_uuid() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = claude_code::ClaudeStore::new(dir.path());
+
+    let src = dir.path().join("orig.jsonl");
+    std::fs::write(&src, sample_jsonl()).unwrap();
+
+    let mut loaded = store.load(&src).unwrap();
+    loaded.meta.id = String::new();
+
+    let saved = store.save(&loaded).unwrap();
+    assert!(!saved.id.is_empty());
+    assert!(saved.reference.exists());
+    assert!(saved.reference.ends_with(format!("{}.jsonl", saved.id)));
+    uuid::Uuid::parse_str(&saved.id).unwrap();
+
+    let reloaded = store.load(&saved.reference).unwrap();
+    assert_eq!(reloaded.meta.id, saved.id);
+}
+
+#[test]
 fn windows_cwd_encodes_the_project_dir() {
     let dir = tempfile::tempdir().unwrap();
     let store = claude_code::ClaudeStore::new(dir.path());
