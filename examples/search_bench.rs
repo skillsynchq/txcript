@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use txcript::harness::{campfire, claude_code, codex, cursor, grok, pi};
+use txcript::harness::{campfire, claude_code, codex, cursor, dsh, grok, pi};
 use txcript::search::{DocKey, Index, Origin, Query};
 use txcript::{Codec, Common, HarnessId, Store, Transcript};
 
@@ -58,6 +58,13 @@ fn main() {
     load_files::<grok::Grok, _>(
         HarnessId::Grok,
         grok::GrokStore::default_root(),
+        &mut index,
+        &mut loaded,
+        &mut failed,
+    );
+    load_files::<dsh::Dsh, _>(
+        HarnessId::Dsh,
+        dsh::DshStore::default_root(),
         &mut index,
         &mut loaded,
         &mut failed,
