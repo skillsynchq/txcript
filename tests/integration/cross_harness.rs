@@ -9,7 +9,7 @@ use txcript::harness::{
     amp, antigravity, campfire, claude_code, codex, cowork, cursor, cursor_desktop, fx, grok,
     grok_bot, hermes, opencode, pi, simple,
 };
-use txcript::{Codec, Common, Transcript, convert};
+use txcript::{Codec, Common, TextCodec, Transcript, convert};
 
 fn ts(s: &str) -> DateTime<Utc> {
     s.parse().unwrap()
@@ -346,5 +346,63 @@ fn claude_tools_become_openai_safe_when_moved_to_codex() {
             .and_then(serde_json::Value::as_str);
 
         assert_eq!(name, Some(expected), "source name: {source:?}");
+    }
+}
+
+fn written<H: Codec + TextCodec>(common: &Transcript<Common>) -> String {
+    H::to_text(&H::from_common(common).unwrap()).unwrap()
+}
+
+/// Codex is the only harness that writes `Meta::lineage` back. Every other
+/// writing harness produces the same bytes with or without it, including
+/// pi/Campfire (`parentSession` is a file path, not an id), `OpenCode`
+/// (`parent_id` is spawn-only and written by `opencode import`), and Claude
+/// Code (`teamName`/`agentName` are spawn-only).
+#[test]
+fn only_codex_writes_lineage_back() {
+    let plain = sample();
+    for relation in [
+        common::Relation::Fork,
+        common::Relation::Continue,
+        common::Relation::Spawn,
+    ] {
+        let mut linked = sample();
+        linked.meta.lineage = Some(common::Lineage {
+            parent: "019a1b2c-3d4e-7f60-8a7b-9c0d1e2f3a4b".into(),
+            relation,
+        });
+        macro_rules! same_bytes {
+            ($($name:literal => $harness:ty),+ $(,)?) => {$(
+                assert_eq!(
+                    written::<$harness>(&linked),
+                    written::<$harness>(&plain),
+                    "{}: {relation:?}",
+                    $name
+                );
+            )+};
+        }
+        same_bytes! {
+            "claude_code" => claude_code::ClaudeCode,
+            "opencode" => opencode::OpenCode,
+            "pi" => pi::Pi,
+            "campfire" => campfire::Campfire,
+            "cursor_desktop" => cursor_desktop::CursorDesktop,
+            "grok" => grok::Grok,
+            "grok_bot" => grok_bot::GrokBot,
+            "fx" => fx::Fx,
+            "hermes" => hermes::Hermes,
+            "amp" => amp::Amp,
+            "antigravity" => antigravity::Antigravity,
+            "simple" => simple::Simple,
+            "cowork" => cowork::Cowork,
+        }
+
+        // Cursor stamps the wall clock into what it writes, so compare what
+        // reads back instead of the bytes.
+        let reread = |common: &Transcript<Common>| {
+            let text = written::<cursor::Cursor>(common);
+            cursor::Cursor::to_common(&cursor::Cursor::from_text(&text).unwrap()).unwrap()
+        };
+        assert_eq!(reread(&linked), reread(&plain), "cursor: {relation:?}");
     }
 }
