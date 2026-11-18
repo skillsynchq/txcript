@@ -1,8 +1,8 @@
 //! Integration tests: every module exercises public API against real backing
 //! stores (temp dirs, real `SQLite`) — no mocks. Per-harness modules cover
 //! store round-trip fidelity, codec fixpoints through Common, and discovery;
-//! the rest cover cross-harness conversion, adversarial path handling,
-//! search, and deletion. Property-based codec invariants live in
+//! the rest cover cross-harness conversion, conversion fidelity, adversarial
+//! path handling, search, and deletion. Property-based codec invariants live in
 //! `properties`. Tests that pin a specific shipped bug belong in
 //! `tests/regression/`, not here — see `tests/README.md`.
 
@@ -16,6 +16,7 @@ mod cowork;
 mod cross_harness;
 mod cursor;
 mod cursor_desktop;
+mod fidelity;
 mod fx;
 mod grok;
 mod grok_bot;

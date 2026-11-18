@@ -35,8 +35,11 @@ three contracts every harness must honor:
   extracted correctly.
 
 Plus cross-cutting modules: `cross_harness` (a conversation survives a hop
-through every harness), `path_safety` (adversarial ids, symlinks, and
-references cannot escape a store root), `store_delete`, `search`, and
+through every harness), `fidelity` (what converting into each harness loses,
+pinned in one golden table that also feeds `docs/formats/README.md`; update
+both deliberately when a codec change moves it), `path_safety` (adversarial
+ids, symlinks, and references cannot escape a store root), `store_delete`,
+`search`, and
 `properties` — proptest sweeps asserting the codec fixpoint over generated
 conversations for every harness that writes (all but the pull-only Claude
 Chat and ChatGPT) at once. The generator in `properties`
